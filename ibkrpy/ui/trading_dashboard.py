@@ -112,7 +112,6 @@ class TradingDashboard:
                 new_text = "".join(lines)
                 current_text = self.log_terminal.get(1.0, tk.END)
                 
-                # [防護] 只有在文字有實際更新時才進行 redraw，避免頻繁喚醒 IMK
                 if new_text.strip() != current_text.strip():
                     self.log_terminal.delete(1.0, tk.END)
                     self.log_terminal.insert(tk.END, new_text)

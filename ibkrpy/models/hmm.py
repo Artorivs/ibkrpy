@@ -1,4 +1,4 @@
-# hmm.py: 隱馬爾可夫模型 (HMM)
+# ibkrpy/models/hmm.py
 # 專責市場隱藏狀態 (Regime) 之偵測，如牛熊市或波動率高低狀態。
 
 import os

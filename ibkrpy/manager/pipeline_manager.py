@@ -175,11 +175,9 @@ class PipelineManager:
             np.random.seed(42)
             precomputed_data['prediction'] = precomputed_data['Close'] * (1 + np.random.normal(0, 0.005, len(precomputed_data)))
             
-            # [修正 1] 波動率必須使用 Bar 級別，不可乘上 np.sqrt(252) 年化，否則短線停損跨度會嚴重失真
             bar_volatility = precomputed_data['Close'].pct_change().rolling(20).std().fillna(0.005)
             precomputed_data['volatility'] = bar_volatility.replace(0, 0.005)
             
-            # [修正 2] 移除寫死的 'SIDEWAYS_QUIET'，改以真實機率分佈隨機生成市場狀態，解開短線封殺令
             regimes = ['BULL_TREND', 'BEAR_TREND', 'SIDEWAYS_VOLATILE', 'SIDEWAYS_QUIET']
             precomputed_data['regime'] = np.random.choice(regimes, len(precomputed_data), p=[0.3, 0.3, 0.3, 0.1])
             

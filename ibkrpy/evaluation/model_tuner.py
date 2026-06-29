@@ -8,10 +8,8 @@ import os
 from typing import Dict, Any, List, Tuple
 from .backtest_engine import BacktestEngine
 
-# 關閉 Optuna 的預設日誌洗版
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# [解耦] 強制錨定專案根目錄，徹底消滅 os.getcwd() 造成的 Optuna 資料庫飄移問題
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 

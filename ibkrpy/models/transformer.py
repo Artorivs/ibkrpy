@@ -1,5 +1,4 @@
 # ibkrpy/models/transformer.py
-# transformer.py: Transformer 模型
 # 善於捕捉長時序之關聯與全局特徵。
 
 import os

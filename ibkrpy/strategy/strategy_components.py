@@ -1,4 +1,4 @@
-# strategy_components.py: 策略基礎組件 (情境、風險、倉位)
+# ibkrpy/strategy/strategy_components.py
 # 將原本分散的組件集中，降低複雜度，提高內聚性
 
 import math

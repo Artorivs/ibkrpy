@@ -1,5 +1,4 @@
 # ibkrpy/models/garch.py
-# garch.py: GARCH 模型
 # 專司預測市場之波動率，是風險控制模組的強力護盾。
 
 import os
