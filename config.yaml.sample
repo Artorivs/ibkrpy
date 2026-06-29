@@ -1,0 +1,44 @@
+# config.yaml
+# 交易系統的設定檔
+
+# 1. 基礎設定
+general_settings:
+  trading_currency: "USD"
+  benchmark_symbol: "SPY"
+  short_term_bar_size: "5 mins"
+  mid_term_bar_size: "1 hour"
+  long_term_bar_size: "1 day"
+
+# 2. 日誌設定
+log_settings:
+  level: "INFO"
+  enable_email_alerts: false
+
+# 3. IBKR 連線設定
+ib_settings:
+  host: "127.0.0.1"
+  port: 7497       # 7496/7497 為 TWS Live/Paper, 4001/4002 為 Gateway Live/Paper
+  client_id: 1
+  account: "DU1234567"
+
+# 4. 外部 API 密鑰
+api_keys_settings:
+  fmp_api_key: ""  # Financial Modeling Prep
+  fred_api_key: "" # Federal Reserve Economic Data
+
+# 5. 核心策略閾值
+strategy_settings:
+  allow_shorting: True
+  min_prediction_threshold_pct: 0.003    # 預測漲幅大於 0.3% 才做多
+  volatility_stop_loss_multiplier: 1.5   # 停損距離
+  volatility_take_profit_multiplier: 2.0 # 停利距離
+
+# 6. 交易資產池 (Assets / Bundles)
+assets:
+  - symbol: "SPY"
+    term: "long_term"
+    tags: "ETF, Market, Core"
+
+  - symbol: "QQQ"
+    term: "long_term"
+    tags: "ETF, Market, Growth, Tech"

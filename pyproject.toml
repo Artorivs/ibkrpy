@@ -1,0 +1,52 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "ibkrpy"
+version = "0.0.1"
+description = "極簡化、高內聚的 IBKR 非同步量化交易系統"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+ib_insync = "^0.9.86"
+pandas = "^3.0.3"
+numpy = "^1.26.4"
+pandas-ta = "0.3.14b0"
+PyYAML = "^6.0.3"
+
+# --- 資料庫與基礎建設 ---
+SQLAlchemy = "^2.0.49"
+aiosqlite = "^0.21.0"
+python-dotenv = "^1.1.1"
+rich = "^15.0.0"
+
+# --- 交易與外部介面 ---
+backtrader = "^1.9.78"
+yfinance = "^1.3.0"
+aiohttp = "^3.13.5"
+fredapi = "^0.5.2"
+
+# --- 預測模型依賴 ---
+tensorflow = "^2.16.2"
+keras = "^3.14.1"
+tensorflow-macos = "^2.16.2"
+tensorflow-metal = "^1.2.0"
+hmmlearn = "^0.3.3"
+scikit-learn = "^1.8.0"
+statsmodels = "^0.14.6"
+arch = "^6.3.0"
+
+# --- 最佳化與視覺化依賴 ---
+optuna = "^3.6.2"
+matplotlib = "^3.10.9"
+seaborn = "^0.13.2"
+plotly = "^6.2.0"
+
+[tool.poetry.group.dev.dependencies]
+jupyterlab = "^4.4.4"
+mkdocs-material = "^9.6.15"
+black = "^25.1.0"
+flake8 = "^7.3.0"
