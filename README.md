@@ -81,9 +81,9 @@ python ibkrpy/core/main.py --mode daemon --ui
 
 右下方面板: 透過下拉選單，可以即時切換查看帳戶總收益曲線 (Equity Curve)，或是個別監控標的之即時走勢圖。
 
-## 4. 核心配置檔 (config.yaml) 詳解
+## 4. 核心配置檔 (`config.yaml`) 詳解
 
-系統之靜態參數均由根目錄（`./`）之 config.yaml 統一控管。你可於該檔案內配置：
+系統之靜態參數均由根目錄（`./`）之 `config.yaml` 統一控管。你可於該檔案內配置：
 
 - 通訊埠號與客戶端編號。
 - 外部總體經濟數據介面（如 FRED API）之金鑰。

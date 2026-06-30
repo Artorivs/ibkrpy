@@ -49,6 +49,9 @@ class TradingEngine:
         self.cached_funds = 0.0
         self.cached_net_liq = 0.0
         self.cached_positions = {}
+        
+        self.cached_vix_series = None
+        self.vix_last_fetch_time = 0.0
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """根據資產的標籤 (Tags) 動態選擇最適合的基準大盤 (Sector Benchmark)"""
@@ -235,7 +238,6 @@ class TradingEngine:
             self.db.save_bulk_market_data(symbol, df.tail(300))
         current_price = float(df['Close'].iloc[-1])
         
-        # 自動為資產配對對應板塊的大盤指標 (Alpha 萃取)
         benchmark_symbol = self._get_dynamic_benchmark(symbol)
         bench_df = pd.DataFrame()
         try:
@@ -257,9 +259,21 @@ class TradingEngine:
 
         macro_dict = {}
         if self.ext:
-            vix_series = await self.ext.fetch_fred_series("VIXCLS")
-            if vix_series is not None and not vix_series.empty:
-                vix_daily = vix_series.copy()
+            current_time = time.time()
+            
+            if self.cached_vix_series is None or (current_time - self.vix_last_fetch_time) > 14400:
+                try:
+                    vix_series = await self.ext.fetch_fred_series("VIXCLS")
+                    if vix_series is not None and not vix_series.empty:
+                        self.cached_vix_series = vix_series
+                        self.vix_last_fetch_time = current_time
+                        print(f"🌍 [系統] 成功從 FRED 更新宏觀數據 (VIXCLS)，已寫入本地快取 (有效期限 4 小時)。")
+                except Exception as e:
+                    print(f"⚠️ 獲取 FRED 數據失敗，將維持使用本地快取: {e}")
+
+            # 直接使用快取的數據進行特徵對齊
+            if self.cached_vix_series is not None and not self.cached_vix_series.empty:
+                vix_daily = self.cached_vix_series.copy()
                 vix_daily.index = vix_daily.index.normalize()
                 
                 df_idx_naive = df.index

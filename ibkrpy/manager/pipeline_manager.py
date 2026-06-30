@@ -7,6 +7,7 @@ import pandas as pd
 import json
 import joblib
 import numpy as np
+import time
 from datetime import datetime
 from typing import Tuple
 
@@ -21,6 +22,7 @@ from ibkrpy.evaluation.model_tuner import ModelTuner
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "weights")
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 class PipelineManager:
     """整合資料抓取、特徵工程與 AI 模型重訓的管線管理器"""
@@ -220,16 +222,21 @@ class PipelineManager:
                     if df_existing.empty or len(df_existing) < 50:
                         days_to_fetch = total_days
                     else:
+                        # 將資料庫的最後時間與系統當前時間，強制統一對齊到美東時間 (America/New_York)
                         last_date = pd.Timestamp(df_existing.index[-1])
-                        now_date = pd.Timestamp.now()
+                        if last_date.tz is None:
+                            last_date = last_date.tz_localize('UTC')
+                        last_date_ny = last_date.tz_convert('America/New_York')
+                        now_ny = pd.Timestamp.now(tz='America/New_York')
                         
-                        bus_days_diff = np.busday_count(last_date.date(), now_date.date())
+                        bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
                         
                         if bus_days_diff <= 0:
                             print(f"      ✅ 資料已是最新狀態，無須同步。")
                             continue
                             
-                        days_to_fetch = min(bus_days_diff + 2, total_days)
+                        # 如果差 1 天，抓 1+1=2 天緩衝即可，避免每次都盲目抓 3 天
+                        days_to_fetch = min(bus_days_diff + 1, total_days)
 
                     df_new_list = []
                     remaining_days = days_to_fetch
@@ -301,12 +308,75 @@ class PipelineManager:
         print("="*60)
         
         all_terms = ["long_term", "mid_term", "short_term"]
+        os.makedirs(DATA_DIR, exist_ok=True)
+        
+        # 1. 永久儲存 FRED 數據至 data/ (解決 API 額度耗盡與重啟遺失問題)
+        global_vix_series = None
+        fred_cache_path = os.path.join(DATA_DIR, "fred_vix_cache.csv")
+        need_fetch_fred = True
+        
+        if os.path.exists(fred_cache_path):
+            mod_time = os.path.getmtime(fred_cache_path)
+            # 如果快取未滿 12 小時 (43200秒)，直接讀取本地檔案
+            if (time.time() - mod_time) < 43200:
+                try:
+                    global_vix_series = pd.read_csv(fred_cache_path, index_col=0, parse_dates=True).squeeze("columns")
+                    need_fetch_fred = False
+                    print("   -> 🌍 從本地 data/ 讀取 FRED VIX 歷史快取...")
+                except Exception: pass
+                
+        if need_fetch_fred and self.ext:
+            print("   -> 🌍 正在向 FRED 請求最新全局宏觀數據 (VIXCLS)...")
+            try:
+                global_vix_series = await self.ext.fetch_fred_series("VIXCLS")
+                if global_vix_series is not None and not global_vix_series.empty:
+                    global_vix_series.to_csv(fred_cache_path)
+                    print(f"      ✅ FRED VIX 數據獲取成功，已永久儲存至 {fred_cache_path}。")
+            except Exception as e:
+                print(f"      ⚠️ FRED API 請求失敗: {e}")
+                if os.path.exists(fred_cache_path):
+                    print("      -> 退回使用過期的本地 FRED 快取。")
+                    global_vix_series = pd.read_csv(fred_cache_path, index_col=0, parse_dates=True).squeeze("columns")
+
+        # 2. 讀取 FMP 基本面本地快取 (解決重複請求問題)
+        fmp_cache_path = os.path.join(WEIGHTS_DIR, "fmp_cache.json")
+        fmp_cache = {}
+        if os.path.exists(fmp_cache_path):
+            try:
+                with open(fmp_cache_path, 'r', encoding='utf-8') as f:
+                    fmp_cache = json.load(f)
+            except Exception: pass
         
         for symbol in self.symbols:
             if symbol == self.benchmark_symbol:
                 continue
                 
             print(f"\n🔥 啟動週期選拔與訓練任務: {symbol} 🔥")
+            
+            # 整合 FMP API 獲取基本面與產業特徵
+            fmp_data = {}
+            if self.ext and self.ext.fmp_api_key:
+                if symbol in fmp_cache:
+                    print(f"   -> 🏢 從本地快取讀取 FMP 公司基本面數據...")
+                    fmp_data = fmp_cache[symbol]
+                    print(f"      => 板塊: {fmp_data.get('sector', 'N/A')} | 產業: {fmp_data.get('industry', 'N/A')} | Beta: {fmp_data.get('beta', 'N/A')}")
+                else:
+                    print(f"   -> 🏢 正在向 FMP 請求公司基本面數據...")
+                    try:
+                        fmp_profile = await self.ext.fetch_fmp_profile(symbol)
+                        if fmp_profile:
+                            fmp_data = fmp_profile
+                            # 更新快取並存檔
+                            fmp_cache[symbol] = fmp_data
+                            os.makedirs(WEIGHTS_DIR, exist_ok=True)
+                            with open(fmp_cache_path, 'w', encoding='utf-8') as f:
+                                json.dump(fmp_cache, f, indent=4)
+                                
+                            print(f"      => 板塊: {fmp_profile.get('sector', 'N/A')} | 產業: {fmp_profile.get('industry', 'N/A')} | Beta: {fmp_profile.get('beta', 'N/A')}")
+                        else:
+                            print(f"      => ⚠️ 無法獲取 FMP 數據 (可能未開通或超出配額)。")
+                    except Exception as e:
+                        print(f"      => ⚠️ FMP API 請求發生例外錯誤: {e}")
             
             best_term = None
             best_score = -float('inf')
@@ -333,24 +403,23 @@ class PipelineManager:
                 if not bench_df.empty:
                     bench_df = bench_df.reindex(df.index, method='ffill').bfill()
                 
+                # 改為使用預先抓取好的 global_vix_series (不再於迴圈中發送 API 請求)
                 macro_data = {}
-                if self.ext:
-                    vix_series = await self.ext.fetch_fred_series("VIXCLS")
-                    if not vix_series.empty:
-                        if getattr(vix_series.index, 'tz', None) is not None:
-                            vix_series.index = vix_series.index
-                        vix_daily = vix_series.copy()
-                        vix_daily.index = vix_daily.index.normalize()
+                if global_vix_series is not None and not global_vix_series.empty:
+                    if getattr(global_vix_series.index, 'tz', None) is not None:
+                        global_vix_series.index = global_vix_series.index
+                    vix_daily = global_vix_series.copy()
+                    vix_daily.index = vix_daily.index.normalize()
+                    
+                    df_idx_naive = df.index if getattr(df.index, 'tz', None) is not None else df.index
+                    vix_aligned_values = df_idx_naive.normalize().map(vix_daily)
+                    
+                    vix_aligned = pd.Series(vix_aligned_values, index=df.index).ffill().bfill()
+                    
+                    if vix_aligned.isna().all():
+                        vix_aligned = pd.Series(20.0, index=df.index)
                         
-                        df_idx_naive = df.index if getattr(df.index, 'tz', None) is not None else df.index
-                        vix_aligned_values = df_idx_naive.normalize().map(vix_daily)
-                        
-                        vix_aligned = pd.Series(vix_aligned_values, index=df.index).ffill().bfill()
-                        
-                        if vix_aligned.isna().all():
-                            vix_aligned = pd.Series(20.0, index=df.index)
-                            
-                        macro_data['VIX'] = vix_aligned
+                    macro_data['VIX'] = vix_aligned
 
                 print(f"\n   -> ⏳ 正在評估 {term} 策略潛力...")
                 params, score = self._run_optuna_optimization(symbol, df, bench_df, macro_data, term)
@@ -370,6 +439,13 @@ class PipelineManager:
             print(f"\n🎉 [{symbol}] 選拔結束！冠軍週期為: {best_term} (得分: {best_score:.2f})")
             
             best_params['term'] = best_term
+            
+            # 將 FMP 的寶貴基本面數據寫入最佳參數中，供實盤的 Market Analyzer 讀取
+            if fmp_data:
+                best_params['fmp_sector'] = fmp_data.get('sector')
+                best_params['fmp_industry'] = fmp_data.get('industry')
+                best_params['fmp_beta'] = fmp_data.get('beta')
+                best_params['fmp_mktCap'] = fmp_data.get('mktCap')
             
             bench_df = self.db.get_market_data_sync(self.benchmark_symbol, timeframe=self._get_term_settings(best_term)["bar_size"])
             if not bench_df.empty:
