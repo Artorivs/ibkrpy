@@ -110,22 +110,24 @@ async def run_live_mode(args):
     risk_controller = RiskController(rules=[VIXHaltRule(threshold=35.0)])
     
     symbols = [p.symbol for p in config.asset_profiles] if config.asset_profiles else ["AAPL"]
-    symbol_terms = {p.symbol: p.term for p in config.asset_profiles} if config.asset_profiles else {s: "long_term" for s in symbols}
     strategy_map = {}
+    symbol_terms = {}
+    
+    global_params_path = os.path.join(project_root, "weights", "global_best_params.json")
+    global_params = {}
+    if os.path.exists(global_params_path):
+        try:
+            with open(global_params_path, 'r', encoding='utf-8') as f:
+                global_params = json.load(f)
+        except Exception: pass
     
     for sym in symbols:
-        params_path = os.path.join(project_root, "weights", f"{sym}_best_params.json")
         cfg = config.get("strategy_settings") or {}
-        cfg['term'] = symbol_terms.get(sym, "long_term")
         
-        if os.path.exists(params_path):
-            try:
-                with open(params_path, 'r', encoding='utf-8') as f:
-                    saved_params = json.load(f)
-                    cfg.update(saved_params)
-                    if 'term' in saved_params:
-                        symbol_terms[sym] = saved_params['term']
-            except Exception: pass
+        if sym in global_params:
+            cfg.update(global_params[sym])
+            if 'term' in global_params[sym]:
+                symbol_terms[sym] = global_params[sym]['term']
             
         strategy_map[sym] = CoreStrategy(sym, cfg)
 

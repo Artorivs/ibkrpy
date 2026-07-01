@@ -16,7 +16,7 @@ class MarketAnalyzer:
         self.db = db_manager
         self.config = config_manager
         self.lookback_periods = 60  # 計算相關性與 Beta 使用的 K 線數量
-        self.benchmark_symbol = "SPY"
+        self.benchmark_symbol = "QQQ"
 
     def get_global_context(self) -> Dict[str, Any]:
         """
@@ -64,10 +64,10 @@ class MarketAnalyzer:
 
         # 4. 評估大盤宏觀趨勢與 Beta 值
         if self.benchmark_symbol in prices_df.columns:
-            spy_cum_ret = (prices_df[self.benchmark_symbol].iloc[-1] / prices_df[self.benchmark_symbol].iloc[0]) - 1
-            if spy_cum_ret > 0.003:   
+            benchmark_cum_ret = (prices_df[self.benchmark_symbol].iloc[-1] / prices_df[self.benchmark_symbol].iloc[0]) - 1
+            if benchmark_cum_ret > 0.003:   
                 context["macro_trend"] = "BULLISH"
-            elif spy_cum_ret < -0.003: 
+            elif benchmark_cum_ret < -0.003: 
                 context["macro_trend"] = "BEARISH"
 
             bench_var = returns_df[self.benchmark_symbol].var()

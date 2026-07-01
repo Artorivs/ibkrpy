@@ -34,14 +34,25 @@ class PipelineManager:
         self.ib_data = ib_data
         self.ext = ext_fetcher
         
-        self.benchmark_symbol = self.config.get("general_settings.benchmark_symbol", "SPY")
+        self.benchmark_symbol = self.config.get("general_settings.benchmark_symbol", "QQQ")
         self.symbols = [p.symbol for p in self.config.asset_profiles] if self.config.asset_profiles else ["AAPL"]
         if self.benchmark_symbol not in self.symbols:
             self.symbols.insert(0, self.benchmark_symbol)
             
-        self.symbol_terms = {p.symbol: p.term for p in self.config.asset_profiles} if self.config.asset_profiles else {}
-        if self.benchmark_symbol not in self.symbol_terms:
-            self.symbol_terms[self.benchmark_symbol] = "long_term"
+        self.symbol_terms = {}
+        param_path = os.path.join(WEIGHTS_DIR, "global_best_params.json")
+        if os.path.exists(param_path):
+            try:
+                with open(param_path, 'r', encoding='utf-8') as f:
+                    global_params = json.load(f)
+                    for sym, params in global_params.items():
+                        if "term" in params:
+                            self.symbol_terms[sym] = params["term"]
+            except Exception: pass
+            
+        for sym in self.symbols:
+            if sym not in self.symbol_terms:
+                self.symbol_terms[sym] = "long_term"
 
     def _get_term_settings(self, term: str) -> dict:
         """根據交易週期 (term) 返回最適合的 K線級別、總下載天數、與單次分批天數"""

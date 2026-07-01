@@ -35,7 +35,7 @@ class DataPipeline:
         """進階特徵工程：融合技術指標、大盤相關性與宏觀經濟數據"""
         df_adv = self.add_technical_indicators(df)
 
-        # 1. 跨資產相關性 (例如 SPY 大盤表現)
+        # 1. 跨資產相關性 (例如 QQQ 大盤表現)
         if benchmark_df is not None and not benchmark_df.empty:
             bench_ret = np.log(benchmark_df['Close'] / benchmark_df['Close'].shift(1))
             # 將大盤的收益率對齊到當前個股的時間軸

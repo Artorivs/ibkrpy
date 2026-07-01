@@ -55,7 +55,7 @@ class TradingEngine:
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """根據資產的標籤 (Tags) 動態選擇最適合的基準大盤 (Sector Benchmark)"""
-        default_bench = self.config.get("general_settings.benchmark_symbol", "SPY")
+        default_bench = self.config.get("general_settings.benchmark_symbol", "QQQ")
         
         # 尋找該資產的設定設定
         asset_profile = next((p for p in self.config.asset_profiles if p.symbol == symbol), None)
