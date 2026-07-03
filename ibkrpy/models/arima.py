@@ -1,5 +1,4 @@
 # ibkrpy/models/arima.py
-# arima.py: ARIMA 模型
 # 專司時間序列之線性預測，善於捕捉趨勢與均值回歸特性。
 
 import os
@@ -50,7 +49,6 @@ class ARIMAModel:
             return last_price
 
         try:
-            # 修改處：傳入 .values 以去除時間索引，避免 statsmodels 產生 missing freq 警告
             if self.model_results is not None:
                 # 模式 1: 使用已保存的模型，灌入最新數據更新狀態並預測
                 updated_model = self.model_results.apply(series.values)

@@ -1,4 +1,4 @@
-# ibkr_data_manager.py: IBKR 數據管家
+# ibkrpy/data/ibkr_data_manager.py
 # 將底層連接、歷史數據、實時訂閱與帳戶資訊統合於一處，去除過度碎片化的繼承。
 
 import asyncio

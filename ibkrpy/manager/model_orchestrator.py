@@ -1,4 +1,4 @@
-# model_orchestrator.py: 模型調度器
+# ibkrpy/manager/model_orchestrator.py
 # 專注於管理 ML 模型的記憶體生命週期、快取與預測分發，避免重複載入。
 
 import pandas as pd
@@ -19,8 +19,6 @@ class ModelOrchestrator:
             print(f"[{symbol}] 載入 {model_type} 模型至記憶體...")
             model = self.factory.create_model(model_type)
             
-            # 注意：深度學習模型可能使用 .h5 或 .keras，而 HMM (sklearn/hmmlearn) 通常使用 .pkl 或 joblib
-            # 這裡假設您的 model 封裝內部已經處理好了副檔名與載入邏輯
             model.load_weights(symbol) 
             self._loaded_models[cache_key] = model
             

@@ -1,5 +1,4 @@
 # ibkrpy/models/lstm.py
-# lstm.py: LSTM 模型
 # 專責捕捉時間序列的序列記憶效應，輸出下一個時間步的預測值。
 
 import os
@@ -44,7 +43,6 @@ class LSTMModel:
             Dense(1)
         ])
         
-        # [升級] 加入 clipnorm=1.0 梯度裁剪，防範黑天鵝數據引發的梯度爆炸
         optimizer = keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0)
         model.compile(optimizer=optimizer, loss=tf.keras.losses.Huber(delta=1.0))
         

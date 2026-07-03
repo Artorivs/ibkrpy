@@ -22,7 +22,6 @@ class AssetProfile:
     secType: str = "STK"
     exchange: str = "SMART"
     currency: str = "USD"
-    term: str = "long_term"
     tags: List[str] = None
 
 class ConfigManager:

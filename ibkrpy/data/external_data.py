@@ -1,5 +1,5 @@
-# external_data.py: 外部數據獲取器
-# 整合 FMP (基本面/產業) 與 FRED (宏觀經濟) API 的輕量級模組
+# ibkrpy/data/external_data.py
+# 外部數據獲取器，整合 FMP (基本面/產業) 與 FRED (宏觀經濟) API 的輕量級模組
 
 import aiohttp
 import asyncio
