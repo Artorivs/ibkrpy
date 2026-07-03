@@ -49,9 +49,9 @@ class TradingEngine:
         self.cached_funds = 0.0
         self.cached_net_liq = 0.0
         self.cached_positions = {}
-        
         self.cached_vix_series = None
         self.vix_last_fetch_time = 0.0
+        self.cached_benchmarks = {}
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """根據資產的標籤 (Tags) 動態選擇最適合的基準大盤 (Sector Benchmark)"""
@@ -84,6 +84,7 @@ class TradingEngine:
 
     async def update_system_state(self):
         """每一輪大迴圈開始前統一調用，更新帳戶快取與全局市場上下文"""
+        self.cached_benchmarks.clear() # 每一輪迴圈開始前清空大盤快取
         try:
             positions = await self.data.ib.reqPositionsAsync()
             account_summary = await self.data.ib.accountSummaryAsync()
@@ -213,47 +214,91 @@ class TradingEngine:
         
         if term == "short_term":
             bar_size_str = self.config.get("general_settings.short_term_bar_size", "5 mins")
-            duration_str = self.config.get("general_settings.short_term_duration", "60 D")
         elif term == "mid_term":
             bar_size_str = self.config.get("general_settings.mid_term_bar_size", "1 hour")
-            duration_str = self.config.get("general_settings.mid_term_duration", "180 D")
         else:
             bar_size_str = self.config.get("general_settings.long_term_bar_size", "1 day")
-            duration_str = self.config.get("general_settings.long_term_duration", "2 Y")
             
         is_short_term = (term == "short_term")
             
-        df = await self.data.fetch_historical_data(
-            contract=contract, duration=duration_str, bar_size=bar_size_str, what_to_show='TRADES'
+        # 實盤模式下，只向 IBKR 請求最近「3 天」的輕量數據
+        live_duration = "3 D" 
+        df_recent = await self.data.fetch_historical_data(
+            contract=contract, duration=live_duration, bar_size=bar_size_str, what_to_show='TRADES'
         )
+        
+        # 取得資料庫中的歷史長線資料，並與剛抓到的最新輕量資料合併 (Stitching)
+        df_db = pd.DataFrame()
+        if self.db:
+            df_db = self.db.get_market_data_sync(symbol, timeframe=bar_size_str)
+
+        if not df_recent.empty:
+            df_recent.index = pd.to_datetime(df_recent.index)
+            df_recent.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+            # 順手將這 3 天的新資料寫入 DB，讓資料庫保持最新
+            if self.db:
+                self.db.save_bulk_market_data(symbol, df_recent, timeframe=bar_size_str)
+
+        if not df_db.empty and not df_recent.empty:
+            # timezone-aware index alignment
+            df_recent = df_recent.tz_localize(df_db.index.tz) if df_db.index.tz else df_recent
+            df = pd.concat([df_db, df_recent])
+            # 去除重複時間戳，保留最新的報價
+            df = df[~df.index.duplicated(keep='last')].sort_index()
+        elif not df_recent.empty:
+            df = df_recent
+        else:
+            df = df_db
         
         if df.empty or len(df) < 60:
             print(f"[{symbol}] ⚠️ 獲取 {term} ({bar_size_str}) 實時 K 線失敗或數據量不足。")
             return
 
-        df.index = pd.to_datetime(df.index)
-
-        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-        if self.db:
-            self.db.save_bulk_market_data(symbol, df.tail(300))
         current_price = float(df['Close'].iloc[-1])
         
         benchmark_symbol = self._get_dynamic_benchmark(symbol)
         bench_df = pd.DataFrame()
         try:
             if benchmark_symbol == symbol:
-                # 標的本身就是大盤 (例如 QQQ)，避免重複抓取浪費 API 配額
                 bench_df = df.copy()
             else:
-                bench_contract = Stock(benchmark_symbol, "SMART", "USD")
-                await self.data.ib.qualifyContractsAsync(bench_contract)
-                bench_df_raw = await self.data.fetch_historical_data(
-                    contract=bench_contract, duration=duration_str, bar_size=bar_size_str, what_to_show='TRADES'
-                )
-                if not bench_df_raw.empty:
-                    bench_df_raw.index = pd.to_datetime(bench_df_raw.index)
-                    bench_df_raw.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-                    bench_df = bench_df_raw.reindex(df.index, method='ffill').bfill()
+                cache_key = f"{benchmark_symbol}_{bar_size_str}"
+                if cache_key in self.cached_benchmarks:
+                    bench_df_raw = self.cached_benchmarks[cache_key]
+                    if not bench_df_raw.empty:
+                        bench_df = bench_df_raw.reindex(df.index, method='ffill').bfill()
+                else:
+                    bench_contract = Stock(benchmark_symbol, "SMART", "USD")
+                    await self.data.ib.qualifyContractsAsync(bench_contract)
+                    
+                    bench_recent = await self.data.fetch_historical_data(
+                        contract=bench_contract, duration=live_duration, bar_size=bar_size_str, what_to_show='TRADES'
+                    )
+                    
+                    bench_db = pd.DataFrame()
+                    if self.db:
+                        bench_db = self.db.get_market_data_sync(benchmark_symbol, timeframe=bar_size_str)
+                        
+                    if not bench_recent.empty:
+                        bench_recent.index = pd.to_datetime(bench_recent.index)
+                        bench_recent.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                        if self.db:
+                            self.db.save_bulk_market_data(benchmark_symbol, bench_recent, timeframe=bar_size_str)
+
+                    if not bench_db.empty and not bench_recent.empty:
+                        bench_df_raw = pd.concat([bench_db, bench_recent])
+                        bench_df_raw = bench_df_raw[~bench_df_raw.index.duplicated(keep='last')].sort_index()
+                    elif not bench_recent.empty:
+                        bench_df_raw = bench_recent
+                    else:
+                        bench_df_raw = bench_db
+
+                    # 寫入快取，供同一迴圈的下一檔股票使用
+                    self.cached_benchmarks[cache_key] = bench_df_raw
+                    
+                    if not bench_df_raw.empty:
+                        bench_df = bench_df_raw.reindex(df.index, method='ffill').bfill()
+                        
         except Exception as e:
             print(f"[{symbol}] ⚠️ 獲取基準指標 Benchmark ({benchmark_symbol}) 失敗: {e}")
 
@@ -433,7 +478,7 @@ class TradingEngine:
 
         if trade_quantity <= 0: return
         
-        # 預設最低建倉門檻為 $500 美元 (可透過 config.yaml 的 min_trade_usd 配置調整)
+        # 預設最低建倉門檻
         min_trade_usd = self.config.get("strategy_settings.min_trade_usd", 500.0) 
         trade_value = trade_quantity * current_price
         
@@ -455,19 +500,19 @@ class TradingEngine:
             else:
                 algo_params = [TagValue('adaptivePriority', 'Normal')]
                 
-                # 2. 定義最大容忍滑價 (0.2%)，取代無底線的市價單
+                # 2. 定義最大容忍滑價 (0.2%)
                 slippage_buffer = 0.002
                 limit_entry_price = current_price * (1 + slippage_buffer) if action == "BUY" else current_price * (1 - slippage_buffer)
 
                 if is_closing_only:
-                    # 提早平倉：僅發送單一限價單即可 (舊的停損停利已在上方被清除)
+                    # 提早平倉
                     order = LimitOrder(action, trade_quantity, round(limit_entry_price, 2))
                     order.algoStrategy = 'Adaptive'
                     order.algoParams = algo_params
                     order.tif = 'DAY'
                     self.data.ib.placeOrder(contract, order)
                 else:
-                    # 全新開倉：發送帶有防護機制的 Bracket Order
+                    # 全新開倉
                     parent_id = self.data.ib.client.getReqId()
                     parent = LimitOrder(action, trade_quantity, round(limit_entry_price, 2))
                     parent.algoStrategy = 'Adaptive'
