@@ -51,11 +51,13 @@ class TradingEngine:
         self.cached_positions = {}
         self.cached_vix_series = None
         self.vix_last_fetch_time = 0.0
+
         self.cached_benchmarks = {}
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """根據資產的標籤 (Tags) 動態選擇最適合的基準大盤 (Sector Benchmark)"""
-        default_bench = self.config.get("general_settings.benchmark_symbol", "QQQ")
+        default_bench = self.config.get("general_settings.benchmark_symbol", "SPY")
+
         
         # 尋找該資產的設定設定
         asset_profile = next((p for p in self.config.asset_profiles if p.symbol == symbol), None)
@@ -231,24 +233,35 @@ class TradingEngine:
         df_db = pd.DataFrame()
         if self.db:
             df_db = self.db.get_market_data_sync(symbol, timeframe=bar_size_str)
+            if not df_db.empty:
+                df_db = df_db[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+                df_db.index = pd.to_datetime(df_db.index, utc=True)
 
         if not df_recent.empty:
-            df_recent.index = pd.to_datetime(df_recent.index)
+            df_recent.index = pd.to_datetime(df_recent.index, utc=True)
             df_recent.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+            df_recent = df_recent[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+            
+
             # 順手將這 3 天的新資料寫入 DB，讓資料庫保持最新
             if self.db:
                 self.db.save_bulk_market_data(symbol, df_recent, timeframe=bar_size_str)
 
         if not df_db.empty and not df_recent.empty:
-            # timezone-aware index alignment
-            df_recent = df_recent.tz_localize(df_db.index.tz) if df_db.index.tz else df_recent
             df = pd.concat([df_db, df_recent])
-            # 去除重複時間戳，保留最新的報價
+
             df = df[~df.index.duplicated(keep='last')].sort_index()
         elif not df_recent.empty:
             df = df_recent
         else:
             df = df_db
+            
+        # 確保型態正確 (防護 TA-Lib / Pandas TA 報錯)
+        cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in cols_to_keep:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
         
         if df.empty or len(df) < 60:
             print(f"[{symbol}] ⚠️ 獲取 {term} ({bar_size_str}) 實時 K 線失敗或數據量不足。")
@@ -278,10 +291,16 @@ class TradingEngine:
                     bench_db = pd.DataFrame()
                     if self.db:
                         bench_db = self.db.get_market_data_sync(benchmark_symbol, timeframe=bar_size_str)
+                        if not bench_db.empty:
+                            bench_db = bench_db[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+                            bench_db.index = pd.to_datetime(bench_db.index, utc=True)
                         
                     if not bench_recent.empty:
-                        bench_recent.index = pd.to_datetime(bench_recent.index)
+                        bench_recent.index = pd.to_datetime(bench_recent.index, utc=True)
                         bench_recent.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                        bench_recent = bench_recent[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+                        
+
                         if self.db:
                             self.db.save_bulk_market_data(benchmark_symbol, bench_recent, timeframe=bar_size_str)
 
@@ -292,6 +311,11 @@ class TradingEngine:
                         bench_df_raw = bench_recent
                     else:
                         bench_df_raw = bench_db
+                        
+                    for col in cols_to_keep:
+                        if col in bench_df_raw.columns:
+                            bench_df_raw[col] = pd.to_numeric(bench_df_raw[col], errors='coerce')
+
 
                     # 寫入快取，供同一迴圈的下一檔股票使用
                     self.cached_benchmarks[cache_key] = bench_df_raw

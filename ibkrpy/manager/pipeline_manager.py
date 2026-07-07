@@ -27,7 +27,7 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 class PipelineManager:
     """整合資料抓取、特徵工程與 AI 模型重訓的管線管理器"""
     
-    def __init__(self, config: ConfigManager, db: DatabaseManager, pipeline: DataPipeline, ib_data: IBKRDataManager, ext_fetcher: ExternalDataFetcher):
+    def __init__(self, config: ConfigManager, db: DatabaseManager, pipeline: DataPipeline, ib_data: IBKRDataManager, ext_fetcher: ExternalDataFetcher, target_symbol: str = None):
         self.config = config
         self.db = db
         self.pipeline = pipeline
@@ -35,7 +35,14 @@ class PipelineManager:
         self.ext = ext_fetcher
         
         self.benchmark_symbol = self.config.get("general_settings.benchmark_symbol", "SPY")
-        self.symbols = [p.symbol for p in self.config.asset_profiles] if self.config.asset_profiles else ["AAPL"]
+        
+        # 如果有指定單一標的，則直接覆蓋 self.symbols
+        if target_symbol:
+            self.symbols = [target_symbol]
+        else:
+            self.symbols = [p.symbol for p in self.config.asset_profiles] if self.config.asset_profiles else ["AAPL"]
+            
+        # 確保基準大盤必定存在於下載與訓練列表中 (放置於首位優先下載)
         if self.benchmark_symbol not in self.symbols:
             self.symbols.insert(0, self.benchmark_symbol)
             

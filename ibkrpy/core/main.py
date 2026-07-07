@@ -61,7 +61,7 @@ def launch_dashboard():
     ui_path = os.path.join(project_root, core_dir_name, "ui", "trading_dashboard.py")
     subprocess.Popen([sys.executable, ui_path])
 
-async def run_pipeline_mode(mode: str):
+async def run_pipeline_mode(mode: str, target_symbol: str = None):
     config = ConfigManager()
     db_manager = DatabaseManager()
     data_pipeline = DataPipeline()
@@ -72,7 +72,7 @@ async def run_pipeline_mode(mode: str):
     
     await ib_manager.connect()
 
-    pipeline = PipelineManager(config=config, db=db_manager, pipeline=data_pipeline, ib_data=ib_manager, ext_fetcher=ext_fetcher)
+    pipeline = PipelineManager(config=config, db=db_manager, pipeline=data_pipeline, ib_data=ib_manager, ext_fetcher=ext_fetcher, target_symbol=target_symbol)
     try:
         if mode == "download": await pipeline.run_data_ingestion()
         elif mode == "train": await pipeline.run_training_and_tuning()
@@ -110,6 +110,10 @@ async def run_live_mode(args):
     risk_controller = RiskController(rules=[VIXHaltRule(threshold=35.0)])
     
     symbols = [p.symbol for p in config.asset_profiles] if config.asset_profiles else ["AAPL"]
+    # 覆蓋為單一標的 (若有提供)
+    if args.symbol:
+        symbols = [args.symbol]
+
     strategy_map = {}
     symbol_terms = {}
     
@@ -140,7 +144,11 @@ async def run_live_mode(args):
 
     try:
         if args.mode == "live": await live_trading_loop(engine, symbols, interval_minutes=5)
-        elif args.mode == "daemon": await SystemDaemon(ib_manager, engine, PipelineManager(config, db_manager, data_pipeline, ib_manager, ext_fetcher), symbols).run_24_7()
+        elif args.mode == "daemon": 
+            await SystemDaemon(ib_manager, 
+                               engine, 
+                               PipelineManager(config, db_manager, data_pipeline, ib_manager, ext_fetcher, target_symbol=args.symbol), 
+                               symbols).run_24_7()
     except KeyboardInterrupt: pass
     finally:
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
@@ -148,6 +156,7 @@ async def run_live_mode(args):
 def main():
     parser = argparse.ArgumentParser(description="IBKR AI 量化交易系統 總樞紐", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--mode", type=str, required=True, choices=["download", "train", "autopilot", "live", "daemon", "ui"])
+    parser.add_argument("symbol", nargs="?", type=str, default=None, help="指定單一股票代碼 (選填，例如 MRVL)")
     parser.add_argument("--ui", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -157,9 +166,9 @@ def main():
         if args.mode == "ui": sys.exit(0)
     
     match args.mode:
-        case "download": asyncio.run(run_pipeline_mode("download"))
-        case "train": asyncio.run(run_pipeline_mode("train"))
-        case "autopilot": asyncio.run(run_pipeline_mode("autopilot"))
+        case "download": asyncio.run(run_pipeline_mode("download", args.symbol))
+        case "train": asyncio.run(run_pipeline_mode("train", args.symbol))
+        case "autopilot": asyncio.run(run_pipeline_mode("autopilot", args.symbol))
         case "live": asyncio.run(run_live_mode(args))
         case "daemon": asyncio.run(run_live_mode(args))
 
