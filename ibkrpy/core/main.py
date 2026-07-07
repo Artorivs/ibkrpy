@@ -140,7 +140,11 @@ async def run_live_mode(args):
 
     try:
         if args.mode == "live": await live_trading_loop(engine, symbols, interval_minutes=5)
-        elif args.mode == "daemon": await SystemDaemon(ib_manager, engine, PipelineManager(config, db_manager, data_pipeline, ib_manager, ext_fetcher), symbols).run_24_7()
+        elif args.mode == "daemon": 
+            await SystemDaemon(ib_manager, 
+                               engine, 
+                               PipelineManager(config, db_manager, data_pipeline, ib_manager, ext_fetcher), 
+                               symbols).run_24_7()
     except KeyboardInterrupt: pass
     finally:
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
