@@ -68,7 +68,7 @@ class PipelineManager:
         elif term == "mid_term":
             return {"bar_size": self.config.get("general_settings.mid_term_bar_size", "1 hour"), "total_days": 180, "chunk_days": 90}
         else: 
-            return {"bar_size": self.config.get("general_settings.long_term_bar_size", "1 day"), "total_days": 730, "chunk_days": 730}
+            return {"bar_size": self.config.get("general_settings.long_term_bar_size", "1 day"), "total_days": 730, "chunk_days": 365}
 
     async def _sync_symbol_term_data(self, symbol: str, term: str, contract: Stock):
         """核心資料抓取模組，支援動態按需調用"""

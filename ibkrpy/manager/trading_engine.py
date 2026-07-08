@@ -53,6 +53,15 @@ class TradingEngine:
         self.vix_last_fetch_time = 0.0
 
         self.cached_benchmarks = {}
+        self.qualified_contracts = {}
+
+    async def _get_qualified_contract(self, symbol: str) -> Stock:
+        """獲取並緩存合約，避免每個迴圈重複向 IBKR 請求驗證"""
+        if symbol not in self.qualified_contracts:
+            contract = Stock(symbol, "SMART", "USD")
+            await self.data.ib.qualifyContractsAsync(contract)
+            self.qualified_contracts[symbol] = contract
+        return self.qualified_contracts[symbol]
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """根據資產的標籤 (Tags) 動態選擇最適合的基準大盤 (Sector Benchmark)"""
@@ -142,15 +151,20 @@ class TradingEngine:
                 await self._attach_oca_protection(symbol, pos_qty)
 
     async def _attach_oca_protection(self, symbol: str, pos_qty: float):
-        contract = Stock(symbol, "SMART", "USD")
+        contract = await self._get_qualified_contract(symbol)
         try:
-            await self.data.ib.qualifyContractsAsync(contract)
-            
-            # 獲取日 K 以計算真實波動率
-            df = await self.data.fetch_historical_data(contract, duration='60 D', bar_size='1 day')
+            # 優先從 DB 讀取日 K 計算真實波動率，避免每 5 分鐘因未平倉而狂刷 60 天歷史請求
+            df = pd.DataFrame()
+            if self.db:
+                df = self.db.get_market_data_sync(symbol, timeframe='1 day')
+                
+            if df.empty or len(df) < 10:
+                df = await self.data.fetch_historical_data(contract, duration='60 D', bar_size='1 day')
+                
             if df.empty: return
             
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+            if 'close' in df.columns:
+                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
             
             current_price = float(df['Close'].iloc[-1])
             returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
@@ -209,8 +223,7 @@ class TradingEngine:
         net_liquidation = self.cached_net_liq
         current_pos = self.cached_positions.get(symbol, 0.0)
         
-        contract = Stock(symbol, "SMART", "USD")
-        await self.data.ib.qualifyContractsAsync(contract)
+        contract = await self._get_qualified_contract(symbol)
         
         term = self.symbol_terms.get(symbol, "long_term")
         
@@ -281,8 +294,7 @@ class TradingEngine:
                     if not bench_df_raw.empty:
                         bench_df = bench_df_raw.reindex(df.index, method='ffill').bfill()
                 else:
-                    bench_contract = Stock(benchmark_symbol, "SMART", "USD")
-                    await self.data.ib.qualifyContractsAsync(bench_contract)
+                    bench_contract = await self._get_qualified_contract(benchmark_symbol)
                     
                     bench_recent = await self.data.fetch_historical_data(
                         contract=bench_contract, duration=live_duration, bar_size=bar_size_str, what_to_show='TRADES'
@@ -330,13 +342,13 @@ class TradingEngine:
         if self.ext:
             current_time = time.time()
             
-            if self.cached_vix_series is None or (current_time - self.vix_last_fetch_time) > 14400:
+            if self.cached_vix_series is None or (current_time - self.vix_last_fetch_time) > 28800:
                 try:
                     vix_series = await self.ext.fetch_fred_series("VIXCLS")
                     if vix_series is not None and not vix_series.empty:
                         self.cached_vix_series = vix_series
                         self.vix_last_fetch_time = current_time
-                        print(f"🌍 [系統] 成功從 FRED 更新宏觀數據 (VIXCLS)，已寫入本地快取 (有效期限 4 小時)。")
+                        print(f"🌍 [系統] 成功從 FRED 更新宏觀數據 (VIXCLS)，已寫入本地快取 (有效期限 8 小時)。")
                 except Exception as e:
                     print(f"⚠️ 獲取 FRED 數據失敗，將維持使用本地快取: {e}")
 
