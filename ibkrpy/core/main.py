@@ -9,7 +9,6 @@ import subprocess
 import json
 import warnings
 import caffeine
-import datetime
 
 # ========== macOS 基礎防禦 ==========
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -42,19 +41,28 @@ from ibkrpy.models.lstm import LSTMModel
 from ibkrpy.models.transformer import TransformerModel
 from ibkrpy.models.arima import ARIMAModel
 from ibkrpy.models.garch import GARCHModel
-from ibkrpy.models.hmm import HMMModel
+
 
 class AutomatedModelFactory:
-    def __init__(self):
+    def __init__(self, data_pipeline=None):
         self.weights_dir = os.path.join(project_root, "weights")
         os.makedirs(self.weights_dir, exist_ok=True)
+        self.pipeline = data_pipeline
 
-    def create_model(self, model_type):
-        if model_type == "LSTM": return LSTMModel(weights_dir=self.weights_dir)
-        if model_type == "Transformer": return TransformerModel(weights_dir=self.weights_dir)
-        if model_type == "ARIMA": return ARIMAModel(weights_dir=self.weights_dir)
-        if model_type == "GARCH": return GARCHModel(weights_dir=self.weights_dir)
-        if model_type == "HMM": return HMMModel(weights_dir=self.weights_dir)
+    def _features_for(self, symbol):
+        if symbol is None or self.pipeline is None:
+            return None
+        return self.pipeline.load_feature_manifest(symbol)
+
+    def create_model(self, model_type, symbol=None):
+        if model_type == "LSTM":
+            return LSTMModel(feature_cols=self._features_for(symbol), weights_dir=self.weights_dir)
+        if model_type == "Transformer":
+            return TransformerModel(feature_cols=self._features_for(symbol), weights_dir=self.weights_dir)
+        if model_type == "ARIMA":
+            return ARIMAModel(weights_dir=self.weights_dir)
+        if model_type == "GARCH":
+            return GARCHModel(weights_dir=self.weights_dir)
         raise ValueError(f"未知的模型類型: {model_type}")
 
 def launch_dashboard():
@@ -70,7 +78,11 @@ async def run_pipeline_mode(mode: str, target_symbol: str = None):
     ib_manager = IBKRDataManager(host=config.get("ib_settings.host", "127.0.0.1"), port=config.get("ib_settings.port", 7497), client_id=config.get("ib_settings.client_id", 1))
     print(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
     
-    await ib_manager.connect()
+    try:
+        await ib_manager.connect()
+    except ConnectionError as e:
+        print(f"❌ 無法連線至 IBKR，中止本次作業: {e}")
+        return
 
     pipeline = PipelineManager(config=config, db=db_manager, pipeline=data_pipeline, ib_data=ib_manager, ext_fetcher=ext_fetcher, target_symbol=target_symbol)
     try:
@@ -81,7 +93,6 @@ async def run_pipeline_mode(mode: str, target_symbol: str = None):
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
 
 async def live_trading_loop(engine: TradingEngine, symbols: list, interval_minutes: int = 5):
-    logger = setup_logger()
     try:
         while True:
             await engine.update_system_state()
@@ -102,11 +113,16 @@ async def run_live_mode(args):
     ib_manager = IBKRDataManager(host=config.get("ib_settings.host", "127.0.0.1"), port=config.get("ib_settings.port", 7497), client_id=config.get("ib_settings.client_id", 1))
     print(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
     
-    await ib_manager.connect()
-        
-    if not ib_manager.ib.isConnected(): return
+    try:
+        await ib_manager.connect()
+    except ConnectionError as e:
+        print(f"❌ 無法連線至 IBKR，中止啟動: {e}")
+        return
 
-    model_orchestrator = ModelOrchestrator(model_factory=AutomatedModelFactory())
+    model_orchestrator = ModelOrchestrator(
+        model_factory=AutomatedModelFactory(data_pipeline=data_pipeline),
+        data_pipeline=data_pipeline,
+    )
     risk_controller = RiskController(rules=[VIXHaltRule(threshold=35.0)])
     
     symbols = [p.symbol for p in config.asset_profiles] if config.asset_profiles else ["AAPL"]
@@ -126,7 +142,7 @@ async def run_live_mode(args):
         except Exception: pass
     
     for sym in symbols:
-        cfg = config.get("strategy_settings") or {}
+        cfg = dict(config.get("strategy_settings") or {})
         
         if sym in global_params:
             cfg.update(global_params[sym])
@@ -139,7 +155,8 @@ async def run_live_mode(args):
         data_manager=ib_manager, model_orchestrator=model_orchestrator,
         risk_controller=risk_controller, strategy_map=strategy_map, db_manager=db_manager,
         ext_fetcher=ext_fetcher, market_analyzer=market_analyzer, data_pipeline=data_pipeline,
-        regime_detector=regime_detector, dry_run=args.dry_run, symbol_terms=symbol_terms
+        regime_detector=regime_detector, dry_run=args.dry_run, symbol_terms=symbol_terms,
+        config_manager=config,
     )
 
     try:
@@ -154,6 +171,9 @@ async def run_live_mode(args):
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
 
 def main():
+    _boot_config = ConfigManager()
+    setup_logger(_boot_config.get("log_settings") or {})
+
     parser = argparse.ArgumentParser(description="IBKR AI 量化交易系統 總樞紐", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--mode", type=str, required=True, choices=["download", "train", "autopilot", "live", "daemon", "ui"])
     parser.add_argument("symbol", nargs="?", type=str, default=None, help="指定單一股票代碼 (選填，例如 MRVL)")

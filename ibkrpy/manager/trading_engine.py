@@ -64,34 +64,10 @@ class TradingEngine:
         return self.qualified_contracts[symbol]
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
-        """根據資產的標籤 (Tags) 動態選擇最適合的基準大盤 (Sector Benchmark)"""
-        default_bench = self.config.get("general_settings.benchmark_symbol", "SPY")
-
-        
-        # 尋找該資產的設定設定
-        asset_profile = next((p for p in self.config.asset_profiles if p.symbol == symbol), None)
-        if not asset_profile or not asset_profile.tags:
-            return default_bench
-            
-        tags = [t.upper() for t in asset_profile.tags]
-        
-        # 根據特性標籤匹配最佳大盤 ETF
-        if any(t in tags for t in ["TECH", "SOFTWARE", "SEMICONDUCTOR", "CLOUD", "AI", "CYBERSECURITY"]):
-            return "QQQ"  # 納斯達克 100 (科技成長股)
-        elif "FINANCIALS" in tags or "BANKING" in tags:
-            return "XLF"  # 金融板塊 ETF
-        elif "ENERGY" in tags or "OIL" in tags:
-            return "XLE"  # 能源板塊 ETF
-        elif "HEALTHCARE" in tags or "PHARMACEUTICALS" in tags:
-            return "XLV"  # 醫療保健板塊 ETF
-        elif "CONSUMER_STAPLES" in tags or "RETAIL" in tags:
-            return "XLP"  # 必需消費品板塊 ETF
-        elif "UTILITIES" in tags:
-            return "XLU"  # 公用事業板塊 ETF
-        elif "INDUSTRIALS" in tags:
-            return "XLI"  # 工業板塊 ETF
-            
-        return default_bench
+        """
+        回傳該標的使用的 benchmark。
+        """
+        return self.config.get("general_settings.benchmark_symbol", "QQQ")
 
     async def update_system_state(self):
         """每一輪大迴圈開始前統一調用，更新帳戶快取與全局市場上下文"""
@@ -138,16 +114,17 @@ class TradingEngine:
         for symbol, pos_qty in positions.items():
             if pos_qty == 0: continue
             
-            # 檢查該標的是否有反向的未決訂單 (SELL單若持倉為正，BUY單若持倉為負)
             protect_action = "SELL" if pos_qty > 0 else "BUY"
-            has_protection = False
+            protected_qty = 0.0
             for t in open_trades:
-                if t.contract.symbol == symbol and t.order.action == protect_action:
-                    has_protection = True
-                    break
+                if (t.contract.symbol == symbol
+                        and t.order.action == protect_action
+                        and t.order.orderType in ("STP", "STP LMT")):
+                    protected_qty += float(t.order.totalQuantity or 0)
+            has_protection = protected_qty >= abs(pos_qty)
                     
             if not has_protection:
-                print(f"\n[守護神] 🛡️ 偵測到 {symbol} 存在無保護持倉 ({pos_qty} 股)，準備自動掛載 OCA 停損停利單...")
+                print(f"\n[守護] 🛡️ 偵測到 {symbol} 存在無保護持倉 ({pos_qty} 股)，準備自動掛載 OCA 停損停利單...")
                 await self._attach_oca_protection(symbol, pos_qty)
 
     async def _attach_oca_protection(self, symbol: str, pos_qty: float):
@@ -169,7 +146,15 @@ class TradingEngine:
             current_price = float(df['Close'].iloc[-1])
             returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
             annual_vol = returns.std() * np.sqrt(252) if len(returns) > 10 else 0.20
-            daily_vol = annual_vol / math.sqrt(252)
+
+            term = self.symbol_terms.get(symbol, "long_term")
+            if term == "short_term":
+                periods_per_year = 252 * 78     # 5 分 K
+            elif term == "mid_term":
+                periods_per_year = 252 * 6.5    # 1 小時 K
+            else:
+                periods_per_year = 252          # 日 K
+            daily_vol = annual_vol / math.sqrt(periods_per_year)
             
             # 從策略抓取乘數設定，若無則預設停損 2.0 倍 / 停利 3.0 倍波動
             strategy = self.strategies.get(symbol)
@@ -370,7 +355,7 @@ class TradingEngine:
             df_adv = self.pipeline.engineer_advanced_features(df, bench_data, macro_dict)
             df_adv = df_adv.ffill().bfill().fillna(0)
             
-            scale_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            df_adv, scale_cols = self.pipeline.align_to_manifest(df_adv, symbol)
             df_scaled = self.pipeline.transform_scale(df_adv, columns=scale_cols, symbol=symbol)
         else:
             df_adv = df.ffill().bfill().fillna(0)
@@ -405,21 +390,13 @@ class TradingEngine:
                 
             pred_real = None
             if self.pipeline and m_type in ["LSTM", "Transformer"]:
-                try:
-                    pred_real_arr = self.pipeline.inverse_transform_scale(pred_raw, "Close", symbol)
-                    if isinstance(pred_real_arr, (list, np.ndarray)):
-                        pred_real = float(pred_real_arr[0])
-                    else:
-                        pred_real = float(pred_real_arr)
-                except Exception:
-                    try:
-                        scaler = self.pipeline.scalers.get(symbol)
-                        if scaler:
-                            c_min = scaler.data_min_[3]
-                            c_max = scaler.data_max_[3]
-                            pred_real = float(pred_raw) * (c_max - c_min) + c_min
-                    except Exception:
-                        pass
+                pred_real_arr = self.pipeline.inverse_transform_scale(pred_raw, "Close", symbol)
+                if pred_real_arr is None:
+                    continue
+                if isinstance(pred_real_arr, (list, np.ndarray)):
+                    pred_real = float(pred_real_arr[0]) if len(pred_real_arr) > 0 else None
+                else:
+                    pred_real = float(pred_real_arr)
             else:
                 pred_real = float(pred_raw)
                 
@@ -428,7 +405,7 @@ class TradingEngine:
                 
             deviation = abs(pred_real - current_price) / current_price
             if pred_real <= 0 or deviation > 0.10:
-                print(f"[{symbol}] 🛡️ 剔除 {m_type} 嚴重偏離或失效之預測 (預測: {pred_real:.2f} | 現價: {current_price:.2f} | 偏差: {deviation*100:.1f}%)")
+                # print(f"[{symbol}] 🛡️ 剔除 {m_type} 嚴重偏離或失效之預測 (預測: {pred_real:.2f} | 現價: {current_price:.2f} | 偏差: {deviation*100:.1f}%)")
                 continue
                 
             ensemble_preds[m_type] = pred_real
@@ -526,7 +503,7 @@ class TradingEngine:
         print(f"[{symbol}] 🎯 準備執行 ({term_name}): {action} {trade_quantity} 股 @ 市價約 {current_price:.2f} (動態分配權重: {final_weight*100:.1f}%)")
         print(f"      => [安全防護] 停損單(STP)設定於: {sl_price:.2f} | 停利單(LMT)設定於: {tp_price:.2f}")
         
-        contract = Stock(symbol, "SMART", "USD")
+        contract = await self._get_qualified_contract(symbol)
         try:
             # 1. 下單前強制清理歷史孤兒單
             await self._cancel_open_orders(symbol)

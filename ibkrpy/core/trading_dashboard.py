@@ -1,4 +1,4 @@
-# ibkrpy/ui/trading_dashboard.py
+# ibkrpy/core/trading_dashboard.py
 # 系統視覺化監控儀表板
 
 import os

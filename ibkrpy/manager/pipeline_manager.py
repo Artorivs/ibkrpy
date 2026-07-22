@@ -153,8 +153,7 @@ class PipelineManager:
             df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
             if not df_existing.empty:
-                df_combined = pd.concat([df_existing, df_new])
-                df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
+                df_combined = df_new
                 df_combined.sort_index(inplace=True)
                 self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
             else:
@@ -178,10 +177,16 @@ class PipelineManager:
         df_adv = self.pipeline.engineer_advanced_features(df, bench_df, macro_data)
         df_adv = df_adv.ffill().bfill().fillna(0)
         
-        scale_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        self.pipeline.fit_scale(df_adv, scale_cols, symbol)
+        scale_cols = self.pipeline.select_model_features(df_adv)
+        self.pipeline.save_feature_manifest(symbol, scale_cols)
+        print(f"      => 特徵欄位: {len(scale_cols)} 個")
+
+        split = int(len(df_adv) * 0.8)
+        df_train = df_adv.iloc[:split]
+
+        self.pipeline.fit_scale(df_train, scale_cols, symbol)
         df_scaled = self.pipeline.transform_scale(df_adv, scale_cols, symbol)
-        
+
         look_back = 60
         X, y = self.pipeline.create_sequences(df_scaled, scale_cols, 'Close', look_back)
         
@@ -198,12 +203,16 @@ class PipelineManager:
             from ibkrpy.models.lstm import LSTMModel
             from ibkrpy.models.transformer import TransformerModel
 
-            callbacks = [EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)]
+            callbacks = [EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)]
+            fit_kwargs = dict(
+                epochs=25, batch_size=dynamic_batch_size, verbose=0,
+                callbacks=callbacks, validation_split=0.2, shuffle=False,  # 時序資料不可打亂
+            )
 
             print(f"   -> 🚀 擬合 LSTM 模型 (Batch Size: {dynamic_batch_size})...")
             lstm = LSTMModel(look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR)
             lstm.model = lstm._build_model()
-            lstm.model.fit(X, y, epochs=25, batch_size=dynamic_batch_size, verbose=0, callbacks=callbacks)
+            lstm.model.fit(X, y, **fit_kwargs)
             lstm_path = os.path.join(WEIGHTS_DIR, f"{symbol}_LSTM.keras")
             lstm.model.save(lstm_path)
             
@@ -213,7 +222,7 @@ class PipelineManager:
             print(f"   -> 🚀 擬合 Transformer 模型 (Batch Size: {dynamic_batch_size})...")
             transformer = TransformerModel(look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR)
             transformer.model = transformer._build_model()
-            transformer.model.fit(X, y, epochs=25, batch_size=dynamic_batch_size, verbose=0, callbacks=callbacks)
+            transformer.model.fit(X, y, **fit_kwargs)
             tf_path = os.path.join(WEIGHTS_DIR, f"{symbol}_Transformer.keras")
             transformer.model.save(tf_path)
             
@@ -233,9 +242,9 @@ class PipelineManager:
             print(f"⚠️ [{symbol}] 資料量不足以進行有效訓練，跳過統計模型。")
             return
             
-        weights_dir = os.path.abspath("weights")
+        weights_dir = WEIGHTS_DIR
         os.makedirs(weights_dir, exist_ok=True)
-        
+
         classical_bundle = {}
 
         print(f"   -> 擬合 ARIMA 模型...")
@@ -259,21 +268,12 @@ class PipelineManager:
                 print(f"      ✅ GARCH 模型訓練完成")
         except Exception as e: print(f"   ⚠️ GARCH 訓練失敗: {e}")
 
-        print(f"   -> 擬合 HMM 模型...")
-        try:
-            from hmmlearn.hmm import GaussianHMM
-            df_features = pd.DataFrame(index=df.index)
-            df_features['log_return'] = np.log(df['Close'] / df['Close'].shift(1)) * 100.0
-            df_features['volatility'] = df_features['log_return'].rolling(window=5).std()
-            df_features = df_features.dropna()
-            X_hmm = df_features[['log_return', 'volatility']].values
-            if len(X_hmm) > 20:
-                hmm = GaussianHMM(n_components=2, covariance_type="full", n_iter=100)
-                hmm.fit(X_hmm)
-                classical_bundle['hmm'] = hmm
-                print(f"      ✅ HMM 模型訓練完成")
-        except Exception as e: print(f"   ⚠️ HMM 訓練失敗: {e}")
-        
+        # 註：原 HMM 訓練已移除。grep 確認 ModelOrchestrator.detect_regime
+        # 全專案只有定義處出現過一次，TradingEngine 從未呼叫 ——
+        # 實盤情境判定一律走 MarketRegimeDetector (ADX/SMA/ATR)。
+        # 每次重訓為一個沒有消費者的模型跑 100 次 EM 迭代是純粹的浪費。
+        # 若日後要啟用，請先把 detect_regime 接進 run_tick 再恢復此段。
+
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
         
@@ -395,13 +395,7 @@ class PipelineManager:
                         cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
                         df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
-                        if not df_existing.empty:
-                            df_combined = pd.concat([df_existing, df_new])
-                            df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
-                            df_combined.sort_index(inplace=True)
-                            self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
-                        else:
-                            self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
+                        self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
                             
                         print(f"      ✅ 成功合併並寫入 {len(df_new)} 筆 {bar_size} K線。")
                     else:
@@ -558,9 +552,9 @@ class PipelineManager:
             self._train_dl_models(symbol, best_df, bench_df, best_macro)
             self._train_safe_models(symbol, best_df)
             
-            weights_dir = os.path.abspath("weights")
+            weights_dir = WEIGHTS_DIR
             os.makedirs(weights_dir, exist_ok=True)
-            
+
             param_path = os.path.join(weights_dir, "global_best_params.json")
             global_params = {}
             if os.path.exists(param_path):
