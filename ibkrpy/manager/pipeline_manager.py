@@ -178,17 +178,30 @@ class PipelineManager:
         df_adv = df_adv.ffill().bfill().fillna(0)
         
         scale_cols = self.pipeline.select_model_features(df_adv)
-        self.pipeline.save_feature_manifest(symbol, scale_cols)
-        print(f"      => 特徵欄位: {len(scale_cols)} 個")
+
+        price_rel = self.pipeline.classify_price_relative(df_adv, scale_cols)
+        minmax_cols = [c for c in scale_cols if c not in price_rel]
+
+        self.pipeline.save_feature_manifest(
+            symbol, scale_cols, price_relative=price_rel,
+            target_mode="log_return", target_scale=100.0,
+        )
+        print(f"      => 特徵欄位: {len(scale_cols)} 個 "
+              f"(價格相對 {len(price_rel)} / Min-Max {len(minmax_cols)})，目標: 對數報酬率")
 
         split = int(len(df_adv) * 0.8)
         df_train = df_adv.iloc[:split]
 
-        self.pipeline.fit_scale(df_train, scale_cols, symbol)
-        df_scaled = self.pipeline.transform_scale(df_adv, scale_cols, symbol)
+        self.pipeline.fit_scale(df_train, minmax_cols, symbol)
+        df_scaled = self.pipeline.transform_scale(df_adv, minmax_cols, symbol)
 
         look_back = 60
-        X, y = self.pipeline.create_sequences(df_scaled, scale_cols, 'Close', look_back)
+        X, y = self.pipeline.create_sequences(
+            df_scaled, scale_cols, look_back,
+            raw_close=df_adv['Close'],
+            price_relative=price_rel,
+            target_mode="log_return", target_scale=100.0,
+        )
         
         print(f"      => 總 K 線數: {len(df_adv)} 筆，產出有效訓練序列: {len(X)} 組")
         
@@ -268,44 +281,199 @@ class PipelineManager:
                 print(f"      ✅ GARCH 模型訓練完成")
         except Exception as e: print(f"   ⚠️ GARCH 訓練失敗: {e}")
 
-        # 註：原 HMM 訓練已移除。grep 確認 ModelOrchestrator.detect_regime
-        # 全專案只有定義處出現過一次，TradingEngine 從未呼叫 ——
-        # 實盤情境判定一律走 MarketRegimeDetector (ADX/SMA/ATR)。
-        # 每次重訓為一個沒有消費者的模型跑 100 次 EM 迭代是純粹的浪費。
-        # 若日後要啟用，請先把 detect_regime 接進 run_tick 再恢復此段。
-
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
         
         if os.path.exists(bundle_path):
             print(f"✅ [{symbol}] 統計模型整合包 (Classical Bundle) 寫入完成。")
 
-    def _run_optuna_optimization(self, symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, macro_data: dict, term: str) -> Tuple[dict, float]:
-        """使用 Optuna 進行參數最佳化，並回傳 (最佳參數, 複合評分)"""
-        tuner = ModelTuner(model_orchestrator=None, data_manager=None)
-        precomputed_data = df.copy()
-        if not precomputed_data.empty:
-            np.random.seed(42)
-            precomputed_data['prediction'] = precomputed_data['Close'] * (1 + np.random.normal(0, 0.005, len(precomputed_data)))
-            
-            bar_volatility = precomputed_data['Close'].pct_change().rolling(20).std().fillna(0.005)
-            precomputed_data['volatility'] = bar_volatility.replace(0, 0.005)
-            
-            regimes = ['BULL_TREND', 'BEAR_TREND', 'SIDEWAYS_VOLATILE', 'SIDEWAYS_QUIET']
-            precomputed_data['regime'] = np.random.choice(regimes, len(precomputed_data), p=[0.3, 0.3, 0.3, 0.1])
-            
+    # ------------------------------------------------------------------
+    # Walk-forward 尋優
+    # ------------------------------------------------------------------
+
+    def _vectorised_regimes(self, df: pd.DataFrame) -> pd.Series:
+        """
+        對整段資料一次算出各根 K 線的市場情境。
+
+        與 MarketRegimeDetector.detect() 的判定邏輯完全相同，只是把逐根呼叫
+        (每次重算全序列指標) 改為向量化計算一次 —— 結果一致但快上數個量級。
+        """
+        import pandas_ta as ta
+        from ibkrpy.strategy.strategy_components import MarketRegimeDetector
+
+        d = MarketRegimeDetector()
+        out = pd.Series("SIDEWAYS_QUIET", index=df.index, dtype=object)
+
         try:
-            best_params, best_score = tuner.optimize_strategy_params(symbol, df, precomputed_data, n_trials=20, term=term)
-            return best_params, best_score
+            adx = ta.adx(df['High'], df['Low'], df['Close'], length=d.adx_period)
+            adx_val = adx.iloc[:, 0] if adx is not None and not adx.empty else pd.Series(0.0, index=df.index)
+            sma_s = ta.sma(df['Close'], length=d.ma_short)
+            sma_l = ta.sma(df['Close'], length=d.ma_long)
+            atr = ta.atr(df['High'], df['Low'], df['Close'], length=d.atr_period)
+            atr_pct = (atr / df['Close']).fillna(0.0)
+
+            trending = adx_val.fillna(0.0) > d.adx_threshold
+            volatile = atr_pct > d.vol_threshold
+            bull = sma_s > sma_l
+
+            out[trending & bull] = "BULL_TREND"
+            out[trending & ~bull] = "BEAR_TREND"
+            out[~trending & volatile] = "SIDEWAYS_VOLATILE"
+            out[~trending & ~volatile] = "SIDEWAYS_QUIET"
+        except Exception as e:
+            print(f"      ⚠️ 情境向量化計算失敗，全段退回 SIDEWAYS_QUIET: {e}")
+
+        return out
+
+    def _walk_forward_predictions(self, symbol: str, df: pd.DataFrame, term: str) -> pd.DataFrame:
+        """
+        在 out-of-sample 區段產生「真實的」模型預測。
+
+          - 切分前 70% 為 in-sample，後 30% 為 out-of-sample
+          - 模型只在 in-sample 上擬合，逐根對 OOS 產生真正的一步預測
+          - 情境改用 MarketRegimeDetector 的實際判定
+          - 波動率改用實際的滾動對數報酬標準差 (與實盤送進策略的量綱一致)
+
+        預設只用 ARIMA 產生尋優預測 —— 它秒級可擬合，而錦標賽要決定的是
+        「K 線週期與風控參數」，不是驗證神經網路。若要更貼近實盤的 Ensemble，
+        可在 config.yaml 設定 tuning_settings.walk_forward_models。
+        """
+        wf_models = self.config.get("tuning_settings.walk_forward_models", ["ARIMA"])
+        oos_frac = float(self.config.get("tuning_settings.oos_fraction", 0.3))
+        max_hist = int(self.config.get("tuning_settings.trailing_window", 500))
+
+        n = len(df)
+        split = int(n * (1 - oos_frac))
+        if n < 150 or split < 100:
+            print(f"      ⚠️ {term} 資料量不足以做 walk-forward 切分 (共 {n} 根)。")
+            return pd.DataFrame()
+
+        oos = df.iloc[split:].copy()
+        close = df['Close'].astype(float).values
+
+        preds = np.full(len(oos), np.nan)
+
+        if "ARIMA" in wf_models:
+            try:
+                from statsmodels.tsa.arima.model import ARIMA
+                # 只在 in-sample 擬合一次，取得參數
+                base = ARIMA(close[:split], order=(5, 1, 0)).fit()
+
+                for k in range(len(oos)):
+                    t = split + k                      # 要預測 close[t]
+                    lo = max(0, t - max_hist)
+                    hist = close[lo:t]                 # 只用 t 之前的資料，無前視
+                    if len(hist) < 20:
+                        continue
+                    try:
+                        preds[k] = float(base.apply(hist).forecast(steps=1)[0])
+                    except Exception:
+                        preds[k] = close[t - 1]
+            except Exception as e:
+                print(f"      ⚠️ ARIMA walk-forward 失敗: {e}")
+
+        # 需要神經網路參與時，只在 in-sample 訓練一次，再對 OOS 逐窗推論
+        dl_wanted = [m for m in wf_models if m in ("LSTM", "Transformer")]
+        if dl_wanted:
+            dl_preds = self._walk_forward_dl(symbol, df, split, dl_wanted)
+            if dl_preds is not None:
+                stacked = [p for p in ([preds] if "ARIMA" in wf_models else []) + [dl_preds]]
+                preds = np.nanmean(np.vstack(stacked), axis=0)
+
+        oos['prediction'] = preds
+        oos = oos[np.isfinite(oos['prediction'])]
+        if oos.empty:
+            print(f"      ⚠️ {term} 未能產生任何有效的 OOS 預測。")
+            return pd.DataFrame()
+
+        log_ret = np.log(df['Close'] / df['Close'].shift(1))
+        bar_vol = log_ret.rolling(20).std().reindex(oos.index).fillna(0.005).replace(0, 0.005)
+        oos['volatility'] = bar_vol
+
+        oos['regime'] = self._vectorised_regimes(df).reindex(oos.index).fillna("SIDEWAYS_QUIET")
+
+        edge = (oos['prediction'] / oos['Close'] - 1).abs()
+        print(f"      => OOS 樣本 {len(oos)} 根 (總計 {n})，尋優模型 {wf_models}；"
+              f"預測邊際中位數 {edge.median()*100:.3f}%，每根波動中位數 {bar_vol.median()*100:.3f}%")
+
+        return oos
+
+    def _walk_forward_dl(self, symbol: str, df: pd.DataFrame, split: int, model_types: list):
+        """在 in-sample 訓練神經網路，對 OOS 逐窗推論 (成本高，非預設路徑)"""
+        try:
+            from keras.callbacks import EarlyStopping
+            from ibkrpy.models.lstm import LSTMModel
+            from ibkrpy.models.transformer import TransformerModel
+        except ImportError:
+            print("      ⚠️ 未安裝 TensorFlow/Keras，walk-forward 略過神經網路。")
+            return None
+
+        try:
+            df_adv = self.pipeline.engineer_advanced_features(df).ffill().bfill().fillna(0)
+            feats = self.pipeline.select_model_features(df_adv)
+            price_rel = self.pipeline.classify_price_relative(df_adv, feats)
+            minmax = [c for c in feats if c not in price_rel]
+
+            adv_split = min(split, len(df_adv) - 1)
+            tmp_key = f"__wf_{symbol}"
+            self.pipeline.fit_scale(df_adv.iloc[:adv_split], minmax, tmp_key)
+            df_s = self.pipeline.transform_scale(df_adv, minmax, tmp_key)
+
+            look_back = 60
+            X, y = self.pipeline.create_sequences(
+                df_s, feats, look_back, raw_close=df_adv['Close'],
+                price_relative=price_rel, target_mode="log_return", target_scale=100.0,
+            )
+            if len(X) < 100:
+                return None
+
+            # 序列 i 的目標落在 df_adv 的第 i+look_back 根
+            seq_pos = np.arange(len(X)) + look_back
+            in_mask = seq_pos < adv_split
+
+            cb = [EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)]
+            outputs = []
+            for mt in model_types:
+                cls = LSTMModel if mt == "LSTM" else TransformerModel
+                m = cls(look_back=look_back, feature_cols=feats, weights_dir=WEIGHTS_DIR)
+                m.model = m._build_model()
+                m.model.fit(X[in_mask], y[in_mask], epochs=12, batch_size=32,
+                            verbose=0, validation_split=0.2, shuffle=False, callbacks=cb)
+                raw = m.model.predict(X[~in_mask], verbose=0).reshape(-1)
+                anchors = df_adv['Close'].values[seq_pos[~in_mask] - 1]
+                outputs.append(anchors * np.exp(raw / 100.0))
+
+            oos_idx = df_adv.index[seq_pos[~in_mask]]
+            series = pd.Series(np.mean(outputs, axis=0), index=oos_idx)
+            return series.reindex(df.index[split:]).values
+        except Exception as e:
+            print(f"      ⚠️ 神經網路 walk-forward 失敗: {e}")
+            return None
+        finally:
+            self.pipeline.invalidate(f"__wf_{symbol}")
+
+    def _run_optuna_optimization(self, symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, macro_data: dict, term: str) -> Tuple[dict, float]:
+        """在真實的 out-of-sample 預測上做參數尋優，並回傳 (最佳參數, 複合評分)"""
+        default_params = {
+            "min_prediction_threshold_pct": 0.005,
+            "volatility_stop_loss_multiplier": 2.0,
+            "volatility_take_profit_multiplier": 3.0,
+        }
+
+        oos = self._walk_forward_predictions(symbol, df, term)
+        if oos.empty:
+            return default_params, -999.0
+
+        tuner = ModelTuner(model_orchestrator=None, data_manager=None)
+        try:
+            # 回測區間必須與預測區間一致，否則權益曲線會混入沒有訊號的 in-sample 段
+            return tuner.optimize_strategy_params(
+                symbol, df.loc[oos.index], oos, n_trials=20, term=term
+            )
         except Exception as e:
             print(f"⚠️ [{symbol}] {term} Optuna 尋優過程發生錯誤: {e}")
-            default_params = {
-                "min_prediction_threshold_pct": 0.005,
-                "volatility_stop_loss_multiplier": 2.0,
-                "volatility_take_profit_multiplier": 3.0
-            }
             return default_params, -999.0
-    
+
     async def run_data_ingestion(self):
         """階段一：日常增量下載資料並寫入資料庫 (按需下載模式)"""
         print("\n" + "="*60)

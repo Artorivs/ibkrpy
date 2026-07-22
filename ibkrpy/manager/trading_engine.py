@@ -53,6 +53,8 @@ class TradingEngine:
         self.vix_last_fetch_time = 0.0
 
         self.cached_benchmarks = {}
+        # 供 _current_gross_exposure 估算名目曝險用
+        self._last_prices = {}
         self.qualified_contracts = {}
 
     async def _get_qualified_contract(self, symbol: str) -> Stock:
@@ -102,6 +104,20 @@ class TradingEngine:
         if self.market_analyzer:
             self.global_context = await asyncio.to_thread(self.market_analyzer.get_global_context)
 
+    def _current_gross_exposure(self) -> float:
+        """
+        目前的總曝險 (多空取絕對值後加總的名目金額)。
+        以最近一次 run_tick 看到的價格估算；沒有價格紀錄時退回以持股數 x 最後已知價。
+        """
+        total = 0.0
+        for sym, qty in (self.cached_positions or {}).items():
+            if not qty:
+                continue
+            price = self._last_prices.get(sym)
+            if price:
+                total += abs(qty) * price
+        return total
+
     async def _protect_unhedged_positions(self):
         """掃描帳戶中的持倉，若發現沒有掛出停損/停利單的持股（例如手動買入），自動補上 OCA 保護傘。"""
         if self.dry_run: return
@@ -114,6 +130,7 @@ class TradingEngine:
         for symbol, pos_qty in positions.items():
             if pos_qty == 0: continue
             
+            # 檢查該標的是否有反向的未決訂單 (SELL單若持倉為正，BUY單若持倉為負)
             protect_action = "SELL" if pos_qty > 0 else "BUY"
             protected_qty = 0.0
             for t in open_trades:
@@ -266,7 +283,8 @@ class TradingEngine:
             return
 
         current_price = float(df['Close'].iloc[-1])
-        
+        self._last_prices[symbol] = current_price
+
         benchmark_symbol = self._get_dynamic_benchmark(symbol)
         bench_df = pd.DataFrame()
         try:
@@ -356,7 +374,7 @@ class TradingEngine:
             df_adv = df_adv.ffill().bfill().fillna(0)
             
             df_adv, scale_cols = self.pipeline.align_to_manifest(df_adv, symbol)
-            df_scaled = self.pipeline.transform_scale(df_adv, columns=scale_cols, symbol=symbol)
+            df_scaled, scale_cols = self.pipeline.transform_for_inference(df_adv, symbol)
         else:
             df_adv = df.ffill().bfill().fillna(0)
             df_scaled = df_adv
@@ -390,13 +408,13 @@ class TradingEngine:
                 
             pred_real = None
             if self.pipeline and m_type in ["LSTM", "Transformer"]:
-                pred_real_arr = self.pipeline.inverse_transform_scale(pred_raw, "Close", symbol)
-                if pred_real_arr is None:
+                if isinstance(pred_raw, (list, np.ndarray)):
+                    pred_raw = float(pred_raw[0]) if len(pred_raw) > 0 else None
+                    if pred_raw is None:
+                        continue
+                pred_real = self.pipeline.decode_prediction(pred_raw, current_price, symbol)
+                if pred_real is None:
                     continue
-                if isinstance(pred_real_arr, (list, np.ndarray)):
-                    pred_real = float(pred_real_arr[0]) if len(pred_real_arr) > 0 else None
-                else:
-                    pred_real = float(pred_real_arr)
             else:
                 pred_real = float(pred_raw)
                 
@@ -468,15 +486,29 @@ class TradingEngine:
         allow_shorting = self.config.get("strategy_settings.allow_shorting", False)
         final_weight = min(target_weight * conviction, 0.35) 
         
+        max_gross = self.config.get("strategy_settings.max_gross_exposure", 1.0)
+
+        def _affordable_qty() -> int:
+            target_cash = net_liquidation * final_weight
+            budget = min(target_cash, available_funds * 0.95)
+
+            if net_liquidation > 0:
+                room = (max_gross * net_liquidation) - self._current_gross_exposure()
+                if room <= 0:
+                    print(f"[{symbol}] ⚠️ 已達組合總曝險上限 ({max_gross*100:.0f}%)，本次不建立新倉。")
+                    return 0
+                budget = min(budget, room)
+
+            return int(budget / current_price) if current_price > 0 else 0
+
         if action == "BUY":
             if current_pos > 0: return
             elif current_pos < 0:
                 trade_quantity = int(abs(current_pos))
                 is_closing_only = True
             else:
-                target_cash = net_liquidation * final_weight
-                trade_quantity = int(min(target_cash, available_funds * 0.95) / current_price)
-                
+                trade_quantity = _affordable_qty()
+
         elif action == "SELL":
             if current_pos < 0: return
             elif current_pos > 0:
@@ -486,8 +518,7 @@ class TradingEngine:
                 if not allow_shorting:
                     print(f"[{symbol}] ⚠️ 已阻擋做空指令，維持觀望。")
                     return
-                target_cash = net_liquidation * final_weight
-                trade_quantity = int(min(target_cash, available_funds * 0.95) / current_price)
+                trade_quantity = _affordable_qty()
 
         if trade_quantity <= 0: return
         
@@ -508,6 +539,9 @@ class TradingEngine:
             # 1. 下單前強制清理歷史孤兒單
             await self._cancel_open_orders(symbol)
             
+            if not is_closing_only:
+                self.cached_funds = max(0.0, self.cached_funds - trade_value)
+
             if self.dry_run:
                 print(f"[{symbol}] 🛡️ [Dry-Run] 虛擬下單成功！")
             else:
