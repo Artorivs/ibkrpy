@@ -186,7 +186,7 @@ class DataPipeline:
         with open(self._manifest_path(symbol), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=4, ensure_ascii=False)
         self._manifests[symbol] = manifest
-        logger.info(
+        logger.debug(
             f"[{symbol}] 特徵清單已保存 ({len(features)} 欄，"
             f"其中 {len(manifest['price_relative'])} 欄為價格相對縮放；"
             f"目標: {target_mode})。"

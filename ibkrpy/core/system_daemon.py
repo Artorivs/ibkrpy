@@ -45,6 +45,7 @@ class SystemDaemon:
         self._retrain_task = None
 
         self._scan_offset = 0
+        self._reconnect_failures = 0
         self._session_cache = {}
 
         self.last_retrain_date = self._load_state().get("last_retrain_date")
@@ -131,10 +132,18 @@ class SystemDaemon:
         self.logger.warning("檢測到 IBKR 斷線，嘗試重新連接...")
         try:
             await self.ib_manager.connect()
-            self.logger.info("IBKR 重新連接成功！")
+            if self._reconnect_failures:
+                self.logger.info(f"IBKR 重新連接成功（先前失敗 {self._reconnect_failures} 次）。")
+            else:
+                self.logger.info("IBKR 重新連接成功！")
+            self._reconnect_failures = 0
         except Exception as e:
-            # connect() 現在會拋出 ConnectionError，此分支不再是死程式碼
-            self.logger.error(f"重連失敗: {e}，將在下個迴圈重試。")
+            self._reconnect_failures += 1
+            msg = f"重連失敗 (第 {self._reconnect_failures} 次): {e}，將在下個迴圈重試。"
+            if self._reconnect_failures >= 3:
+                self.logger.error(msg)
+            else:
+                self.logger.warning(msg)
 
     # ------------------------------------------------------------------
     # 重訓 (獨立行程)

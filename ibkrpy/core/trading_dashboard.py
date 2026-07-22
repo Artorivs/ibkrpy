@@ -3,6 +3,7 @@
 
 import os
 import sys
+import logging
 import tkinter as tk
 from tkinter import ttk
 import pandas as pd
@@ -15,6 +16,7 @@ import matplotlib.dates as mdates
 
 # 取得專案根目錄
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+logger = logging.getLogger("ibkrpy")
 sys.path.append(project_root)
 
 from ibkrpy.shared.db_manager import DatabaseManager
@@ -228,7 +230,7 @@ class TradingDashboard:
             self._tail_system_logs()
 
         except Exception as e:
-            print(f"UI 更新錯誤: {e}")
+            logger.error(f"UI 更新錯誤: {e}")
 
         self.root.after(5000, self._update_data)
 

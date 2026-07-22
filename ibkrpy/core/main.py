@@ -2,6 +2,7 @@
 # 系統總樞紐 (Command Center)
 
 import argparse
+import logging
 import sys
 import os
 import asyncio
@@ -11,6 +12,8 @@ import warnings
 import caffeine
 
 # ========== macOS 基礎防禦 ==========
+logger = logging.getLogger("ibkrpy")
+logging.basicConfig(level=logging.INFO)
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -76,12 +79,12 @@ async def run_pipeline_mode(mode: str, target_symbol: str = None):
     ext_fetcher = ExternalDataFetcher(fred_api_key=config.get("api_keys_settings.fred_api_key"))
     
     ib_manager = IBKRDataManager(host=config.get("ib_settings.host", "127.0.0.1"), port=config.get("ib_settings.port", 7497), client_id=config.get("ib_settings.client_id", 1))
-    print(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
+    logger.info(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
     
     try:
         await ib_manager.connect()
     except ConnectionError as e:
-        print(f"❌ 無法連線至 IBKR，中止本次作業: {e}")
+        logger.error(f"❌ 無法連線至 IBKR，中止本次作業: {e}")
         return
 
     pipeline = PipelineManager(config=config, db=db_manager, pipeline=data_pipeline, ib_data=ib_manager, ext_fetcher=ext_fetcher, target_symbol=target_symbol)
@@ -111,12 +114,12 @@ async def run_live_mode(args):
     regime_detector = MarketRegimeDetector() 
     
     ib_manager = IBKRDataManager(host=config.get("ib_settings.host", "127.0.0.1"), port=config.get("ib_settings.port", 7497), client_id=config.get("ib_settings.client_id", 1))
-    print(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
+    logger.info(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
     
     try:
         await ib_manager.connect()
     except ConnectionError as e:
-        print(f"❌ 無法連線至 IBKR，中止啟動: {e}")
+        logger.error(f"❌ 無法連線至 IBKR，中止啟動: {e}")
         return
 
     model_orchestrator = ModelOrchestrator(

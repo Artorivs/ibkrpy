@@ -1,6 +1,7 @@
 # ibkrpy/evaluation/model_tuner.py
 # 結合 Optuna 優化與模型選拔 (支援跨週期錦標賽)
 
+import logging
 import optuna
 import pandas as pd
 import numpy as np
@@ -10,6 +11,7 @@ from .backtest_engine import BacktestEngine
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+logger = logging.getLogger("ibkrpy")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
@@ -103,11 +105,11 @@ class ModelTuner:
             
             return study.best_params, study.best_value
         except Exception as e:
-            print(f"      ⚠️ Optuna 優化失敗: {e}")
+            logger.warning(f"      ⚠️ Optuna 優化失敗: {e}")
             return {}, -999.0
 
     def optimize_hyperparameters(self, symbol: str, model_type: str, n_trials: int = 20) -> Dict[str, Any]:
-        print(f"[{symbol}] 開始 {model_type} 模型的超參數優化 (Trials: {n_trials})...")
+        logger.info(f"[{symbol}] 開始 {model_type} 模型的超參數優化 (Trials: {n_trials})...")
         def objective(trial):
             look_back = trial.suggest_categorical("look_back", [30, 60, 90])
             dropout = trial.suggest_float("dropout_rate", 0.1, 0.4)
@@ -128,7 +130,7 @@ class ModelTuner:
         return study.best_params
 
     def select_best_model(self, symbol: str, candidate_models: List[str]) -> str:
-        print(f"[{symbol}] 展開模型選拔賽: {candidate_models}")
+        logger.info(f"[{symbol}] 展開模型選拔賽: {candidate_models}")
         best_model = candidate_models[0]
         best_score = -float('inf')
         for model_type in candidate_models:
@@ -137,5 +139,5 @@ class ModelTuner:
             if score > best_score:
                 best_score = score
                 best_model = model_type
-        print(f"[{symbol}] 冠軍模型誕生: {best_model} (Composite Score: {best_score:.2f})")
+        logger.info(f"[{symbol}] 冠軍模型誕生: {best_model} (Composite Score: {best_score:.2f})")
         return best_model

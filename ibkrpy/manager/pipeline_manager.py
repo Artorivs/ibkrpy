@@ -19,6 +19,9 @@ from ibkrpy.data.data_pipeline import DataPipeline
 from ibkrpy.data.ibkr_data_manager import IBKRDataManager
 from ibkrpy.data.external_data import ExternalDataFetcher
 from ibkrpy.evaluation.model_tuner import ModelTuner
+import logging
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "weights")
@@ -77,7 +80,7 @@ class PipelineManager:
         total_days = settings["total_days"]
         chunk_days = settings["chunk_days"]
         
-        print(f"   -> 🔄 正在同步 {term} ({bar_size}) 資料...")
+        logger.debug(f"   -> 🔄 正在同步 {term} ({bar_size}) 資料...")
         df_existing = self.db.get_market_data_sync(symbol, timeframe=bar_size)
         days_to_fetch = 0
         
@@ -93,7 +96,7 @@ class PipelineManager:
             bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
             
             if bus_days_diff <= 0:
-                print(f"      ✅ 資料已是最新狀態，無須同步。")
+                logger.debug(f"      ✅ 資料已是最新狀態，無須同步。")
                 return
                 
             days_to_fetch = min(bus_days_diff + 1, total_days)
@@ -153,23 +156,26 @@ class PipelineManager:
             df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
             if not df_existing.empty:
+                # [修正] save_bulk_market_data 用的是 INSERT OR REPLACE，本身就是 upsert。
+                # 舊版把 df_existing 併進去一起重寫，只新增兩天資料也要對整段歷史
+                # 執行 executemany，白做數十萬次寫入。這裡只寫真正的新資料。
                 df_combined = df_new
                 df_combined.sort_index(inplace=True)
                 self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
             else:
                 self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
                 
-            print(f"      ✅ 成功合併並寫入 {len(df_new)} 筆 {bar_size} K線。")
+            logger.info(f"      ✅ 成功合併並寫入 {len(df_new)} 筆 {bar_size} K線。")
         else:
             if days_to_fetch > 0:
-                print(f"      ❌ [{symbol}] 該週期所有分批資料獲取皆失敗。")
+                logger.error(f"      ❌ [{symbol}] 該週期所有分批資料獲取皆失敗。")
 
     def _train_dl_models(self, symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, macro_data: dict):
         """訓練深度學習模型（LSTM、Transformer）並儲存 .keras"""
-        print(f"🔍 [{symbol}] 開始訓練深度學習模型...")
-        print(f"[{symbol}] 資料量: {len(df)} 筆，特徵數量: {df.shape[1]} 欄")
+        logger.info(f"🔍 [{symbol}] 開始訓練深度學習模型...")
+        logger.info(f"[{symbol}] 資料量: {len(df)} 筆，特徵數量: {df.shape[1]} 欄")
         if df.empty or len(df) < 60:
-            print(f"⚠️ [{symbol}] 資料量極度不足 (僅 {len(df)} 筆)，跳過 DL 訓練。")
+            logger.warning(f"⚠️ [{symbol}] 資料量極度不足 (僅 {len(df)} 筆)，跳過 DL 訓練。")
             return
 
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
@@ -177,8 +183,14 @@ class PipelineManager:
         df_adv = self.pipeline.engineer_advanced_features(df, bench_df, macro_data)
         df_adv = df_adv.ffill().bfill().fillna(0)
         
+        # [修正] 舊版寫死 OHLCV，等於把 engineer_advanced_features 算出的
+        # 技術指標、bench_correlation、VIX 全部丟掉。改為挑出所有可用特徵，
+        # 並把清單存成 manifest 供推論端讀回，兩端不再各自猜測欄位。
         scale_cols = self.pipeline.select_model_features(df_adv)
 
+        # [修正] 隨價格等比例縮放的欄位改用「逐窗相對錨定」而非 Min-Max。
+        # Min-Max 的 min/max 來自訓練窗，趨勢股創新高時縮放值會超出 [0,1]，
+        # 模型直接進入訓練分布之外的外推區間。
         price_rel = self.pipeline.classify_price_relative(df_adv, scale_cols)
         minmax_cols = [c for c in scale_cols if c not in price_rel]
 
@@ -186,9 +198,12 @@ class PipelineManager:
             symbol, scale_cols, price_relative=price_rel,
             target_mode="log_return", target_scale=100.0,
         )
-        print(f"      => 特徵欄位: {len(scale_cols)} 個 "
-              f"(價格相對 {len(price_rel)} / Min-Max {len(minmax_cols)})，目標: 對數報酬率")
+        logger.info(
+            f"      => 特徵欄位: {len(scale_cols)} 個 "
+            f"(價格相對 {len(price_rel)} / Min-Max {len(minmax_cols)})，目標: 對數報酬率")
 
+        # [修正] 舊版對「全部」資料 fit_scale，min/max 涵蓋最近期資料，
+        # 訓練樣本因此隱含未來資訊。改為只在訓練段擬合 scaler。
         split = int(len(df_adv) * 0.8)
         df_train = df_adv.iloc[:split]
 
@@ -203,10 +218,10 @@ class PipelineManager:
             target_mode="log_return", target_scale=100.0,
         )
         
-        print(f"      => 總 K 線數: {len(df_adv)} 筆，產出有效訓練序列: {len(X)} 組")
+        logger.info(f"      => 總 K 線數: {len(df_adv)} 筆，產出有效訓練序列: {len(X)} 組")
         
         if len(X) < 16:
-            print(f"⚠️ [{symbol}] 有效序列數量不足以支撐梯度下降 (僅 {len(X)} 組)，跳過 DL 訓練。")
+            logger.warning(f"⚠️ [{symbol}] 有效序列數量不足以支撐梯度下降 (僅 {len(X)} 組)，跳過 DL 訓練。")
             return
 
         dynamic_batch_size = min(32, max(8, len(X) // 4))
@@ -216,61 +231,71 @@ class PipelineManager:
             from ibkrpy.models.lstm import LSTMModel
             from ibkrpy.models.transformer import TransformerModel
 
+            # [修正] 舊版 monitor='loss' 監看的是「訓練損失」，且 fit() 沒有
+            # validation_split —— EarlyStopping 完全不具備防過擬合作用。
             callbacks = [EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)]
             fit_kwargs = dict(
                 epochs=25, batch_size=dynamic_batch_size, verbose=0,
                 callbacks=callbacks, validation_split=0.2, shuffle=False,  # 時序資料不可打亂
             )
 
-            print(f"   -> 🚀 擬合 LSTM 模型 (Batch Size: {dynamic_batch_size})...")
+            logger.info(f"   -> 🚀 擬合 LSTM 模型 (Batch Size: {dynamic_batch_size})...")
             lstm = LSTMModel(look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR)
             lstm.model = lstm._build_model()
             lstm.model.fit(X, y, **fit_kwargs)
             lstm_path = os.path.join(WEIGHTS_DIR, f"{symbol}_LSTM.keras")
             lstm.model.save(lstm_path)
             
-            if os.path.exists(lstm_path): print(f"      ✅ [成功] LSTM 權重已實體寫入: {lstm_path}")
-            else: print(f"      ❌ [失敗] LSTM 寫入異常！")
+            if os.path.exists(lstm_path):
+                logger.info(f"      ✅ [成功] LSTM 權重已實體寫入: {lstm_path}")
+            else:
+                logger.error(f"      ❌ [失敗] LSTM 寫入異常！")
 
-            print(f"   -> 🚀 擬合 Transformer 模型 (Batch Size: {dynamic_batch_size})...")
+            logger.info(f"   -> 🚀 擬合 Transformer 模型 (Batch Size: {dynamic_batch_size})...")
             transformer = TransformerModel(look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR)
             transformer.model = transformer._build_model()
             transformer.model.fit(X, y, **fit_kwargs)
             tf_path = os.path.join(WEIGHTS_DIR, f"{symbol}_Transformer.keras")
             transformer.model.save(tf_path)
             
-            if os.path.exists(tf_path): print(f"      ✅ [成功] Transformer 權重已實體寫入: {tf_path}")
-            else: print(f"      ❌ [失敗] Transformer 寫入異常！")
+            if os.path.exists(tf_path):
+                logger.info(f"      ✅ [成功] Transformer 權重已實體寫入: {tf_path}")
+            else:
+                logger.error(f"      ❌ [失敗] Transformer 寫入異常！")
             
-            print(f"✅ [{symbol}] 深度學習模型訓練完畢。\n")
+            logger.info(f"✅ [{symbol}] 深度學習模型訓練完畢。\n")
         except ImportError:
-            print(f"⚠️ 尚未安裝 TensorFlow/Keras，跳過深度學習訓練。")
+            logger.warning(f"⚠️ 尚未安裝 TensorFlow/Keras，跳過深度學習訓練。")
         except Exception as e:
-            print(f"❌ [{symbol}] DL 模型訓練失敗: {e}")
+            logger.error(f"❌ [{symbol}] DL 模型訓練失敗: {e}")
 
     def _train_safe_models(self, symbol: str, df: pd.DataFrame):
         """訓練統計與狀態模型（ARIMA、GARCH、HMM）並打包成單一 .pkl 檔案"""
-        print(f"🔍 [{symbol}] 開始訓練統計與狀態模型...")
+        logger.info(f"🔍 [{symbol}] 開始訓練統計與狀態模型...")
         if df.empty or len(df) < 50:
-            print(f"⚠️ [{symbol}] 資料量不足以進行有效訓練，跳過統計模型。")
+            logger.warning(f"⚠️ [{symbol}] 資料量不足以進行有效訓練，跳過統計模型。")
             return
             
+        # [修正] 舊版此處用 os.path.abspath("weights") —— 相對於 cwd，
+        # 而 _train_dl_models 與 main.py 用的是專案根目錄的 WEIGHTS_DIR。
+        # cwd 不是專案根目錄時，訓練成果永遠載入不到。
         weights_dir = WEIGHTS_DIR
         os.makedirs(weights_dir, exist_ok=True)
 
         classical_bundle = {}
 
-        print(f"   -> 擬合 ARIMA 模型...")
+        logger.info(f"   -> 擬合 ARIMA 模型...")
         try:
             from statsmodels.tsa.arima.model import ARIMA
             series = df['Close'].dropna().values
             model_arima = ARIMA(series, order=(5, 1, 0))
             res_arima = model_arima.fit()
             classical_bundle['arima'] = res_arima
-            print(f"      ✅ ARIMA 模型訓練完成")
-        except Exception as e: print(f"   ⚠️ ARIMA 訓練失敗: {e}")
+            logger.info(f"      ✅ ARIMA 模型訓練完成")
+        except Exception as e:
+            logger.warning(f"   ⚠️ ARIMA 訓練失敗: {e}")
 
-        print(f"   -> 擬合 GARCH 模型...")
+        logger.info(f"   -> 擬合 GARCH 模型...")
         try:
             from arch import arch_model
             returns = np.log(df['Close'] / df['Close'].shift(1)).dropna() * 100.0
@@ -278,14 +303,21 @@ class PipelineManager:
                 am = arch_model(returns, vol='Garch', p=1, q=1, dist='normal')
                 res_garch = am.fit(disp='off')
                 classical_bundle['garch'] = res_garch.params
-                print(f"      ✅ GARCH 模型訓練完成")
-        except Exception as e: print(f"   ⚠️ GARCH 訓練失敗: {e}")
+                logger.info(f"      ✅ GARCH 模型訓練完成")
+        except Exception as e:
+            logger.warning(f"   ⚠️ GARCH 訓練失敗: {e}")
+
+        # 註：原 HMM 訓練已移除。grep 確認 ModelOrchestrator.detect_regime
+        # 全專案只有定義處出現過一次，TradingEngine 從未呼叫 ——
+        # 實盤情境判定一律走 MarketRegimeDetector (ADX/SMA/ATR)。
+        # 每次重訓為一個沒有消費者的模型跑 100 次 EM 迭代是純粹的浪費。
+        # 若日後要啟用，請先把 detect_regime 接進 run_tick 再恢復此段。
 
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
         
         if os.path.exists(bundle_path):
-            print(f"✅ [{symbol}] 統計模型整合包 (Classical Bundle) 寫入完成。")
+            logger.info(f"✅ [{symbol}] 統計模型整合包 (Classical Bundle) 寫入完成。")
 
     # ------------------------------------------------------------------
     # Walk-forward 尋優
@@ -321,7 +353,7 @@ class PipelineManager:
             out[~trending & volatile] = "SIDEWAYS_VOLATILE"
             out[~trending & ~volatile] = "SIDEWAYS_QUIET"
         except Exception as e:
-            print(f"      ⚠️ 情境向量化計算失敗，全段退回 SIDEWAYS_QUIET: {e}")
+            logger.warning(f"      ⚠️ 情境向量化計算失敗，全段退回 SIDEWAYS_QUIET: {e}")
 
         return out
 
@@ -329,6 +361,13 @@ class PipelineManager:
         """
         在 out-of-sample 區段產生「真實的」模型預測。
 
+        [修正] 舊版此處是：
+            prediction = Close * (1 + np.random.normal(0, 0.005))
+            regime     = np.random.choice([...])
+        整套「多週期錦標賽」因此是在對高斯雜訊做參數擬合，選出的 best_term 與
+        風控參數都不具意義，而那些參數會被寫進 global_best_params.json 直接用於實盤。
+
+        現在改為：
           - 切分前 70% 為 in-sample，後 30% 為 out-of-sample
           - 模型只在 in-sample 上擬合，逐根對 OOS 產生真正的一步預測
           - 情境改用 MarketRegimeDetector 的實際判定
@@ -345,7 +384,7 @@ class PipelineManager:
         n = len(df)
         split = int(n * (1 - oos_frac))
         if n < 150 or split < 100:
-            print(f"      ⚠️ {term} 資料量不足以做 walk-forward 切分 (共 {n} 根)。")
+            logger.warning(f"      ⚠️ {term} 資料量不足以做 walk-forward 切分 (共 {n} 根)。")
             return pd.DataFrame()
 
         oos = df.iloc[split:].copy()
@@ -370,7 +409,7 @@ class PipelineManager:
                     except Exception:
                         preds[k] = close[t - 1]
             except Exception as e:
-                print(f"      ⚠️ ARIMA walk-forward 失敗: {e}")
+                logger.warning(f"      ⚠️ ARIMA walk-forward 失敗: {e}")
 
         # 需要神經網路參與時，只在 in-sample 訓練一次，再對 OOS 逐窗推論
         dl_wanted = [m for m in wf_models if m in ("LSTM", "Transformer")]
@@ -383,7 +422,7 @@ class PipelineManager:
         oos['prediction'] = preds
         oos = oos[np.isfinite(oos['prediction'])]
         if oos.empty:
-            print(f"      ⚠️ {term} 未能產生任何有效的 OOS 預測。")
+            logger.warning(f"      ⚠️ {term} 未能產生任何有效的 OOS 預測。")
             return pd.DataFrame()
 
         log_ret = np.log(df['Close'] / df['Close'].shift(1))
@@ -393,8 +432,9 @@ class PipelineManager:
         oos['regime'] = self._vectorised_regimes(df).reindex(oos.index).fillna("SIDEWAYS_QUIET")
 
         edge = (oos['prediction'] / oos['Close'] - 1).abs()
-        print(f"      => OOS 樣本 {len(oos)} 根 (總計 {n})，尋優模型 {wf_models}；"
-              f"預測邊際中位數 {edge.median()*100:.3f}%，每根波動中位數 {bar_vol.median()*100:.3f}%")
+        logger.info(
+            f"      => OOS 樣本 {len(oos)} 根 (總計 {n})，尋優模型 {wf_models}；"
+            f"預測邊際中位數 {edge.median()*100:.3f}%，每根波動中位數 {bar_vol.median()*100:.3f}%")
 
         return oos
 
@@ -405,7 +445,7 @@ class PipelineManager:
             from ibkrpy.models.lstm import LSTMModel
             from ibkrpy.models.transformer import TransformerModel
         except ImportError:
-            print("      ⚠️ 未安裝 TensorFlow/Keras，walk-forward 略過神經網路。")
+            logger.debug("      ⚠️ 未安裝 TensorFlow/Keras，walk-forward 略過神經網路。")
             return None
 
         try:
@@ -447,7 +487,7 @@ class PipelineManager:
             series = pd.Series(np.mean(outputs, axis=0), index=oos_idx)
             return series.reindex(df.index[split:]).values
         except Exception as e:
-            print(f"      ⚠️ 神經網路 walk-forward 失敗: {e}")
+            logger.warning(f"      ⚠️ 神經網路 walk-forward 失敗: {e}")
             return None
         finally:
             self.pipeline.invalidate(f"__wf_{symbol}")
@@ -471,19 +511,17 @@ class PipelineManager:
                 symbol, df.loc[oos.index], oos, n_trials=20, term=term
             )
         except Exception as e:
-            print(f"⚠️ [{symbol}] {term} Optuna 尋優過程發生錯誤: {e}")
+            logger.warning(f"⚠️ [{symbol}] {term} Optuna 尋優過程發生錯誤: {e}")
             return default_params, -999.0
 
     async def run_data_ingestion(self):
         """階段一：日常增量下載資料並寫入資料庫 (按需下載模式)"""
-        print("\n" + "="*60)
-        print(" [Pipeline] 啟動資料增量下載與資料庫同步 (Daily Sync)")
-        print("="*60)
+        logger.info(" [Pipeline] 啟動資料增量下載與資料庫同步 (Daily Sync)")
         
         all_terms = ["long_term", "mid_term", "short_term"]
         
         for symbol in self.symbols:
-            print(f"\n[{symbol}] 檢核並同步最新市場資料...")
+            logger.debug(f"[{symbol}] 檢核並同步最新市場資料...")
             try:
                 contract = Stock(symbol, "SMART", "USD")
                 await self.ib_data.ib.qualifyContractsAsync(contract)
@@ -494,7 +532,7 @@ class PipelineManager:
                     total_days = settings["total_days"]
                     chunk_days = settings["chunk_days"]
                     
-                    print(f"   -> 🔄 正在同步 {term} ({bar_size}) 資料...")
+                    logger.debug(f"   -> 🔄 正在同步 {term} ({bar_size}) 資料...")
                     df_existing = self.db.get_market_data_sync(symbol, timeframe=bar_size)
                     days_to_fetch = 0
                     
@@ -511,7 +549,7 @@ class PipelineManager:
                         bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
                         
                         if bus_days_diff <= 0:
-                            print(f"      ✅ 資料已是最新狀態，無須同步。")
+                            logger.debug(f"      ✅ 資料已是最新狀態，無須同步。")
                             continue
                             
                         # 如果差 1 天，抓 1+1=2 天緩衝即可，避免每次都盲目抓 3 天
@@ -563,22 +601,22 @@ class PipelineManager:
                         cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
                         df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
+                        # [修正] 同 _sync_symbol_term_data：資料庫層是 INSERT OR REPLACE，
+                        # 不需要把 df_existing 併進來一起重寫整段歷史。
                         self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
                             
-                        print(f"      ✅ 成功合併並寫入 {len(df_new)} 筆 {bar_size} K線。")
+                        logger.info(f"      ✅ 成功合併並寫入 {len(df_new)} 筆 {bar_size} K線。")
                     else:
-                        print(f"      ❌ [{symbol}] 該週期所有分批資料獲取皆失敗。")
+                        logger.error(f"      ❌ [{symbol}] 該週期所有分批資料獲取皆失敗。")
                     
             except Exception as e:
-                print(f"⚠️ [{symbol}] 資料更新發生例外錯誤: {e}")
+                logger.warning(f"⚠️ [{symbol}] 資料更新發生例外錯誤: {e}")
             
             await asyncio.sleep(2)
 
     async def run_training_and_tuning(self):
         """階段二：多週期選拔 (Tournament-based Selection)，淘汰弱勢週期，適應並訓練最佳模型"""
-        print("\n" + "="*60)
-        print(" [Pipeline] 啟動多週期選拔 (Term Tournament) 與 AI 訓練")
-        print("="*60)
+        logger.info(" [Pipeline] 啟動多週期選拔 (Term Tournament) 與 AI 訓練")
         
         all_terms = ["long_term", "mid_term", "short_term"]
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -594,18 +632,18 @@ class PipelineManager:
                 try:
                     global_vix_series = pd.read_csv(fred_cache_path, index_col=0, parse_dates=True).squeeze("columns")
                     need_fetch_fred = False
-                    print("   -> 🌍 從本地 data/ 讀取 FRED VIX 歷史快取...")
+                    logger.debug("   -> 🌍 從本地 data/ 讀取 FRED VIX 歷史快取...")
                 except Exception: pass
                 
         if need_fetch_fred and self.ext:
-            print("   -> 🌍 正在向 FRED 請求最新全局宏觀數據 (VIXCLS)...")
+            logger.debug("   -> 🌍 正在向 FRED 請求最新全局宏觀數據 (VIXCLS)...")
             try:
                 global_vix_series = await self.ext.fetch_fred_series("VIXCLS")
                 if global_vix_series is not None and not global_vix_series.empty:
                     global_vix_series.to_csv(fred_cache_path)
-                    print(f"      ✅ FRED VIX 數據獲取成功，已永久儲存至 {fred_cache_path}。")
+                    logger.info(f"      ✅ FRED VIX 數據獲取成功，已永久儲存至 {fred_cache_path}。")
             except Exception as e:
-                print(f"      ⚠️ FRED API 請求失敗: {e}")
+                logger.warning(f"      ⚠️ FRED API 請求失敗: {e}")
                 if os.path.exists(fred_cache_path):
                     global_vix_series = pd.read_csv(fred_cache_path, index_col=0, parse_dates=True).squeeze("columns")
 
@@ -622,15 +660,15 @@ class PipelineManager:
             if symbol == self.benchmark_symbol:
                 continue
                 
-            print(f"\n🔥 啟動週期選拔與訓練任務: {symbol} 🔥")
+            logger.info(f"🔥 啟動週期選拔與訓練任務: {symbol} 🔥")
             
             fmp_data = {}
             if self.ext and self.ext.fmp_api_key:
                 if symbol in fmp_cache:
-                    print(f"   -> 🏢 從本地快取讀取 FMP 公司基本面數據...")
+                    logger.info(f"   -> 🏢 從本地快取讀取 FMP 公司基本面數據...")
                     fmp_data = fmp_cache[symbol]
                 else:
-                    print(f"   -> 🏢 正在向 FMP 請求公司基本面數據...")
+                    logger.info(f"   -> 🏢 正在向 FMP 請求公司基本面數據...")
                     try:
                         fmp_profile = await self.ext.fetch_fmp_profile(symbol)
                         if fmp_profile:
@@ -640,7 +678,7 @@ class PipelineManager:
                             with open(fmp_cache_path, 'w', encoding='utf-8') as f:
                                 json.dump(fmp_cache, f, indent=4)
                     except Exception as e:
-                        print(f"      => ⚠️ FMP API 請求發生例外錯誤: {e}")
+                        logger.warning(f"      => ⚠️ FMP API 請求發生例外錯誤: {e}")
             
             best_term = None
             best_score = -float('inf')
@@ -659,17 +697,17 @@ class PipelineManager:
                 stale_days = np.busday_count(last_date.date(), now_date.date()) if last_date else 999
 
                 if df.empty or len(df) < 100 or stale_days > 5:
-                    print(f"   -> 🔍 為了評估 {term}，發現資料空缺或過期，啟動即時下載...")
+                    logger.info(f"   -> 🔍 為了評估 {term}，發現資料空缺或過期，啟動即時下載...")
                     try:
                         contract = Stock(symbol, "SMART", "USD")
                         await self.ib_data.ib.qualifyContractsAsync(contract)
                         await self._sync_symbol_term_data(symbol, term, contract)
                         df = self.db.get_market_data_sync(symbol, timeframe=bar_size)
                     except Exception as e:
-                        print(f"   -> ⚠️ 即時下載失敗: {e}")
+                        logger.warning(f"   -> ⚠️ 即時下載失敗: {e}")
 
                 if df.empty or len(df) < 100:
-                    print(f"   -> ⚠️ {term} 資料仍不足，跳過該週期評估。")
+                    logger.warning(f"   -> ⚠️ {term} 資料仍不足，跳過該週期評估。")
                     continue
                 
                 bench_df = self.db.get_market_data_sync(self.benchmark_symbol, timeframe=bar_size)
@@ -689,9 +727,9 @@ class PipelineManager:
                     if vix_aligned.isna().all(): vix_aligned = pd.Series(20.0, index=df.index)
                     macro_data['VIX'] = vix_aligned
 
-                print(f"\n   -> ⏳ 正在評估 {term} 策略潛力...")
+                logger.info(f"   -> ⏳ 正在評估 {term} 策略潛力...")
                 params, score = self._run_optuna_optimization(symbol, df, bench_df, macro_data, term)
-                print(f"      => {term} 複合評分預期: {score:.2f}")
+                logger.info(f"      => {term} 複合評分預期: {score:.2f}")
                 
                 if score > best_score:
                     best_score = score
@@ -701,10 +739,10 @@ class PipelineManager:
                     best_macro = macro_data
 
             if best_term is None:
-                print(f"❌ [{symbol}] 所有週期皆無法通過評估，強制終止此標的之訓練。")
+                logger.error(f"❌ [{symbol}] 所有週期皆無法通過評估，強制終止此標的之訓練。")
                 continue
             
-            print(f"\n🎉 [{symbol}] 選拔結束！冠軍週期為: {best_term} (得分: {best_score:.2f})")
+            logger.info(f"🎉 [{symbol}] 選拔結束！冠軍週期為: {best_term} (得分: {best_score:.2f})")
             
             best_params['term'] = best_term
             if fmp_data:
@@ -720,6 +758,8 @@ class PipelineManager:
             self._train_dl_models(symbol, best_df, bench_df, best_macro)
             self._train_safe_models(symbol, best_df)
             
+            # [修正] 同上：global_best_params.json 原本也寫到 cwd，
+            # 但 main.py 是從 project_root/weights 讀它的。
             weights_dir = WEIGHTS_DIR
             os.makedirs(weights_dir, exist_ok=True)
 
@@ -736,9 +776,9 @@ class PipelineManager:
             with open(param_path, 'w', encoding='utf-8') as f:
                 json.dump(global_params, f, indent=4)
                 
-            print(f"      ✅ 最佳策略參數已更新至全域檔案: {param_path}")
+            logger.info(f"      ✅ 最佳策略參數已更新至全域檔案: {param_path}")
             self.symbol_terms[symbol] = best_term
-            print(f"🏆 {symbol} ({best_term}) 模型訓練與參數尋優徹底完成。")
+            logger.info(f"🏆 {symbol} ({best_term}) 模型訓練與參數尋優徹底完成。")
 
     async def run_autopilot(self):
         """一鍵全自動執行"""
