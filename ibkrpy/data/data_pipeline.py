@@ -281,7 +281,10 @@ class DataPipeline:
         with open(scaler_path, "w", encoding="utf-8") as f:
             json.dump(scaler_dict, f, indent=4)
 
-        logger.info(f"[{symbol}] 特徵縮放參數 (Scaler) 已成功適配並儲存。")
+        if "__wf" not in symbol:
+            logger.info(f"[{symbol}] 特徵縮放參數 (Scaler) 已適配並儲存。")
+        else:
+            logger.debug(f"[{symbol}] 特徵縮放參數 (Scaler) 已成適配並儲存。")
 
     def transform_scale(self, df: pd.DataFrame, columns: List[str], symbol: str) -> pd.DataFrame:
         """
@@ -300,7 +303,7 @@ class DataPipeline:
             else:
                 logger.error(
                     f"[{symbol}] 找不到預訓練的 Scaler，僅在記憶體中臨時計算 (不落盤)。"
-                    f" 該標的尚未訓練，預測結果不可信 —— 請執行 --mode train。"
+                    f"該標的尚未訓練，預測結果不可信 —— 請執行 --mode train。"
                 )
                 self.scalers[symbol] = self._compute_scaler(df, columns)
 

@@ -150,10 +150,10 @@ class TransformerModel:
                 return
             except Exception as e:
                 # 架構變更後，舊的 .keras 會在此失敗 —— 這是預期行為，需重新訓練。
-                print(f"[{symbol}] ⚠️ Transformer 權重載入失敗: {e}")
-                print(f"[{symbol}]    若此檔為舊架構 (無位置編碼) 所存，請重新執行 --mode train。")
+                print(f"❌ [{symbol}] Transformer 權重載入失敗: {e}")
+                print(f"❌ [{symbol}] 若此檔為舊架構 (無位置編碼) 所存，請重新執行 --mode train。")
 
-        print(f"[{symbol}] ⚠️ 無可用的 Transformer 權重，初始化未訓練模型 (不應用於實盤決策)。")
+        print(f"❌ [{symbol}] 無可用的 Transformer 權重，初始化未訓練模型 (不應用於實盤決策)。")
         self.model = self._build_model()
         self.is_trained = False
 

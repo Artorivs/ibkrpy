@@ -4,8 +4,8 @@
 import asyncio
 import math
 import time
-from typing import Dict, Any, List
-from ib_insync import Order, MarketOrder, LimitOrder, Stock, TagValue
+from typing import Dict, Any
+from ib_insync import Order, LimitOrder, Stock, TagValue
 import pandas as pd
 import numpy as np
 import logging
@@ -56,7 +56,6 @@ class TradingEngine:
         self.vix_last_fetch_time = 0.0
 
         self.cached_benchmarks = {}
-        # 供 _current_gross_exposure 估算名目曝險用
         self._last_prices = {}
         self.qualified_contracts = {}
 
@@ -70,14 +69,7 @@ class TradingEngine:
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """
-        回傳該標的使用的 benchmark。
-
-        [修正] 舊版依 tags 選擇產業 ETF (XLF/XLE/XLV/XLP/XLU/XLI)，但：
-          1. 標籤詞彙與 config.yaml 對不上 —— 程式查 "HEALTHCARE"，YAML 寫
-             "Health_Care"，UNH 與 ISRG 從來沒有對上過，一直退回預設值。
-          2. 每個額外的產業 ETF 都要多花一次 IBKR 歷史請求。以 32 檔標的、
-             5 分鐘一輪計算，歷史請求量本來就已逼近券商的 pacing 上限。
-        改為單一 benchmark，由 config 決定。
+        回傳該標的使用的 benchmark
         """
         return self.config.get("general_settings.benchmark_symbol", "QQQ")
 
@@ -141,10 +133,6 @@ class TradingEngine:
             if pos_qty == 0: continue
             
             # 檢查該標的是否有反向的未決訂單 (SELL單若持倉為正，BUY單若持倉為負)
-            # [修正] 舊版只比對「代碼 + 方向」，不看訂單類型也不看數量：
-            #   - 一張殘留的 1 股限價單，會讓 500 股部位被判定為「已受保護」
-            #   - is_closing_only 掛出的平倉限價單也會被誤認為停損保護
-            # 現在要求必須是停損單 (STP / STP LMT)，且總量足以覆蓋整個部位。
             protect_action = "SELL" if pos_qty > 0 else "BUY"
             protected_qty = 0.0
             for t in open_trades:
@@ -157,6 +145,22 @@ class TradingEngine:
             if not has_protection:
                 logger.warning(f"[守護] 🛡️ 偵測到 {symbol} 存在無保護持倉 ({pos_qty} 股)，準備自動掛載 OCA 停損停利單...")
                 await self._attach_oca_protection(symbol, pos_qty)
+
+    def _live_market_price(self, symbol: str):
+        """
+        取得即時市價。優先使用 IBKR 已串流的 portfolio marketPrice ——
+        它由 updatePortfolio 事件持續推送，不額外消耗歷史資料請求配額。
+        其次退回本輪 run_tick 記錄的價格。兩者皆無則回傳 None。
+        """
+        try:
+            for item in self.data.ib.portfolio():
+                if item.contract.symbol == symbol and item.marketPrice and item.marketPrice > 0:
+                    return float(item.marketPrice)
+        except Exception as e:
+            logger.warning(f"[{symbol}] 讀取 portfolio 市價失敗: {e}")
+
+        p = self._last_prices.get(symbol)
+        return float(p) if p else None
 
     async def _attach_oca_protection(self, symbol: str, pos_qty: float):
         contract = await self._get_qualified_contract(symbol)
@@ -174,12 +178,27 @@ class TradingEngine:
             if 'close' in df.columns:
                 df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
             
-            current_price = float(df['Close'].iloc[-1])
+            live_price = self._live_market_price(symbol)
+            db_price = float(df['Close'].iloc[-1])
+
+            if live_price is None:
+                logger.critical(
+                    f"❌ [{symbol}]取不到即時市價，拒絕掛載保護傘（部位仍無保護，需人工處理）。"
+                    f"	資料庫參考價為 {db_price:.2f}。"
+                )
+                return
+
+            drift = abs(db_price / live_price - 1) if live_price > 0 else 1.0
+            if drift > 0.03:
+                logger.warning(
+                    f"❌ [{symbol}] 本地行情已過期 {drift*100:.1f}%"
+                    f"（DB {db_price:.2f} vs 市價 {live_price:.2f}），改以市價為錨。"
+                )
+
+            current_price = live_price
             returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
             annual_vol = returns.std() * np.sqrt(252) if len(returns) > 10 else 0.20
 
-            # [修正] 舊版一律用日線波動 (annual_vol / sqrt(252))，
-            # 與 run_tick 的分週期邏輯不一致 —— 短線標的的保護傘會被畫得過寬。
             term = self.symbol_terms.get(symbol, "long_term")
             if term == "short_term":
                 periods_per_year = 252 * 78     # 5 分 K
@@ -203,19 +222,33 @@ class TradingEngine:
                 sl_price = current_price * (1 + daily_vol * sl_mult)
                 tp_price = current_price * (1 - daily_vol * tp_mult)
                 
+            sl_price, tp_price = round(sl_price, 2), round(tp_price, 2)
+            if pos_qty > 0:
+                bad = sl_price >= current_price or tp_price <= current_price
+            else:
+                bad = sl_price <= current_price or tp_price >= current_price
+
+            if bad:
+                logger.critical(
+                    f"❌ [{symbol}] 保護傘價位方向錯誤，已拒絕送出："
+                    f"市價 {current_price:.2f} / 停損 {sl_price:.2f} / 停利 {tp_price:.2f}"
+                    f"（部位 {pos_qty:+.0f} 股）。掛出去會立即成交，等同誤平倉。"
+                )
+                return
+
             # 建立 OCA 群組標籤 (加上時間戳確保唯一性)
             oca_group = f"OCA_PROTECT_{symbol}_{int(time.time())}"
             
             # 建立獨立的 STP 與 LMT 單，並透過 ocaGroup 綁定。ocaType=1 代表觸發其一即取消另一
-            sl_order = Order(action=action, totalQuantity=abs(pos_qty), orderType="STP", auxPrice=round(sl_price, 2), tif='GTC', ocaGroup=oca_group, ocaType=1)
-            tp_order = LimitOrder(action=action, totalQuantity=abs(pos_qty), lmtPrice=round(tp_price, 2), tif='GTC', ocaGroup=oca_group, ocaType=1)
+            sl_order = Order(action=action, totalQuantity=abs(pos_qty), orderType="STP", auxPrice=sl_price, tif='GTC', ocaGroup=oca_group, ocaType=1)
+            tp_order = LimitOrder(action=action, totalQuantity=abs(pos_qty), lmtPrice=tp_price, tif='GTC', ocaGroup=oca_group, ocaType=1)
             
             self.data.ib.placeOrder(contract, sl_order)
             self.data.ib.placeOrder(contract, tp_order)
             
-            logger.info(f"[{symbol}] ✅ 成功掛載手動保護傘 (OCA) -> 停損(STP): {sl_price:.2f}, 停利(LMT): {tp_price:.2f}")
+            logger.info(f"✅ [{symbol}] 掛載保護傘 (OCA) -> 停損(STP): {sl_price:.2f}, 停利(LMT): {tp_price:.2f}")
         except Exception as e:
-            logger.critical(f"[{symbol}] ❌ 掛載保護傘失敗: {e}")
+            logger.critical(f"❌ [{symbol}] 掛載保護傘失敗: {e}")
 
     async def _cancel_open_orders(self, symbol: str):
         """[關鍵防護] 取消該標的目前所有未成交的委託單，防範舊的停損/停利單變成「孤兒單」導致裸空"""
@@ -295,7 +328,7 @@ class TradingEngine:
 
         
         if df.empty or len(df) < 60:
-            logger.warning(f"[{symbol}] ⚠️ 獲取 {term} ({bar_size_str}) 實時 K 線失敗或數據量不足。")
+            logger.warning(f"⚠️ [{symbol}] 獲取 {term} ({bar_size_str}) 實時 K 線失敗或數據量不足。")
             return
 
         current_price = float(df['Close'].iloc[-1])
@@ -347,7 +380,6 @@ class TradingEngine:
                         if col in bench_df_raw.columns:
                             bench_df_raw[col] = pd.to_numeric(bench_df_raw[col], errors='coerce')
 
-
                     # 寫入快取，供同一迴圈的下一檔股票使用
                     self.cached_benchmarks[cache_key] = bench_df_raw
                     
@@ -355,7 +387,7 @@ class TradingEngine:
                         bench_df = bench_df_raw.reindex(df.index, method='ffill').bfill()
                         
         except Exception as e:
-            logger.warning(f"[{symbol}] ⚠️ 獲取基準指標 Benchmark ({benchmark_symbol}) 失敗: {e}")
+            logger.warning(f"⚠️ [{symbol}] 獲取基準指標 Benchmark ({benchmark_symbol}) 失敗: {e}")
 
         macro_dict = {}
         if self.ext:
@@ -389,9 +421,6 @@ class TradingEngine:
             df_adv = self.pipeline.engineer_advanced_features(df, bench_data, macro_dict)
             df_adv = df_adv.ffill().bfill().fillna(0)
             
-            # [修正] 舊版寫死 OHLCV，使 engineer_advanced_features 算出的
-            # 技術指標、bench_correlation 與 VIX 全部被丟棄。現在讀回訓練時
-            # 保存的特徵清單，訓練與推論兩端使用同一組欄位與同一個順序。
             df_adv, scale_cols = self.pipeline.align_to_manifest(df_adv, symbol)
             df_scaled, scale_cols = self.pipeline.transform_for_inference(df_adv, symbol)
         else:
@@ -427,14 +456,6 @@ class TradingEngine:
                 
             pred_real = None
             if self.pipeline and m_type in ["LSTM", "Transformer"]:
-                # [修正] 移除原本的 sklearn fallback (scaler.data_min_[3])。
-                # DataPipeline.scalers[symbol] 是 {col: {'min','max'}} 的純字典，
-                # 沒有 data_min_ 屬性，那段程式永遠拋 AttributeError 被吞掉 ——
-                # 是一條壞掉的保險絲。inverse_transform_scale 現在會在缺少
-                # scaler 時明確回傳 None，直接跳過該模型即可。
-                # [修正] 模型現在輸出的是「下一根 K 線的對數報酬 x 100」，
-                # 不再是 Min-Max 縮放後的價格水位。decode_prediction 會依
-                # manifest 的 target_mode 自動選擇解碼方式 (含舊格式相容)。
                 if isinstance(pred_raw, (list, np.ndarray)):
                     pred_raw = float(pred_raw[0]) if len(pred_raw) > 0 else None
                     if pred_raw is None:
@@ -450,13 +471,13 @@ class TradingEngine:
                 
             deviation = abs(pred_real - current_price) / current_price
             if pred_real <= 0 or deviation > 0.10:
-                # print(f"[{symbol}] 🛡️ 剔除 {m_type} 嚴重偏離或失效之預測 (預測: {pred_real:.2f} | 現價: {current_price:.2f} | 偏差: {deviation*100:.1f}%)")
+                print(f"[{symbol}] 🛡️ 剔除 {m_type} 嚴重偏離或失效之預測 (預測: {pred_real:.2f} | 現價: {current_price:.2f} | 偏差: {deviation*100:.1f}%)")
                 continue
                 
             ensemble_preds[m_type] = pred_real
 
         if not ensemble_preds:
-            logger.debug(f"[{symbol}] ⚠️ 所有模型預測皆失效或觸發 10% 偏差安全網，強制維持觀望 (HOLD)。")
+            logger.debug(f"⚠️ [{symbol}] 所有模型預測皆失效或觸發 10% 偏差安全網，強制維持觀望 (HOLD)。")
             return
 
         _, annual_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
@@ -512,11 +533,6 @@ class TradingEngine:
         
         allow_shorting = self.config.get("strategy_settings.allow_shorting", False)
         final_weight = min(target_weight * conviction, 0.35) 
-        
-        # [修正] 組合層級的總曝險上限。
-        # 舊版只有單筆的 final_weight <= 0.35，沒有任何組合層級約束：
-        # market_analyzer 若因資料不足回傳 is_valid=False，target_weight 一律
-        # 退回 0.10，32 檔 x 10% = 理論總曝險 320%。
         max_gross = self.config.get("strategy_settings.max_gross_exposure", 1.0)
 
         def _affordable_qty() -> int:
@@ -526,7 +542,7 @@ class TradingEngine:
             if net_liquidation > 0:
                 room = (max_gross * net_liquidation) - self._current_gross_exposure()
                 if room <= 0:
-                    logger.warning(f"[{symbol}] ⚠️ 已達組合總曝險上限 ({max_gross*100:.0f}%)，本次不建立新倉。")
+                    logger.warning(f"⚠️ [{symbol}] 已達組合總曝險上限 ({max_gross*100:.0f}%)，本次不建立新倉。")
                     return 0
                 budget = min(budget, room)
 
@@ -547,7 +563,7 @@ class TradingEngine:
                 is_closing_only = True
             else:
                 if not allow_shorting:
-                    logger.debug(f"[{symbol}] ⚠️ 已阻擋做空指令，維持觀望。")
+                    logger.debug(f"⚠️ [{symbol}] 已阻擋做空指令，維持觀望。")
                     return
                 trade_quantity = _affordable_qty()
 
@@ -559,25 +575,17 @@ class TradingEngine:
         
         # 注意：若是「平倉單 (is_closing_only)」，就算僅剩 1 股也必須無條件出清，因此排除在此檢查外。
         if not is_closing_only and trade_value < min_trade_usd:
-            logger.debug(f"[{symbol}] ⚠️ 預期建倉總值 (${trade_value:.2f}) 低於最小經濟門檻 (${min_trade_usd:.2f})，為防範手續費耗損，取消本次交易。")
+            logger.debug(f"⚠️ [{symbol}] 預期建倉總值 (${trade_value:.2f}) 低於最小經濟門檻 (${min_trade_usd:.2f})，為防範手續費耗損，取消本次交易。")
             return
             
         logger.info(f"[{symbol}] 🎯 準備執行 ({term_name}): {action} {trade_quantity} 股 @ 市價約 {current_price:.2f} (動態分配權重: {final_weight*100:.1f}%)")
-        logger.info(f"      => [安全防護] 停損單(STP)設定於: {sl_price:.2f} | 停利單(LMT)設定於: {tp_price:.2f}")
+        logger.info(f"	=> [安全防護] 停損單(STP)設定於: {sl_price:.2f} | 停利單(LMT)設定於: {tp_price:.2f}")
         
-        # [修正] 舊版用未經 qualifyContracts 的 Stock(symbol, "SMART", "USD") 下單。
-        # 對 BRK B、ASML、TSM 這類有歧義或多重上市的代碼，可能觸發 IBKR 的
-        # ambiguous contract 錯誤，或在非預期的交易所成交。此處已有快取可用。
         contract = await self._get_qualified_contract(symbol)
         try:
             # 1. 下單前強制清理歷史孤兒單
             await self._cancel_open_orders(symbol)
             
-            # [修正] 舊版 available_funds 來自每輪開頭的一次性帳戶快照，
-            # 在 run_tick 的逐檔迴圈中「不會更新」。前幾檔建完倉後現金早已耗盡，
-            # 後面的標的卻仍以為有全額可用，直到低於 min_trade_usd 才被跳過 ——
-            # config.yaml 中標的的排列順序實質決定了誰能拿到資金。
-            # 這裡在送單後立刻扣除，讓同一輪的後續標的看到真實餘額。
             if not is_closing_only:
                 self.cached_funds = max(0.0, self.cached_funds - trade_value)
 
@@ -619,4 +627,4 @@ class TradingEngine:
                 reason = "AI反向平倉" if is_closing_only else f"AI建倉 ({term_name} | Alloc:{final_weight*100:.1f}%)"
                 await self.db.log_trade({"symbol": symbol, "action": action, "quantity": trade_quantity, "price": current_price, "regime": regime_name, "reason": ("[虛擬] " if self.dry_run else "") + reason})
         except Exception as e:
-            logger.critical(f"[{symbol}] ❌ 下單過程發生錯誤: {e}")
+            logger.critical(f"❌ [{symbol}] 下單過程發生錯誤: {e}")

@@ -1,11 +1,14 @@
 # ibkrpy/strategy/market_analyzer.py
 # 負責跨資產的相關性分析、產業板塊動能、大盤宏觀狀態評估與投資組合權重最佳化
 
+import logging
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List
 from ibkrpy.shared.db_manager import DatabaseManager
 from ibkrpy.shared.config_manager import ConfigManager
+
+logger = logging.getLogger("ibkrpy")
 
 class MarketAnalyzer:
     """
@@ -15,8 +18,8 @@ class MarketAnalyzer:
     def __init__(self, db_manager: DatabaseManager, config_manager: ConfigManager):
         self.db = db_manager
         self.config = config_manager
-        self.lookback_periods = 60  # 計算相關性與 Beta 使用的 K 線數量
-        self.benchmark_symbol = "QQQ"
+        self.lookback_periods = config_manager.get("general_settings.analyzer_lookback", 60)
+        self.benchmark_symbol = config_manager.get("general_settings.benchmark_symbol", "QQQ")
 
     def get_global_context(self) -> Dict[str, Any]:
         """
@@ -26,9 +29,8 @@ class MarketAnalyzer:
         context = {
             "correlation_matrix": {},   # 標的間的相關係數矩陣
             "beta_values": {},          # 各標的相對於大盤的 Beta 值 (系統性風險)
-            "sector_momentum": {},      # 各產業板塊的短期平均報酬率
             "macro_trend": "NEUTRAL",   # 大盤短期趨勢
-            "symbol_tags": {},          # 標的對應的產業標籤快取
+            "symbols": [],              # 納入本次計算的標的
             "optimal_weights": {},      # 投資組合最佳化目標權重
             "is_valid": False           # 數據是否足夠計算
         }
@@ -41,8 +43,8 @@ class MarketAnalyzer:
         price_dict = {}
         for profile in self.config.asset_profiles:
             sym = profile.symbol
-            context["symbol_tags"][sym] = profile.tags or ["General"]
-            
+            context["symbols"].append(sym)
+
             df = self.db.get_market_data_sync(sym)
             if not df.empty and len(df) >= self.lookback_periods:
                 price_dict[sym] = df['Close'].tail(self.lookback_periods)
@@ -52,7 +54,14 @@ class MarketAnalyzer:
 
         # 2. 組裝成 DataFrame 並計算對數報酬率
         prices_df = pd.DataFrame(price_dict).ffill().dropna()
-        if len(prices_df) < 10: 
+        if len(prices_df) < 10:
+            # [修正] 舊版在此靜默 return，is_valid 保持 False，
+            # 所有 conviction 退回 1.0、所有 target_weight 退回 0.10，
+            # 而日誌上看不出任何異常。
+            logger.warning(
+                f"全局分析資料不足 (對齊後僅 {len(prices_df)} 列，需 >= 10)，"
+                f"本輪相關性 / Beta / 風險平價全部退回預設值。"
+            )
             return context
             
         returns_df = np.log(prices_df / prices_df.shift(1)).dropna()
@@ -79,18 +88,6 @@ class MarketAnalyzer:
                     else:
                         context["beta_values"][sym] = 1.0
 
-        # 5. 評估產業板塊資金動能
-        sector_returns = {}
-        for sym in returns_df.columns:
-            sym_cum_ret = (prices_df[sym].iloc[-1] / prices_df[sym].iloc[0]) - 1
-            tags = context["symbol_tags"].get(sym, ["General"])
-            for tag in tags:
-                if tag not in sector_returns:
-                    sector_returns[tag] = []
-                sector_returns[tag].append(sym_cum_ret)
-
-        for tag, rets in sector_returns.items():
-            context["sector_momentum"][tag] = np.mean(rets)
 
         # 6. 投資組合最佳化: 基於風險平價 (Risk Parity / Inverse Variance)
         # 讓波動大的股票權重小，波動小的股票權重大，實現整體 Portfolio 波動率最小化與夏普最大化
@@ -109,7 +106,6 @@ class MarketAnalyzer:
         針對單一股票，結合全局上下文進行橫截面分析 (Cross-Sectional Analysis)
         """
         analysis = {
-            "sector_health": "NEUTRAL",
             "macro_alignment": "NEUTRAL",
             "benchmark_correlation": 0.0,
             "beta": 1.0,
@@ -118,27 +114,13 @@ class MarketAnalyzer:
             "warnings": []
         }
         
-        if not context.get("is_valid") or symbol not in context["symbol_tags"]:
+        if not context.get("is_valid") or symbol not in context.get("symbols", []):
             return analysis
 
         # 提取投資組合最佳化目標權重
         analysis["target_weight"] = context.get("optimal_weights", {}).get(symbol, 0.10)
 
-        # --- A. 產業板塊健康度分析 ---
-        tags = context["symbol_tags"][symbol]
-        sector_scores = [context["sector_momentum"].get(t, 0.0) for t in tags]
-        avg_sector_score = np.mean(sector_scores) if sector_scores else 0.0
-        
-        if avg_sector_score > 0.005:
-            analysis["sector_health"] = "STRONG"
-            analysis["conviction_multiplier"] += 0.2 if action == "BUY" else -0.2
-        elif avg_sector_score < -0.005:
-            analysis["sector_health"] = "WEAK"
-            analysis["conviction_multiplier"] += 0.2 if action == "SELL" else -0.2
-            if action == "BUY":
-                analysis["warnings"].append(f"逆風警告: {tags} 板塊資金正在流出。")
-
-        # --- B. 大盤宏觀對齊與 Beta 風險分析 ---
+        # --- A. 大盤宏觀對齊與 Beta 風險分析 ---
         macro_trend = context.get("macro_trend", "NEUTRAL")
         beta = context.get("beta_values", {}).get(symbol, 1.0)
         analysis["macro_alignment"] = macro_trend
@@ -162,7 +144,7 @@ class MarketAnalyzer:
                 analysis["conviction_multiplier"] += 0.1 
                 analysis["warnings"].append(f"防禦屬性: 該標的 Beta 較低 ({beta:.2f})，具備一定的抗跌能力。")
 
-        # --- C. 投資組合過度集中風險 (Portfolio Concentration Risk) ---
+        # --- B. 投資組合過度集中風險 (Portfolio Concentration Risk) ---
         corr_matrix = context.get("correlation_matrix", {})
         
         if current_positions and symbol in corr_matrix:

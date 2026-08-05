@@ -1,17 +1,18 @@
 # ibkrpy/evaluation/model_tuner.py
 # 結合 Optuna 優化與模型選拔 (支援跨週期錦標賽)
 
-import logging
 import optuna
 import pandas as pd
 import numpy as np
 import os
 from typing import Dict, Any, List, Tuple
 from .backtest_engine import BacktestEngine
+import logging
+
+logger = logging.getLogger(__name__)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-logger = logging.getLogger("ibkrpy")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
@@ -25,14 +26,23 @@ class ModelTuner:
 
     def _calculate_composite_score(self, perf: Dict[str, Any]) -> float:
         """超越單一夏普指數的機構級複合評分 (Composite Score)"""
-        # 樣本數過少，不具統計意義，給予極大懲罰
-        if perf["total_trades"] < 5:
-            return -999.0  
+        # [修正] 舊版對所有「虧損」與「交易過少」的組合都回傳同一個 -999，
+        # 使搜尋空間出現大片平原。Optuna 的 TPE 需要靠分數差異建立分布模型，
+        # 常數平原提供不了任何梯度，搜尋會退化成接近隨機取樣。
+        # 改為連續懲罰，保留組合之間的排序資訊。
 
-        # 1. 索提諾比率 (Sortino Ratio)
         sortino = perf.get("sortino_ratio", 0.0)
-        if sortino <= 0: 
-            return -999.0
+        n_trades = perf.get("total_trades", 0)
+
+        # 虧損策略：仍依虧損程度排序，讓 TPE 知道往哪個方向走
+        if sortino <= 0:
+            mdd = perf.get("max_drawdown_pct", 100.0)
+            return sortino - 1.0 - (mdd / 100.0)
+
+        # 樣本數不足：線性遞減而非硬切，避免與虧損策略混為一談
+        sample_penalty = 1.0
+        if n_trades < 5:
+            sample_penalty = max(0.05, n_trades / 5.0)
 
         # 2. 獲利因子 (Profit Factor)
         pf = perf.get("profit_factor", 0.0)
@@ -44,10 +54,10 @@ class ModelTuner:
 
         # 4. 交易頻率懲罰
         trade_penalty = 1.0
-        if perf["total_trades"] > 40:
-            trade_penalty = 40.0 / perf["total_trades"]
+        if n_trades > 40:
+            trade_penalty = 40.0 / n_trades
 
-        return sortino * (1.0 + pf_multiplier) * mdd_penalty * trade_penalty
+        return sortino * (1.0 + pf_multiplier) * mdd_penalty * trade_penalty * sample_penalty
 
     def optimize_strategy_params(self, symbol: str, df: pd.DataFrame, precomputed_data: pd.DataFrame, n_trials: int = 50, term: str = "long_term") -> Tuple[Dict[str, Any], float]:
         """使用 Optuna 尋找最佳風控參數並回傳 (最佳參數, 複合評分)"""
@@ -70,18 +80,21 @@ class ModelTuner:
             strategy = CoreStrategy(symbol, config)
             signals = []
             
-            for ts, row in precomputed_data.iterrows():
-                regime_name = row.get('regime', 'SIDEWAYS_QUIET')
+            # [修正] iterrows() 每列都會建立一個 Series 物件，是 pandas 最慢的迭代方式。
+            # 這裡是最內層迴圈 (列數 x trials x terms x symbols)，改用 itertuples()。
+            for row in precomputed_data.itertuples(index=True):
+                regime_name = getattr(row, 'regime', 'SIDEWAYS_QUIET')
                 regime = MarketRegime[regime_name] if hasattr(MarketRegime, regime_name) else MarketRegime.SIDEWAYS_QUIET
-                
+
+                close = getattr(row, 'Close')
                 sig = strategy.generate_signal(
-                    current_price=row['Close'],
-                    prediction=row.get('prediction', row['Close']),
-                    volatility=row.get('volatility', 0.02),
+                    current_price=close,
+                    prediction=getattr(row, 'prediction', close),
+                    volatility=getattr(row, 'volatility', 0.02),
                     regime=regime
                 )
                 if sig:
-                    sig["timestamp"] = ts
+                    sig["timestamp"] = row.Index
                     signals.append(sig)
                     
             perf = self.engine.run(df, signals)
@@ -105,39 +118,12 @@ class ModelTuner:
             
             return study.best_params, study.best_value
         except Exception as e:
-            logger.warning(f"      ⚠️ Optuna 優化失敗: {e}")
+            logger.warning(f"⚠️ Optuna 優化失敗: {e}")
             return {}, -999.0
 
-    def optimize_hyperparameters(self, symbol: str, model_type: str, n_trials: int = 20) -> Dict[str, Any]:
-        logger.info(f"[{symbol}] 開始 {model_type} 模型的超參數優化 (Trials: {n_trials})...")
-        def objective(trial):
-            look_back = trial.suggest_categorical("look_back", [30, 60, 90])
-            dropout = trial.suggest_float("dropout_rate", 0.1, 0.4)
-            return -abs(look_back - 60) + (dropout * 2) 
-            
-        os.makedirs(DATA_DIR, exist_ok=True)
-        db_path = os.path.join(DATA_DIR, "optuna_study.db")
-        storage_url = f"sqlite:///{db_path}"
-        study_name = f"hyperparams_{symbol}_{model_type}"
-
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=storage_url,
-            load_if_exists=True,
-            direction="maximize"
-        )
-        study.optimize(objective, n_trials=n_trials, n_jobs=-1)
-        return study.best_params
-
-    def select_best_model(self, symbol: str, candidate_models: List[str]) -> str:
-        logger.info(f"[{symbol}] 展開模型選拔賽: {candidate_models}")
-        best_model = candidate_models[0]
-        best_score = -float('inf')
-        for model_type in candidate_models:
-            simulated_perf = {"sortino_ratio": 1.5, "profit_factor": 1.2, "max_drawdown_pct": 15, "total_trades": 25}
-            score = self._calculate_composite_score(simulated_perf)
-            if score > best_score:
-                best_score = score
-                best_model = model_type
-        logger.info(f"[{symbol}] 冠軍模型誕生: {best_model} (Composite Score: {best_score:.2f})")
-        return best_model
+# 註：原 optimize_hyperparameters 與 select_best_model 已移除。
+#   - optimize_hyperparameters 的目標函式是 `-abs(look_back-60) + dropout*2`，
+#     沒有訓練任何模型，回傳的「最佳超參數」恆為 look_back=60 加最大 dropout。
+#   - select_best_model 對每個候選模型都套用同一組硬編碼的 simulated_perf，
+#     分數完全相同，永遠回傳 candidate_models[0]。
+#   兩者都未被 pipeline_manager 呼叫。留著只會讓人誤以為系統具備這些能力。

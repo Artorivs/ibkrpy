@@ -266,7 +266,7 @@ class SystemDaemon:
                         continue
 
                     self.logger.info("=" * 40)
-                    self.logger.info(f" 📈 盤中時間 (NY: {now_ny.strftime('%H:%M')}) - 執行 AI 掃描與決策")
+                    self.logger.info(f"📈 盤中時間 (NY: {now_ny.strftime('%H:%M')}) - 執行 AI 掃描與決策")
                     self.logger.info("=" * 40)
 
                     if self.ib_manager.ib.isConnected():
