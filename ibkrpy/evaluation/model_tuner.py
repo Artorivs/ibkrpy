@@ -26,11 +26,6 @@ class ModelTuner:
 
     def _calculate_composite_score(self, perf: Dict[str, Any]) -> float:
         """超越單一夏普指數的機構級複合評分 (Composite Score)"""
-        # [修正] 舊版對所有「虧損」與「交易過少」的組合都回傳同一個 -999，
-        # 使搜尋空間出現大片平原。Optuna 的 TPE 需要靠分數差異建立分布模型，
-        # 常數平原提供不了任何梯度，搜尋會退化成接近隨機取樣。
-        # 改為連續懲罰，保留組合之間的排序資訊。
-
         sortino = perf.get("sortino_ratio", 0.0)
         n_trades = perf.get("total_trades", 0)
 
@@ -80,8 +75,6 @@ class ModelTuner:
             strategy = CoreStrategy(symbol, config)
             signals = []
             
-            # [修正] iterrows() 每列都會建立一個 Series 物件，是 pandas 最慢的迭代方式。
-            # 這裡是最內層迴圈 (列數 x trials x terms x symbols)，改用 itertuples()。
             for row in precomputed_data.itertuples(index=True):
                 regime_name = getattr(row, 'regime', 'SIDEWAYS_QUIET')
                 regime = MarketRegime[regime_name] if hasattr(MarketRegime, regime_name) else MarketRegime.SIDEWAYS_QUIET

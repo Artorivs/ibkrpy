@@ -379,10 +379,6 @@ class DataPipeline:
 
         target_mode = "log_return" 時，模型輸出的是下一根 K 線的對數報酬 x target_scale，
         因此 price = current_price * exp(raw / target_scale)。
-
-        [修正] 舊版模型預測的是 Min-Max 縮放後的「價格水位」。預測價格水位時，
-        網路最省力的解就是「輸出約等於最後一根輸入」，收斂到近似隨機漫步，
-        預測邊際自然趨近於 0 —— 這正是預測幅度長期停在 ±0.3% 的主因。
         """
         if not np.isfinite(raw) or current_price <= 0:
             return None

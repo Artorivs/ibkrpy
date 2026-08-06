@@ -150,15 +150,8 @@ class ModelOrchestrator:
         else:
             logger.debug(f"[{symbol}] 載入 {model_type} 模型至記憶體...")
 
-        # [修正] 傳入 symbol，讓工廠依 {symbol}_features.json 決定 feature_cols。
-        # 舊版一律用預設的 OHLCV，與訓練端寫死的 OHLCV 靠巧合對上。
         model = self.factory.create_model(model_type, symbol=symbol)
         model.load_weights(symbol)
-
-        # [修正] 載入後立刻驗證輸入維度。
-        # 若權重是用 N 個特徵訓練的，而工廠給的 feature_cols 只有 M 個，
-        # Keras 會在每一次 tick 拋出難懂的 shape 例外，而該模型仍留在 Ensemble 名單上。
-        # 這裡直接把它標成未訓練，由 _is_model_usable 排除，並給出可行動的訊息。
         self._verify_input_shape(model, symbol, model_type)
 
         self._loaded_models[cache_key] = model

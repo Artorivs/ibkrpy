@@ -22,7 +22,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.append(project_root)
 caffeine.on(display=False)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ibkrpy.main")
 
 core_dir_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -115,18 +115,32 @@ async def run_pipeline_mode(mode: str, target_symbol: str = None, client_id: int
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
 
 async def live_trading_loop(engine: TradingEngine, symbols: list, interval_minutes: int = 5):
+    """
+    由 engine.should_tick() 依 bar size 決定該不該問：日 K 標的每小時一次、
+    小時 K 每 15 分鐘一次、5 分 K 才每 5 分鐘一次。有持倉的標的不受節流限制。
+    掃描迴圈本身仍維持 1 分鐘一次，讓短線標的與持倉監控保持即時。
+    """
     offset = 0
+    loop_seconds = 60
     try:
         while True:
             await engine.update_system_state()
             # 輪替起點，避免資金耗盡時清單後段的標的長期被跳過
             order = symbols[offset:] + symbols[:offset]
             offset = (offset + 1) % max(len(symbols), 1)
-            for symbol in order:
+
+            due = [s for s in order if engine.should_tick(s)]
+            if due:
+                logger.info(f"🔁 本輪待掃描 {len(due)}/{len(symbols)} 檔: {', '.join(due[:12])}"
+                            + (" ..." if len(due) > 12 else ""))
+            for symbol in due:
                 await engine.run_tick(symbol)
-                await asyncio.sleep(2)
-            await asyncio.sleep(interval_minutes * 60)
-    except asyncio.CancelledError: pass
+                await asyncio.sleep(0.5)
+
+            engine.log_cycle_summary()
+            await asyncio.sleep(loop_seconds)
+    except asyncio.CancelledError:
+        pass
 
 async def run_live_mode(args):
     config = ConfigManager()

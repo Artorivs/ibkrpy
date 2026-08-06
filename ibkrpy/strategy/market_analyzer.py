@@ -55,9 +55,6 @@ class MarketAnalyzer:
         # 2. 組裝成 DataFrame 並計算對數報酬率
         prices_df = pd.DataFrame(price_dict).ffill().dropna()
         if len(prices_df) < 10:
-            # [修正] 舊版在此靜默 return，is_valid 保持 False，
-            # 所有 conviction 退回 1.0、所有 target_weight 退回 0.10，
-            # 而日誌上看不出任何異常。
             logger.warning(
                 f"全局分析資料不足 (對齊後僅 {len(prices_df)} 列，需 >= 10)，"
                 f"本輪相關性 / Beta / 風險平價全部退回預設值。"

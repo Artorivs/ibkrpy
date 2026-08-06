@@ -10,7 +10,14 @@ import pandas as pd
 import numpy as np
 import logging
 
-logger = logging.getLogger(__name__)
+# 掛在 "ibkrpy" 樹下，確保 system_log 的 QueueHandler 會收到本模組的日誌
+logger = logging.getLogger("ibkrpy.trading_engine")
+_TERM_POLL_SECONDS = {
+    "short_term": 300,      # 5 分 K -> 每 5 分鐘
+    "mid_term": 900,        # 1 小時 K -> 每 15 分鐘 (盤中提早看到未收完的當根)
+    "long_term": 3600,      # 日 K -> 每小時
+}
+
 
 class TradingEngine:
     """單向資料流的主迴圈，具備長短期數據自適應抓取能力，全面落實配置驅動。"""
@@ -59,13 +66,78 @@ class TradingEngine:
         self._last_prices = {}
         self.qualified_contracts = {}
 
-    async def _get_qualified_contract(self, symbol: str) -> Stock:
-        """獲取並緩存合約，避免每個迴圈重複向 IBKR 請求驗證"""
-        if symbol not in self.qualified_contracts:
+        # 每檔標的上次真正跑完 run_tick 的時間，用來做 per-term 節流
+        self._last_tick_at: Dict[str, float] = {}
+        # 本輪掃描的決策統計，供 log_cycle_summary 輸出
+        self._cycle_decisions: Dict[str, int] = {}
+        self._cycle_started_at = time.time()
+
+    def _poll_interval(self, symbol: str) -> int:
+        term = self.symbol_terms.get(symbol, "long_term")
+        default = _TERM_POLL_SECONDS.get(term, 3600)
+        return int(self.config.get(f"general_settings.poll_seconds_{term}", default))
+
+    def should_tick(self, symbol: str) -> bool:
+        """
+        由 bar size 決定該不該真的去問 IBKR。持倉中的標的例外 —— 有部位時
+        風險是實時的，不能等下一根 K 線。
+        """
+        if self.cached_positions.get(symbol):
+            return True
+        last = self._last_tick_at.get(symbol)
+        if last is None:
+            return True
+        return (time.time() - last) >= self._poll_interval(symbol)
+
+    def _record_decision(self, code: str):
+        self._cycle_decisions[code] = self._cycle_decisions.get(code, 0) + 1
+
+    def log_cycle_summary(self):
+        """
+        每輪掃描結束時印一行總結。
+        """
+        if not self._cycle_decisions:
+            logger.info("📊 [本輪總結] 沒有任何標的通過輪詢節流 (皆在冷卻期內)。")
+            return
+
+        total = sum(self._cycle_decisions.values())
+        breakdown = " | ".join(
+            f"{k}×{v}" for k, v in sorted(self._cycle_decisions.items(), key=lambda kv: -kv[1])
+        )
+        elapsed = time.time() - self._cycle_started_at
+        line = f"📊 [本輪總結] 掃描 {total} 檔 / 耗時 {elapsed:.0f}s -> {breakdown}"
+
+        stats = getattr(self.data, "pacing_stats", None)
+        if callable(stats):
+            s = stats()
+            line += (f" || API: 10分鐘窗 {s['requests_in_window']}/{s['window_limit']}，"
+                     f"快取命中率 {s['cache_hit_rate']:.0%}")
+        logger.info(line)
+
+        self._cycle_decisions = {}
+        self._cycle_started_at = time.time()
+
+    async def _get_qualified_contract(self, symbol: str):
+        """
+        獲取並緩存「完整」合約。
+        必然失敗。現在改為委派給 IBKRDataManager.qualify()，解析不到就回 None。
+        """
+        if symbol in self.qualified_contracts:
+            return self.qualified_contracts[symbol]
+
+        contract = None
+        if hasattr(self.data, "qualify"):
+            contract = await self.data.qualify(symbol)
+        else:  # 相容舊版 data manager
             contract = Stock(symbol, "SMART", "USD")
-            await self.data.ib.qualifyContractsAsync(contract)
+            resolved = await self.data.ib.qualifyContractsAsync(contract)
+            if not resolved or not contract.conId:
+                logger.error(f"[{symbol}] ❌ 合約解析失敗，本輪跳過此標的。")
+                contract = None
+
+        if contract is not None:
             self.qualified_contracts[symbol] = contract
-        return self.qualified_contracts[symbol]
+        return contract
 
     def _get_dynamic_benchmark(self, symbol: str) -> str:
         """
@@ -268,14 +340,17 @@ class TradingEngine:
             await asyncio.sleep(0.5)
 
     async def run_tick(self, symbol: str):
-        logger.info(f"[{symbol}] 啟動實盤決策迴圈...")
-        
+        self._last_tick_at[symbol] = time.time()
+
         available_funds = self.cached_funds
         net_liquidation = self.cached_net_liq
         current_pos = self.cached_positions.get(symbol, 0.0)
-        
+
         contract = await self._get_qualified_contract(symbol)
-        
+        if contract is None:
+            self._record_decision("CONTRACT_UNRESOLVED")
+            return
+
         term = self.symbol_terms.get(symbol, "long_term")
         
         if term == "short_term":
@@ -328,7 +403,11 @@ class TradingEngine:
 
         
         if df.empty or len(df) < 60:
-            logger.warning(f"⚠️ [{symbol}] 獲取 {term} ({bar_size_str}) 實時 K 線失敗或數據量不足。")
+            self._record_decision("NO_DATA")
+            logger.warning(
+                f"⚠️ [{symbol}] {term} ({bar_size_str}) 資料不足："
+                f"僅 {len(df)} 根 K 線 (需要 ≥60)。請執行 --mode download 補齊資料庫。"
+            )
             return
 
         current_price = float(df['Close'].iloc[-1])
@@ -436,48 +515,74 @@ class TradingEngine:
         context = {"vix_series": macro_dict.get("VIX"), "current_price": current_price, "regime": regime}
         is_allowed, reason = self.risk.check_trade_allowed(context)
         if not is_allowed:
+            self._record_decision("RISK_BLOCKED")
             logger.info(f"[{symbol}] 🛡️ 交易系統拒絕進場: {reason}")
             return
 
         ensemble_preds = {}
+        rejected_models = {}
         target_models = ["LSTM", "Transformer", "ARIMA"]
-        
+
         for m_type in target_models:
-            pred_raw, _ = self.models.predict(symbol, df_scaled if m_type != "ARIMA" else df_adv, model_type=m_type)
-            
-            if isinstance(pred_raw, (list, np.ndarray)):
-                if len(pred_raw) > 0:
-                    pred_raw = float(pred_raw[0])
-                else:
-                    continue
-                    
-            if pd.isna(pred_raw):
+            if hasattr(self.models, "is_ready") and not self.models.is_ready(symbol, m_type):
+                rejected_models[m_type] = "未訓練"
                 continue
-                
-            pred_real = None
-            if self.pipeline and m_type in ["LSTM", "Transformer"]:
-                if isinstance(pred_raw, (list, np.ndarray)):
-                    pred_raw = float(pred_raw[0]) if len(pred_raw) > 0 else None
-                    if pred_raw is None:
-                        continue
+
+            pred_raw, _ = self.models.predict(
+                symbol, df_scaled if m_type != "ARIMA" else df_adv, model_type=m_type
+            )
+
+            if isinstance(pred_raw, (list, np.ndarray)):
+                if len(pred_raw) == 0:
+                    rejected_models[m_type] = "空輸出"
+                    continue
+                pred_raw = float(pred_raw[0])
+
+            if pred_raw is None or pd.isna(pred_raw):
+                rejected_models[m_type] = "NaN"
+                continue
+
+            # 未訓練時 orchestrator 回傳 0.0；例外時回傳 current_price。兩者都必須擋掉。
+            if float(pred_raw) == 0.0 and m_type in ("LSTM", "Transformer"):
+                rejected_models[m_type] = "輸出為 0 (權重缺失)"
+                continue
+
+            if self.pipeline and m_type in ("LSTM", "Transformer"):
                 pred_real = self.pipeline.decode_prediction(pred_raw, current_price, symbol)
                 if pred_real is None:
+                    rejected_models[m_type] = "解碼失敗"
                     continue
             else:
                 pred_real = float(pred_raw)
-                
-            if pred_real is None:
-                continue
-                
+
             deviation = abs(pred_real - current_price) / current_price
             if pred_real <= 0 or deviation > 0.10:
-                print(f"[{symbol}] 🛡️ 剔除 {m_type} 嚴重偏離或失效之預測 (預測: {pred_real:.2f} | 現價: {current_price:.2f} | 偏差: {deviation*100:.1f}%)")
+                rejected_models[m_type] = f"偏離 {deviation * 100:.1f}%"
+                logger.warning(
+                    f"[{symbol}] 🛡️ 剔除 {m_type}：預測 {pred_real:.2f} vs 現價 "
+                    f"{current_price:.2f} (偏差 {deviation * 100:.1f}%)"
+                )
                 continue
-                
+
             ensemble_preds[m_type] = pred_real
 
+        # 決策過程的完整留痕：每個模型各自預測了多少、誰被剔除、為什麼
+        if ensemble_preds:
+            detail = "·".join(
+                f"{k} {(v / current_price - 1) * 100:+.2f}%" for k, v in ensemble_preds.items()
+            )
+        else:
+            detail = "無"
+        if rejected_models:
+            detail += " || 剔除: " + "·".join(f"{k}({v})" for k, v in rejected_models.items())
+        logger.debug(f"[{symbol}] 🧠 模型預測 ({term}/{bar_size_str}) 現價 {current_price:.2f} -> {detail}")
+
         if not ensemble_preds:
-            logger.debug(f"⚠️ [{symbol}] 所有模型預測皆失效或觸發 10% 偏差安全網，強制維持觀望 (HOLD)。")
+            self._record_decision("NO_USABLE_MODEL")
+            logger.warning(
+                f"⚠️ [{symbol}] 無任何可用模型，維持觀望。"
+                f"若 reason 為「未訓練」，請執行 python ibkrpy/core/main.py --mode train {symbol}。"
+            )
             return
 
         _, annual_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
@@ -495,7 +600,10 @@ class TradingEngine:
             adjusted_volatility = annual_volatility / math.sqrt(252)
 
         strategy = self.strategies.get(symbol)
-        if not strategy: return
+        if not strategy:
+            self._record_decision("NO_STRATEGY")
+            logger.error(f"[{symbol}] ❌ 找不到對應的策略物件，本輪跳過。")
+            return
 
         signal = strategy.generate_signal(
             current_price=context["current_price"],
@@ -503,6 +611,18 @@ class TradingEngine:
             regime=context["regime"],
             ensemble_predictions=ensemble_preds
         )
+
+        # 不論成交與否，都把策略的判斷依據寫進日誌。
+        decision = getattr(strategy, "last_decision", {}) or {}
+        self._record_decision(decision.get("reason_code", "UNKNOWN"))
+        describe = getattr(strategy, "describe_last_decision", None)
+        trace = describe() if callable(describe) else str(decision)
+
+        if signal:
+            logger.info(f"[{symbol}] ✅ 策略決策: {trace}")
+        else:
+            logger.info(f"[{symbol}] ⏸️ 策略決策: {trace}")
+            return
 
         if signal:
             conviction = 1.0
@@ -518,8 +638,6 @@ class TradingEngine:
                     logger.warning(f"[{symbol}] 🌍 宏觀警告: {' | '.join(analysis['warnings'])}")
 
             await self._execute_signal(symbol, signal, current_price, available_funds, net_liquidation, current_pos, conviction, target_weight)
-        else:
-            logger.debug(f"[{symbol}] ⏸️ 策略判斷維持觀望 (HOLD)。")
 
     async def _execute_signal(self, symbol: str, signal: Dict[str, Any], current_price: float, available_funds: float, net_liquidation: float, current_pos: float, conviction: float = 1.0, target_weight: float = 0.10):
         action = signal["action"]
@@ -549,7 +667,10 @@ class TradingEngine:
             return int(budget / current_price) if current_price > 0 else 0
 
         if action == "BUY":
-            if current_pos > 0: return
+            if current_pos > 0:
+                self._record_decision("ALREADY_LONG")
+                logger.info(f"[{symbol}] ⏸️ 已持有多單 {current_pos:+.0f} 股，BUY 訊號不重複加倉。")
+                return
             elif current_pos < 0:
                 trade_quantity = int(abs(current_pos))
                 is_closing_only = True
@@ -557,31 +678,56 @@ class TradingEngine:
                 trade_quantity = _affordable_qty()
 
         elif action == "SELL":
-            if current_pos < 0: return
+            if current_pos < 0:
+                self._record_decision("ALREADY_SHORT")
+                logger.info(f"[{symbol}] ⏸️ 已持有空單 {current_pos:+.0f} 股，SELL 訊號不重複加倉。")
+                return
             elif current_pos > 0:
                 trade_quantity = int(current_pos)
                 is_closing_only = True
             else:
                 if not allow_shorting:
-                    logger.debug(f"⚠️ [{symbol}] 已阻擋做空指令，維持觀望。")
+                    self._record_decision("SHORTING_DISABLED")
+                    logger.info(
+                        f"[{symbol}] ⏸️ 產生 SELL 訊號但無持倉，且 allow_shorting=False，"
+                        f"已阻擋做空。"
+                    )
                     return
                 trade_quantity = _affordable_qty()
 
-        if trade_quantity <= 0: return
-        
+        if trade_quantity <= 0:
+            self._record_decision("NO_BUYING_POWER")
+            budget = min(net_liquidation * final_weight, available_funds * 0.95)
+            logger.warning(
+                f"[{symbol}] ⚠️ 有 {action} 訊號但可下單股數為 0。"
+                f"目標權重 {final_weight * 100:.1f}% / 淨值 ${net_liquidation:,.0f} / "
+                f"可用資金 ${available_funds:,.0f} / 預算 ${budget:,.0f} / 現價 {current_price:.2f}。"
+            )
+            return
+
         # 預設最低建倉門檻
         min_trade_usd = self.config.get("strategy_settings.min_trade_usd", 500.0) 
         trade_value = trade_quantity * current_price
         
         # 注意：若是「平倉單 (is_closing_only)」，就算僅剩 1 股也必須無條件出清，因此排除在此檢查外。
         if not is_closing_only and trade_value < min_trade_usd:
-            logger.debug(f"⚠️ [{symbol}] 預期建倉總值 (${trade_value:.2f}) 低於最小經濟門檻 (${min_trade_usd:.2f})，為防範手續費耗損，取消本次交易。")
+            self._record_decision("BELOW_MIN_TRADE")
+            logger.info(
+                f"[{symbol}] ⏸️ 有 {action} 訊號但建倉總值 ${trade_value:.2f} "
+                f"低於最小經濟門檻 ${min_trade_usd:.2f}，取消以免手續費耗損。"
+            )
             return
             
         logger.info(f"[{symbol}] 🎯 準備執行 ({term_name}): {action} {trade_quantity} 股 @ 市價約 {current_price:.2f} (動態分配權重: {final_weight*100:.1f}%)")
         logger.info(f"	=> [安全防護] 停損單(STP)設定於: {sl_price:.2f} | 停利單(LMT)設定於: {tp_price:.2f}")
         
         contract = await self._get_qualified_contract(symbol)
+        if contract is None:
+            self._record_decision("CONTRACT_UNRESOLVED")
+            logger.error(f"[{symbol}] ❌ 下單前合約解析失敗，已中止本次交易。")
+            return
+
+        self._record_decision(f"ORDER_{action}")
         try:
             # 1. 下單前強制清理歷史孤兒單
             await self._cancel_open_orders(symbol)

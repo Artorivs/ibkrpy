@@ -119,22 +119,26 @@ class PipelineManager:
                 
             end_date_str = current_end_date.strftime('%Y%m%d %H:%M:%S')
             
-            df_chunk = pd.DataFrame()
-            attempts = 0
-            
-            while attempts < 3 and df_chunk.empty:
-                if attempts > 0:
-                    await asyncio.sleep(5)
-                    
+            df_chunk = await self.ib_data.fetch_historical_data(
+                contract=contract,
+                end_datetime=end_date_str,
+                duration=duration_str,
+                bar_size=bar_size,
+                what_to_show='TRADES'
+            )
+
+            if df_chunk.empty:
+                logger.warning(f"	-> [{symbol}] {duration_str}/{bar_size} 首次請求無資料，20 秒後重試一次...")
+                await asyncio.sleep(20)
                 df_chunk = await self.ib_data.fetch_historical_data(
                     contract=contract,
                     end_datetime=end_date_str,
                     duration=duration_str,
                     bar_size=bar_size,
-                    what_to_show='TRADES'
+                    what_to_show='TRADES',
+                    allow_cache=False,
                 )
-                attempts += 1
-                
+
             if not df_chunk.empty:
                 df_chunk.index = pd.to_datetime(df_chunk.index, utc=True)
                 df_new_list.append(df_chunk)
@@ -145,7 +149,7 @@ class PipelineManager:
                 break
                 
             remaining_days -= fetch_days
-            await asyncio.sleep(2) 
+            await asyncio.sleep(1)
         
         if df_new_list:
             df_new = pd.concat(df_new_list)
@@ -157,7 +161,6 @@ class PipelineManager:
             df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
             if not df_existing.empty:
-                # [修正] save_bulk_market_data 用的是 INSERT OR REPLACE，
                 df_combined = df_new
                 df_combined.sort_index(inplace=True)
                 self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
@@ -263,10 +266,7 @@ class PipelineManager:
         if df.empty or len(df) < 50:
             logger.warning(f"⚠️ [{symbol}] 資料量不足以進行有效訓練，跳過統計模型。")
             return
-            
-        # [修正] 舊版此處用 os.path.abspath("weights") —— 相對於 cwd，
-        # 而 _train_dl_models 與 main.py 用的是專案根目錄的 WEIGHTS_DIR。
-        # cwd 不是專案根目錄時，訓練成果永遠載入不到。
+        
         weights_dir = WEIGHTS_DIR
         os.makedirs(weights_dir, exist_ok=True)
 
@@ -501,99 +501,37 @@ class PipelineManager:
         
         all_terms = ["long_term", "mid_term", "short_term"]
         
+        skipped = []
         for symbol in self.symbols:
             logger.debug(f"[{symbol}] 檢核並同步最新市場資料...")
-            try:
-                contract = Stock(symbol, "SMART", "USD")
-                await self.ib_data.ib.qualifyContractsAsync(contract)
-                
-                for term in all_terms:
-                    settings = self._get_term_settings(term)
-                    bar_size = settings["bar_size"]
-                    total_days = settings["total_days"]
-                    chunk_days = settings["chunk_days"]
-                    
-                    logger.debug(f"	-> 🔄 正在同步 {term} ({bar_size}) 資料...")
-                    df_existing = self.db.get_market_data_sync(symbol, timeframe=bar_size)
-                    days_to_fetch = 0
-                    
-                    if df_existing.empty or len(df_existing) < 50:
-                        days_to_fetch = total_days
-                    else:
-                        # 將資料庫的最後時間與系統當前時間，強制統一對齊到美東時間 (America/New_York)
-                        last_date = pd.Timestamp(df_existing.index[-1])
-                        if last_date.tz is None:
-                            last_date = last_date.tz_localize('UTC')
-                        last_date_ny = last_date.tz_convert('America/New_York')
-                        now_ny = pd.Timestamp.now(tz='America/New_York')
-                        
-                        bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
-                        
-                        if bus_days_diff <= 0:
-                            logger.debug(f"	✅ 資料已是最新狀態，無須同步。")
-                            continue
-                            
-                        # 如果差 1 天，抓 1+1=2 天緩衝即可，避免每次都盲目抓 3 天
-                        days_to_fetch = min(bus_days_diff + 1, total_days)
 
-                    df_new_list = []
-                    remaining_days = days_to_fetch
-                    current_end_date = datetime.now()
-                    
-                    while remaining_days > 0:
-                        fetch_days = min(remaining_days, chunk_days)
-                        duration_str = f"{fetch_days} D"
-                        end_date_str = current_end_date.strftime('%Y%m%d %H:%M:%S')
-                        
-                        df_chunk = pd.DataFrame()
-                        attempts = 0
-                        
-                        while attempts < 3 and df_chunk.empty:
-                            if attempts > 0:
-                                await asyncio.sleep(5)
-                                
-                            df_chunk = await self.ib_data.fetch_historical_data(
-                                contract=contract,
-                                end_datetime=end_date_str,
-                                duration=duration_str,
-                                bar_size=bar_size,
-                                what_to_show='TRADES'
-                            )
-                            attempts += 1
-                            
-                        if not df_chunk.empty:
-                            df_chunk.index = pd.to_datetime(df_chunk.index, utc=True)
-                            df_new_list.append(df_chunk)
-                            first_dt = df_chunk.index[0]
-                            if isinstance(first_dt, str): first_dt = pd.to_datetime(first_dt, utc=True)
-                            current_end_date = first_dt
-                        else:
-                            break
-                            
-                        remaining_days -= fetch_days
-                        await asyncio.sleep(2) 
-                    
-                    if df_new_list:
-                        df_new = pd.concat(df_new_list)
-                        df_new.index = pd.to_datetime(df_new.index, utc=True)
-                        df_new.sort_index(inplace=True)
-                        df_new = df_new[~df_new.index.duplicated(keep='last')]
-                        df_new.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-                        cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
-                        df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
+            contract = await self.ib_data.qualify(symbol)
+            if contract is None:
+                # qualify 已經印出可行動的錯誤訊息，這裡只記錄跳過
+                skipped.append(symbol)
+                continue
 
-                        # [修正] 同 _sync_symbol_term_data：資料庫層是 INSERT OR REPLACE，
-                        # 不需要把 df_existing 併進來一起重寫整段歷史。
-                        self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
-                            
-                        logger.info(f"	✅ [{symbol}] 併入 {len(df_new)} 筆 {bar_size} K線。")
-                    else:
-                        logger.error(f"	❌ [{symbol}] 該週期所有分批資料獲取皆失敗。")
-                    
-            except Exception as e:
-                logger.warning(f"	⚠️ [{symbol}] 資料更新發生例外錯誤: {e}")
-            
-            await asyncio.sleep(2)
+            for term in all_terms:
+                try:
+                    await self._sync_symbol_term_data(symbol, term, contract)
+                except Exception as e:
+                    logger.warning(f"	⚠️ [{symbol}] {term} 資料更新發生例外錯誤: {e}")
+
+            await asyncio.sleep(0.5)
+
+        if skipped:
+            logger.error(
+                f"❌ 以下 {len(skipped)} 檔標的無法解析合約，已跳過："
+                f"{', '.join(skipped)}。請檢查 config.yaml 的 assets 拼寫。"
+            )
+
+        stats = getattr(self.ib_data, "pacing_stats", None)
+        if callable(stats):
+            s = stats()
+            logger.info(
+                f"📊 [資料同步完成] 歷史請求 {s['cache_misses']} 次 / 快取命中 "
+                f"{s['cache_hits']} 次 (命中率 {s['cache_hit_rate']:.0%})。"
+            )
 
     async def run_training_and_tuning(self):
         """階段二：多週期選拔 (Tournament-based Selection)，淘汰弱勢週期，適應並訓練最佳模型"""
@@ -686,8 +624,10 @@ class PipelineManager:
                 if df.empty or len(df) < 100 or stale_days > 5:
                     logger.info(f"	-> 🔍 為了評估 {term}，發現資料空缺或過期，啟動即時下載...")
                     try:
-                        contract = Stock(symbol, "SMART", "USD")
-                        await self.ib_data.ib.qualifyContractsAsync(contract)
+                        contract = await self.ib_data.qualify(symbol)
+                        if contract is None:
+                            logger.error(f"	-> ❌ [{symbol}] 合約無法解析，跳過 {term} 評估。")
+                            continue
                         await self._sync_symbol_term_data(symbol, term, contract)
                         df = self.db.get_market_data_sync(symbol, timeframe=bar_size)
                     except Exception as e:

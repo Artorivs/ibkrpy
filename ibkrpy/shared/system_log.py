@@ -8,6 +8,8 @@ import atexit
 from logging.handlers import RotatingFileHandler, SMTPHandler, QueueHandler, QueueListener
 from typing import Dict, Any
 
+from datetime import datetime
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _log_listener = None
@@ -90,7 +92,7 @@ def setup_logger(config: Dict[str, Any] = None, enable_file: bool = True) -> log
         log_dir = os.path.join(PROJECT_ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
         file_handler = RotatingFileHandler(
-            os.path.join(log_dir, "trading_bot.log"),
+            os.path.join(log_dir, f"trading_bot_{datetime.now().strftime('%Y-%m-%d')}.log"),
             maxBytes=10 * 1024 * 1024,
             backupCount=5,
             encoding="utf-8",
@@ -104,7 +106,7 @@ def setup_logger(config: Dict[str, Any] = None, enable_file: bool = True) -> log
         required = ("smtp_server", "sender_email", "receiver_email", "sender_password")
         missing = [k for k in required if not cfg.get(k)]
         if missing:
-            # 明確報錯，而不是靜默跳過 —— 使用者以為開啟了警報，實際上沒有
+            # 明確報錯，而不是靜默跳過
             logging.getLogger("ibkrpy").error(
                 f"已啟用 email 警報，但 log_settings 缺少必要欄位: {missing}，警報未生效。"
             )
