@@ -7,9 +7,9 @@ import os
 import asyncio
 import subprocess
 import json
+import logging
 import warnings
 import caffeine
-import datetime
 
 # ========== macOS 基礎防禦 ==========
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -21,6 +21,8 @@ warnings.filterwarnings("ignore")
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
 caffeine.on(display=False)
+
+logger = logging.getLogger("ibkrpy.main")
 
 core_dir_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -42,35 +44,67 @@ from ibkrpy.models.lstm import LSTMModel
 from ibkrpy.models.transformer import TransformerModel
 from ibkrpy.models.arima import ARIMAModel
 from ibkrpy.models.garch import GARCHModel
-from ibkrpy.models.hmm import HMMModel
+
 
 class AutomatedModelFactory:
-    def __init__(self):
+    """
+    依訓練時保存的特徵清單建立神經網路模型。
+    """
+
+    def __init__(self, data_pipeline=None):
         self.weights_dir = os.path.join(project_root, "weights")
         os.makedirs(self.weights_dir, exist_ok=True)
+        self.pipeline = data_pipeline
 
-    def create_model(self, model_type):
-        if model_type == "LSTM": return LSTMModel(weights_dir=self.weights_dir)
-        if model_type == "Transformer": return TransformerModel(weights_dir=self.weights_dir)
-        if model_type == "ARIMA": return ARIMAModel(weights_dir=self.weights_dir)
-        if model_type == "GARCH": return GARCHModel(weights_dir=self.weights_dir)
-        if model_type == "HMM": return HMMModel(weights_dir=self.weights_dir)
+    def _features_for(self, symbol):
+        if symbol is None or self.pipeline is None:
+            return None
+        return self.pipeline.load_feature_manifest(symbol)
+
+    def create_model(self, model_type, symbol=None):
+        if model_type == "LSTM":
+            return LSTMModel(feature_cols=self._features_for(symbol), weights_dir=self.weights_dir)
+        if model_type == "Transformer":
+            return TransformerModel(feature_cols=self._features_for(symbol), weights_dir=self.weights_dir)
+        if model_type == "ARIMA":
+            return ARIMAModel(weights_dir=self.weights_dir)
+        if model_type == "GARCH":
+            return GARCHModel(weights_dir=self.weights_dir)
         raise ValueError(f"未知的模型類型: {model_type}")
 
 def launch_dashboard():
-    ui_path = os.path.join(project_root, core_dir_name, "ui", "trading_dashboard.py")
-    subprocess.Popen([sys.executable, ui_path])
+    """
+    啟動視覺化儀表板。
+    """
+    candidates = [
+        os.path.join(project_root, core_dir_name, "core", "trading_dashboard.py"),
+        os.path.join(project_root, core_dir_name, "ui", "trading_dashboard.py"),
+    ]
+    for ui_path in candidates:
+        if os.path.exists(ui_path):
+            subprocess.Popen([sys.executable, ui_path])
+            logger.info(f"已啟動儀表板: {ui_path}")
+            return
+    logger.error(f"找不到 trading_dashboard.py，已嘗試: {candidates}")
 
-async def run_pipeline_mode(mode: str, target_symbol: str = None):
+async def run_pipeline_mode(mode: str, target_symbol: str = None, client_id: int = None):
     config = ConfigManager()
     db_manager = DatabaseManager()
     data_pipeline = DataPipeline()
     ext_fetcher = ExternalDataFetcher(fred_api_key=config.get("api_keys_settings.fred_api_key"))
     
-    ib_manager = IBKRDataManager(host=config.get("ib_settings.host", "127.0.0.1"), port=config.get("ib_settings.port", 7497), client_id=config.get("ib_settings.client_id", 1))
+    ib_manager = IBKRDataManager(
+        host=config.get("ib_settings.host", "127.0.0.1"),
+        port=config.get("ib_settings.port", 7497),
+        client_id=client_id if client_id is not None else config.get("ib_settings.client_id", 1),
+    )
     print(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
-    
-    await ib_manager.connect()
+
+    try:
+        await ib_manager.connect()
+    except ConnectionError as e:
+        logger.error(f"❌ 無法連線至 IBKR，中止本次作業: {e}")
+        return
 
     pipeline = PipelineManager(config=config, db=db_manager, pipeline=data_pipeline, ib_data=ib_manager, ext_fetcher=ext_fetcher, target_symbol=target_symbol)
     try:
@@ -81,15 +115,32 @@ async def run_pipeline_mode(mode: str, target_symbol: str = None):
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
 
 async def live_trading_loop(engine: TradingEngine, symbols: list, interval_minutes: int = 5):
-    logger = setup_logger()
+    """
+    由 engine.should_tick() 依 bar size 決定該不該問：日 K 標的每小時一次、
+    小時 K 每 15 分鐘一次、5 分 K 才每 5 分鐘一次。有持倉的標的不受節流限制。
+    掃描迴圈本身仍維持 1 分鐘一次，讓短線標的與持倉監控保持即時。
+    """
+    offset = 0
+    loop_seconds = 60
     try:
         while True:
             await engine.update_system_state()
-            for symbol in symbols:
+            # 輪替起點，避免資金耗盡時清單後段的標的長期被跳過
+            order = symbols[offset:] + symbols[:offset]
+            offset = (offset + 1) % max(len(symbols), 1)
+
+            due = [s for s in order if engine.should_tick(s)]
+            if due:
+                logger.info(f"🔁 本輪待掃描 {len(due)}/{len(symbols)} 檔: {', '.join(due[:12])}"
+                            + (" ..." if len(due) > 12 else ""))
+            for symbol in due:
                 await engine.run_tick(symbol)
-                await asyncio.sleep(2)
-            await asyncio.sleep(interval_minutes * 60)
-    except asyncio.CancelledError: pass
+                await asyncio.sleep(0.5)
+
+            engine.log_cycle_summary()
+            await asyncio.sleep(loop_seconds)
+    except asyncio.CancelledError:
+        pass
 
 async def run_live_mode(args):
     config = ConfigManager()
@@ -99,14 +150,23 @@ async def run_live_mode(args):
     data_pipeline = DataPipeline()  
     regime_detector = MarketRegimeDetector() 
     
-    ib_manager = IBKRDataManager(host=config.get("ib_settings.host", "127.0.0.1"), port=config.get("ib_settings.port", 7497), client_id=config.get("ib_settings.client_id", 1))
+    ib_manager = IBKRDataManager(
+        host=config.get("ib_settings.host", "127.0.0.1"),
+        port=config.get("ib_settings.port", 7497),
+        client_id=args.client_id if args.client_id is not None else config.get("ib_settings.client_id", 1),
+    )
     print(f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})...")
-    
-    await ib_manager.connect()
-        
-    if not ib_manager.ib.isConnected(): return
 
-    model_orchestrator = ModelOrchestrator(model_factory=AutomatedModelFactory())
+    try:
+        await ib_manager.connect()
+    except ConnectionError as e:
+        logger.error(f"❌ 無法連線至 IBKR，中止啟動: {e}")
+        return
+
+    model_orchestrator = ModelOrchestrator(
+        model_factory=AutomatedModelFactory(data_pipeline=data_pipeline),
+        data_pipeline=data_pipeline,
+    )
     risk_controller = RiskController(rules=[VIXHaltRule(threshold=35.0)])
     
     symbols = [p.symbol for p in config.asset_profiles] if config.asset_profiles else ["AAPL"]
@@ -126,7 +186,7 @@ async def run_live_mode(args):
         except Exception: pass
     
     for sym in symbols:
-        cfg = config.get("strategy_settings") or {}
+        cfg = dict(config.get("strategy_settings") or {})
         
         if sym in global_params:
             cfg.update(global_params[sym])
@@ -139,7 +199,8 @@ async def run_live_mode(args):
         data_manager=ib_manager, model_orchestrator=model_orchestrator,
         risk_controller=risk_controller, strategy_map=strategy_map, db_manager=db_manager,
         ext_fetcher=ext_fetcher, market_analyzer=market_analyzer, data_pipeline=data_pipeline,
-        regime_detector=regime_detector, dry_run=args.dry_run, symbol_terms=symbol_terms
+        regime_detector=regime_detector, dry_run=args.dry_run, symbol_terms=symbol_terms,
+        config_manager=config,
     )
 
     try:
@@ -154,11 +215,19 @@ async def run_live_mode(args):
         if ib_manager.ib.isConnected(): ib_manager.ib.disconnect()
 
 def main():
+    _is_subprocess = "--client-id" in sys.argv
+
+    _boot_config = ConfigManager()
+    setup_logger(_boot_config.get("log_settings") or {}, enable_file=not _is_subprocess)
+
     parser = argparse.ArgumentParser(description="IBKR AI 量化交易系統 總樞紐", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--mode", type=str, required=True, choices=["download", "train", "autopilot", "live", "daemon", "ui"])
     parser.add_argument("symbol", nargs="?", type=str, default=None, help="指定單一股票代碼 (選填，例如 MRVL)")
     parser.add_argument("--ui", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--client-id", type=int, default=None,
+                        help="覆寫 config 的 IBKR client_id。SystemDaemon 以此讓重訓子行程\n"
+                             "使用不同號碼，避免與 24/7 主行程的連線衝突。")
     args = parser.parse_args()
 
     if args.ui or args.mode == "ui":
@@ -166,9 +235,9 @@ def main():
         if args.mode == "ui": sys.exit(0)
     
     match args.mode:
-        case "download": asyncio.run(run_pipeline_mode("download", args.symbol))
-        case "train": asyncio.run(run_pipeline_mode("train", args.symbol))
-        case "autopilot": asyncio.run(run_pipeline_mode("autopilot", args.symbol))
+        case "download": asyncio.run(run_pipeline_mode("download", args.symbol, args.client_id))
+        case "train": asyncio.run(run_pipeline_mode("train", args.symbol, args.client_id))
+        case "autopilot": asyncio.run(run_pipeline_mode("autopilot", args.symbol, args.client_id))
         case "live": asyncio.run(run_live_mode(args))
         case "daemon": asyncio.run(run_live_mode(args))
 
