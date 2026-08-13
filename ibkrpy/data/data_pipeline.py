@@ -1,5 +1,5 @@
 # ibkrpy/data/data_pipeline.py
-# 數據管線與緩存，負責特徵工程、特徵清單、特徵縮放、序列建構。
+# 數據管線與緩存：負責特徵工程、特徵清單、特徵縮放、序列建構
 
 import json
 import os
@@ -8,7 +8,9 @@ import pandas as pd
 import numpy as np
 from typing import Tuple, List, Dict, Optional
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "weights")
 
 logger = logging.getLogger("ibkrpy")
@@ -22,19 +24,50 @@ _BASE_FEATURES = ["Open", "High", "Low", "Close", "Volume"]
 # 與價格等比例縮放的欄位 (名稱前綴)。涵蓋 add_technical_indicators 產生的所有
 # 價格量綱指標：移動平均、布林上中下軌、ATR、MACD 等。
 _PRICE_RELATIVE_PREFIXES = (
-    "Open", "High", "Low", "Close",
-    "SMA_", "EMA_", "WMA_", "DEMA_", "TEMA_", "HMA_", "VWAP",
-    "BBL_", "BBM_", "BBU_",          # 布林上中下軌 (價格量綱)
-    "ATR_", "ATRr_", "TRUERANGE",
-    "MACD_", "MACDh_", "MACDs_",     # MACD 三線皆為價格差量綱
-    "HL2", "HLC3", "OHLC4", "STDEV",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "SMA_",
+    "EMA_",
+    "WMA_",
+    "DEMA_",
+    "TEMA_",
+    "HMA_",
+    "VWAP",
+    "BBL_",
+    "BBM_",
+    "BBU_",  # 布林上中下軌 (價格量綱)
+    "ATR_",
+    "ATRr_",
+    "TRUERANGE",
+    "MACD_",
+    "MACDh_",
+    "MACDs_",  # MACD 三線皆為價格差量綱
+    "HL2",
+    "HLC3",
+    "OHLC4",
+    "STDEV",
 )
 
 # 明確不隨價格縮放的欄位 (振盪指標、比例、外部數據)
 _NEVER_PRICE_RELATIVE = (
-    "Volume", "RSI_", "BBB_", "BBP_", "ADX_", "DMP_", "DMN_",
-    "STOCH", "CCI_", "MFI_", "WILLR_", "ROC_", "MOM_",
-    "VIX", "bench_return", "bench_correlation",
+    "Volume",
+    "RSI_",
+    "BBB_",
+    "BBP_",
+    "ADX_",
+    "DMP_",
+    "DMN_",
+    "STOCH",
+    "CCI_",
+    "MFI_",
+    "WILLR_",
+    "ROC_",
+    "MOM_",
+    "VIX",
+    "bench_return",
+    "bench_correlation",
 )
 
 
@@ -52,6 +85,7 @@ class DataPipeline:
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """使用 pandas_ta 快速計算技術指標"""
         import pandas_ta as ta
+
         df_copy = df.copy()
         df_copy.ta.sma(length=10, append=True)
         df_copy.ta.ema(length=20, append=True)
@@ -74,10 +108,12 @@ class DataPipeline:
 
         # 1. 跨資產相關性 (例如 QQQ 大盤表現)
         if benchmark_df is not None and not benchmark_df.empty:
-            bench_ret = np.log(benchmark_df['Close'] / benchmark_df['Close'].shift(1))
-            df_adv['bench_return'] = bench_ret.reindex(df_adv.index).fillna(0)
-            stock_ret = np.log(df_adv['Close'] / df_adv['Close'].shift(1))
-            df_adv['bench_correlation'] = stock_ret.rolling(20).corr(df_adv['bench_return']).fillna(0)
+            bench_ret = np.log(benchmark_df["Close"] / benchmark_df["Close"].shift(1))
+            df_adv["bench_return"] = bench_ret.reindex(df_adv.index).fillna(0)
+            stock_ret = np.log(df_adv["Close"] / df_adv["Close"].shift(1))
+            df_adv["bench_correlation"] = (
+                stock_ret.rolling(20).corr(df_adv["bench_return"]).fillna(0)
+            )
 
         # 2. 宏觀數據 (例如 VIX 恐慌指數)
         if macro_dict:
@@ -146,7 +182,9 @@ class DataPipeline:
             if any(col.startswith(p) for p in _PRICE_RELATIVE_PREFIXES):
                 out.append(col)
                 continue
-            if col in _NEVER_PRICE_RELATIVE or any(col.startswith(p) for p in _NEVER_PRICE_RELATIVE):
+            if col in _NEVER_PRICE_RELATIVE or any(
+                col.startswith(p) for p in _NEVER_PRICE_RELATIVE
+            ):
                 continue
 
             # 未知欄位的保守數值判準
@@ -174,13 +212,15 @@ class DataPipeline:
         price_relative: List[str] = None,
         target_mode: str = "log_return",
         target_scale: float = 100.0,
+        benchmark: str = None,
     ):
         """[訓練階段專用] 保存特徵欄位、其縮放方式與預測目標的定義"""
         manifest = {
             "features": list(features),
             "price_relative": list(price_relative or []),
-            "target_mode": target_mode,     # "log_return" 或 "level"
-            "target_scale": target_scale,   # log_return 乘上的倍率 (100 = 百分比)
+            "target_mode": target_mode,  # "log_return" 或 "level"
+            "target_scale": target_scale,  # log_return 乘上的倍率 (100 = 百分比)
+            "benchmark": (str(benchmark).upper() if benchmark else None),
         }
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
         with open(self._manifest_path(symbol), "w", encoding="utf-8") as f:
@@ -189,7 +229,7 @@ class DataPipeline:
         logger.debug(
             f"[{symbol}] 特徵清單已保存 ({len(features)} 欄，"
             f"其中 {len(manifest['price_relative'])} 欄為價格相對縮放；"
-            f"目標: {target_mode})。"
+            f"目標: {target_mode}；benchmark: {manifest['benchmark'] or '無'})。"
         )
 
     def load_manifest(self, symbol: str) -> Optional[Dict]:
@@ -209,6 +249,7 @@ class DataPipeline:
             manifest.setdefault("price_relative", [])
             manifest.setdefault("target_mode", "level")
             manifest.setdefault("target_scale", 1.0)
+            manifest.setdefault("benchmark", None)
             self._manifests[symbol] = manifest
             return manifest
         except Exception as e:
@@ -220,7 +261,9 @@ class DataPipeline:
         m = self.load_manifest(symbol)
         return m["features"] if m else None
 
-    def align_to_manifest(self, df: pd.DataFrame, symbol: str) -> Tuple[pd.DataFrame, List[str]]:
+    def align_to_manifest(
+        self, df: pd.DataFrame, symbol: str
+    ) -> Tuple[pd.DataFrame, List[str]]:
         """
         把推論用的 DataFrame 對齊到訓練時的特徵清單。
 
@@ -232,10 +275,11 @@ class DataPipeline:
         if features is None:
             return df, [c for c in _BASE_FEATURES if c in df.columns]
 
-
         missing = [c for c in features if c not in df.columns]
         if missing:
-            logger.warning(f"[{symbol}] 推論資料缺少 {len(missing)} 個訓練特徵，已補 0: {missing}")
+            logger.warning(
+                f"[{symbol}] 推論資料缺少 {len(missing)} 個訓練特徵，已補 0: {missing}"
+            )
             df = df.copy()
             for c in missing:
                 df[c] = 0.0
@@ -256,14 +300,16 @@ class DataPipeline:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_scaler(df: pd.DataFrame, columns: List[str]) -> Dict[str, Dict[str, float]]:
+    def _compute_scaler(
+        df: pd.DataFrame, columns: List[str]
+    ) -> Dict[str, Dict[str, float]]:
         """純計算，不產生任何副作用 (不寫檔、不改 self.scalers)"""
         scaler_dict = {}
         for col in columns:
             if col in df.columns:
                 scaler_dict[col] = {
-                    'min': float(df[col].min()),
-                    'max': float(df[col].max()),
+                    "min": float(df[col].min()),
+                    "max": float(df[col].max()),
                 }
         return scaler_dict
 
@@ -286,7 +332,9 @@ class DataPipeline:
         else:
             logger.debug(f"[{symbol}] 特徵縮放參數 (Scaler) 已成適配並儲存。")
 
-    def transform_scale(self, df: pd.DataFrame, columns: List[str], symbol: str) -> pd.DataFrame:
+    def transform_scale(
+        self, df: pd.DataFrame, columns: List[str], symbol: str
+    ) -> pd.DataFrame:
         """
         [回測與實盤專用] 載入訓練階段算好的 Min-Max 參數進行轉換。
 
@@ -313,8 +361,8 @@ class DataPipeline:
             if col not in df.columns or col not in scaler_dict:
                 continue
 
-            min_val = scaler_dict[col]['min']
-            max_val = scaler_dict[col]['max']
+            min_val = scaler_dict[col]["min"]
+            max_val = scaler_dict[col]["max"]
 
             if max_val > min_val:
                 df_scaled[col] = (df_scaled[col] - min_val) / (max_val - min_val)
@@ -323,7 +371,9 @@ class DataPipeline:
 
         return df_scaled
 
-    def inverse_transform_scale(self, value: float, column: str, symbol: str) -> Optional[float]:
+    def inverse_transform_scale(
+        self, value: float, column: str, symbol: str
+    ) -> Optional[float]:
         """
         反向還原縮放值 (供預測價格還原時使用)。
 
@@ -335,14 +385,16 @@ class DataPipeline:
             logger.error(f"[{symbol}] 缺少 {column} 的 scaler，無法還原預測值。")
             return None
 
-        min_val = self.scalers[symbol][column]['min']
-        max_val = self.scalers[symbol][column]['max']
+        min_val = self.scalers[symbol][column]["min"]
+        max_val = self.scalers[symbol][column]["max"]
 
         if max_val > min_val:
             return value * (max_val - min_val) + min_val
         return min_val
 
-    def transform_for_inference(self, df: pd.DataFrame, symbol: str) -> Tuple[pd.DataFrame, List[str]]:
+    def transform_for_inference(
+        self, df: pd.DataFrame, symbol: str
+    ) -> Tuple[pd.DataFrame, List[str]]:
         """
         [實盤/回測專用] 依 manifest 產生模型輸入。
 
@@ -359,7 +411,9 @@ class DataPipeline:
         df, features = self.align_to_manifest(df, symbol)
         price_rel = set(manifest.get("price_relative", []))
 
-        anchor = float(df["Close"].iloc[-1]) if "Close" in df.columns and len(df) else 0.0
+        anchor = (
+            float(df["Close"].iloc[-1]) if "Close" in df.columns and len(df) else 0.0
+        )
         if anchor <= 0:
             logger.error(f"[{symbol}] 錨定價格無效，無法產生模型輸入。")
             return df, features
@@ -373,7 +427,9 @@ class DataPipeline:
 
         return out, features
 
-    def decode_prediction(self, raw: float, current_price: float, symbol: str) -> Optional[float]:
+    def decode_prediction(
+        self, raw: float, current_price: float, symbol: str
+    ) -> Optional[float]:
         """
         把模型原始輸出轉回「預測價格」。
 
@@ -391,7 +447,9 @@ class DataPipeline:
             log_ret = float(raw) / scale
             # 單根 K 線的對數報酬超過 ±0.5 (約 ±65%) 必為模型失效
             if abs(log_ret) > 0.5:
-                logger.warning(f"[{symbol}] 模型輸出的報酬率異常 ({log_ret:.3f})，已剔除。")
+                logger.warning(
+                    f"[{symbol}] 模型輸出的報酬率異常 ({log_ret:.3f})，已剔除。"
+                )
                 return None
             return float(current_price * np.exp(log_ret))
 
@@ -441,7 +499,7 @@ class DataPipeline:
 
         X, y = [], []
         for i in range(len(data) - look_back):
-            window = data[i:(i + look_back)].copy()
+            window = data[i : (i + look_back)].copy()
             anchor = closes[i + look_back - 1]
 
             if price_idx:

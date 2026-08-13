@@ -16,12 +16,13 @@ except ImportError:
     GaussianHMM = None
     print("警告: 尚未安裝 hmmlearn，請執行 `pip install hmmlearn`")
 
+
 class HMMModel:
     """
     隱馬爾可夫模型 (Hidden Markov Model)
     用於偵測市場的隱藏狀態 (如: 0 代表低波盤整，1 代表高波趨勢等)
     """
-    
+
     def __init__(self, n_components: int = 2, weights_dir: str = "weights"):
         """
         初始化 HMM 模型
@@ -39,13 +40,13 @@ class HMMModel:
             raise ImportError("hmmlearn 未安裝，無法載入 HMM 模型。")
 
         file_path = os.path.join(self.weights_dir, f"{symbol}_classical.pkl")
-        
+
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"找不到 {symbol} 的傳統模型整合包: {file_path}")
 
         try:
             bundle = joblib.load(file_path)
-            self.model = bundle.get('hmm')
+            self.model = bundle.get("hmm")
             if self.model:
                 self.is_trained = True
                 print(f"[{symbol}] HMM 模型權重載入成功。")
@@ -60,18 +61,18 @@ class HMMModel:
         這裡實作了最經典的 HMM 雙特徵：對數收益率 (Log Return) 與 波動率 (Volatility)。
         """
         df_features = pd.DataFrame(index=df.index)
-        
+
         # 1. 計算對數收益率 (Log Returns)
-        df_features['log_return'] = np.log(df['Close'] / df['Close'].shift(1)) * 100.0
-        
+        df_features["log_return"] = np.log(df["Close"] / df["Close"].shift(1)) * 100.0
+
         # 2. 計算短期波動率 (例如 5 日標準差)
-        df_features['volatility'] = df_features['log_return'].rolling(window=5).std()
-        
+        df_features["volatility"] = df_features["log_return"].rolling(window=5).std()
+
         # 移除 NaN 值，因為 HMM 無法處理包含 NaN 的數據
         df_features = df_features.dropna()
-        
+
         # hmmlearn 預期輸入形狀為 (n_samples, n_features)
-        return df_features[['log_return', 'volatility']].values
+        return df_features[["log_return", "volatility"]].values
 
     def predict_state(self, df: pd.DataFrame) -> int:
         """
@@ -86,7 +87,7 @@ class HMMModel:
 
         # 提取特徵
         features = self._prepare_features(df)
-        
+
         if len(features) == 0:
             print("警告: 傳入數據長度不足以計算特徵，無法進行 HMM 狀態偵測")
             return -1
@@ -94,11 +95,11 @@ class HMMModel:
         try:
             # 預測這段時間序列所有的隱藏狀態
             hidden_states = self.model.predict(features)
-            
+
             # 我們只需要最新一根 K 線所處的狀態
             current_state = int(hidden_states[-1])
             return current_state
-            
+
         except Exception as e:
             print(f"HMM 狀態預測失敗: {e}")
             return -1

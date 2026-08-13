@@ -7,8 +7,13 @@ import pandas as pd
 import tensorflow as tf
 import keras
 from keras.layers import (
-    Input, Dense, Dropout, LayerNormalization,
-    MultiHeadAttention, Cropping1D, Flatten,
+    Input,
+    Dense,
+    Dropout,
+    LayerNormalization,
+    MultiHeadAttention,
+    Cropping1D,
+    Flatten,
 )
 from keras.models import Model, load_model
 from typing import List, Optional
@@ -78,7 +83,7 @@ class TransformerModel:
         self.look_back = look_back
         # 預設對齊 OHLCV 5 特徵。若訓練時使用了更多特徵，
         # 務必在此傳入同一份清單，否則會 shape mismatch。
-        self.feature_cols = feature_cols or ['Open', 'High', 'Low', 'Close', 'Volume']
+        self.feature_cols = feature_cols or ["Open", "High", "Low", "Close", "Volume"]
         self.features = len(self.feature_cols)
 
         self.d_model = d_model
@@ -132,14 +137,13 @@ class TransformerModel:
         # 使用 Huber Loss 對抗極端值 (黑天鵝防護)
         optimizer = keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0)
         model.compile(optimizer=optimizer, loss=tf.keras.losses.Huber(delta=1.0))
-        
 
         return model
 
     def load_weights(self, symbol: str):
         """載入 .keras 權重檔"""
         file_path = os.path.join(self.weights_dir, f"{symbol}_Transformer.keras")
-        
+
         if os.path.exists(file_path):
             try:
                 # PositionalEmbedding 已透過 register_keras_serializable 註冊，
@@ -151,9 +155,13 @@ class TransformerModel:
             except Exception as e:
                 # 架構變更後，舊的 .keras 會在此失敗 —— 這是預期行為，需重新訓練。
                 print(f"❌ [{symbol}] Transformer 權重載入失敗: {e}")
-                print(f"❌ [{symbol}] 若此檔為舊架構 (無位置編碼) 所存，請重新執行 --mode train。")
+                print(
+                    f"❌ [{symbol}] 若此檔為舊架構 (無位置編碼) 所存，請重新執行 --mode train。"
+                )
 
-        print(f"❌ [{symbol}] 無可用的 Transformer 權重，初始化未訓練模型 (不應用於實盤決策)。")
+        print(
+            f"❌ [{symbol}] 無可用的 Transformer 權重，初始化未訓練模型 (不應用於實盤決策)。"
+        )
         self.model = self._build_model()
         self.is_trained = False
 
@@ -165,30 +173,30 @@ class TransformerModel:
         missing_cols = [col for col in self.feature_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"數據缺失必要特徵欄位: {missing_cols}")
-            
+
         # 嚴格過濾欄位，避免 df 的指標無限膨脹導致 keras shape 報錯
-        data = df[self.feature_cols].iloc[-self.look_back:].values
+        data = df[self.feature_cols].iloc[-self.look_back :].values
         return np.expand_dims(data, axis=0)
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
         """預測下一個時間步的價格 (輸出為縮放值，需由呼叫端還原)"""
         if self.model is None:
-            return float(df['Close'].iloc[-1])
-            
+            return float(df["Close"].iloc[-1])
+
         try:
             X = self._prepare_features(df)
             if len(X) == 0:
-                return float(df['Close'].iloc[-1])
-            
+                return float(df["Close"].iloc[-1])
+
             X_tensor = tf.convert_to_tensor(X, dtype=tf.float32)
             prediction = self.model(X_tensor, training=False)
             return float(prediction[0, 0])
         except Exception as e:
             print(f"Transformer 預測發生異常: {e}")
-            return float(df['Close'].iloc[-1])
+            return float(df["Close"].iloc[-1])
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
         """Fallback：計算歷史波動率"""
-        returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
+        returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
         vol = returns.tail(20).std() * np.sqrt(252) if len(returns) >= 20 else 0.02
         return float(vol)

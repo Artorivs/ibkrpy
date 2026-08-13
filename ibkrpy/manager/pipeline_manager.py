@@ -9,7 +9,7 @@ import joblib
 import numpy as np
 import time
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Dict
 
 from ib_insync import Stock
 
@@ -23,56 +23,181 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "weights")
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
+
 class PipelineManager:
     """整合資料抓取、特徵工程與 AI 模型重訓的管線管理器"""
-    
-    def __init__(self, config: ConfigManager, db: DatabaseManager, pipeline: DataPipeline, ib_data: IBKRDataManager, ext_fetcher: ExternalDataFetcher, target_symbol: str = None):
+
+    def __init__(
+        self,
+        config: ConfigManager,
+        db: DatabaseManager,
+        pipeline: DataPipeline,
+        ib_data: IBKRDataManager,
+        ext_fetcher: ExternalDataFetcher,
+        target_symbol: str = None,
+        benchmark_resolver=None,
+        benchmark_store=None,
+    ):
         self.config = config
         self.db = db
         self.pipeline = pipeline
         self.ib_data = ib_data
         self.ext = ext_fetcher
-        
-        self.benchmark_symbol = self.config.get("general_settings.benchmark_symbol", "SPY")
-        
+
+        self.benchmark_symbol = self.config.get(
+            "general_settings.benchmark_symbol", "SPY"
+        )
+
         # 如果有指定單一標的，則直接覆蓋 self.symbols
         if target_symbol:
             self.symbols = [target_symbol]
         else:
-            self.symbols = [p.symbol for p in self.config.asset_profiles] if self.config.asset_profiles else ["AAPL"]
-            
-        self._reference_only = set()
-        if self.benchmark_symbol not in self.symbols:
-            self.symbols.insert(0, self.benchmark_symbol)
-            self._reference_only.add(self.benchmark_symbol)
-            
+            self.symbols = (
+                [p.symbol for p in self.config.asset_profiles]
+                if self.config.asset_profiles
+                else ["AAPL"]
+            )
+
+        # [DIP] 依賴抽象；未注入時退回「全部標的共用同一檔 benchmark」的舊行為。
+        if benchmark_resolver is None:
+            from ibkrpy.data.benchmark_resolver import StaticBenchmarkResolver
+
+            benchmark_resolver = StaticBenchmarkResolver(self.benchmark_symbol)
+        self.benchmark_resolver = benchmark_resolver
+        self.benchmark_store = benchmark_store
+
+        # 每檔標的的 benchmark。訓練與資料下載都以這張表為準。
+        self._benchmark_for: Dict[str, str] = {}
+        self._tradable = list(self.symbols)
+        self._refresh_benchmark_map()
+
         self.symbol_terms = {}
         param_path = os.path.join(WEIGHTS_DIR, "global_best_params.json")
         if os.path.exists(param_path):
             try:
-                with open(param_path, 'r', encoding='utf-8') as f:
+                with open(param_path, "r", encoding="utf-8") as f:
                     global_params = json.load(f)
                     for sym, params in global_params.items():
                         if "term" in params:
                             self.symbol_terms[sym] = params["term"]
-            except Exception: pass
-            
+            except Exception:
+                pass
+
         for sym in self.symbols:
             if sym not in self.symbol_terms:
                 self.symbol_terms[sym] = "long_term"
 
+    def _refresh_benchmark_map(self):
+        """
+        解析每檔標的的 benchmark，並把所有用到的 benchmark 併進下載清單。
+
+        [修正] 舊版只把單一 general_settings.benchmark_symbol 加進 _reference_only。
+        改成 per-symbol 之後，可能同時用到 SMH / XLF / XLV 等多檔 ETF，
+        每一檔都必須先有歷史資料，否則 engineer_advanced_features 拿到空的
+        benchmark_df，bench_return / bench_correlation 兩欄就整個消失。
+        """
+        self._benchmark_for = {}
+        for symbol in self._tradable:
+            chosen = self.benchmark_resolver.resolve(symbol) or self.benchmark_symbol
+            self._benchmark_for[symbol] = chosen
+
+        needed = sorted(set(self._benchmark_for.values()))
+        self._reference_only = {b for b in needed if b not in self._tradable}
+
+        # benchmark 必須排在前面先下載：相關性法要靠它們的歷史資料才能運作
+        self.symbols = sorted(self._reference_only) + list(self._tradable)
+
+        pairs = ", ".join(f"{s}→{b}" for s, b in list(self._benchmark_for.items())[:8])
+        logger.info(
+            f"📐 benchmark 對應已解析 ({len(set(self._benchmark_for.values()))} 檔不重複): "
+            f"{pairs}{' ...' if len(self._benchmark_for) > 8 else ''}"
+        )
+        if self._reference_only:
+            logger.info(
+                f"	-> 需額外下載的參考標的: {', '.join(sorted(self._reference_only))}"
+            )
+
+    def benchmark_for(self, symbol: str) -> str:
+        return self._benchmark_for.get(symbol, self.benchmark_symbol)
+
+    def _correlation_candidates(self) -> list:
+        """
+        相關性法要比較的候選池。
+
+        [雞生蛋問題] CorrelationBenchmarkResolver 需要候選池的歷史資料才能運作，
+        但候選 ETF 只有在「被選中」之後才會進下載清單 —— 沒資料就選不中，
+        選不中就沒資料。因此候選池必須獨立下載，不能等它被選中。
+        只抓相關性計算用的那一個週期 (預設日 K)，把 API 成本壓到最低。
+        """
+        settings = self.config.get("benchmark_settings") or {}
+        if not settings.get("enable_correlation", True):
+            return []
+        from ibkrpy.data.benchmark_resolver import DEFAULT_CANDIDATE_POOL
+
+        pool = settings.get("candidate_pool") or DEFAULT_CANDIDATE_POOL
+        return [s for s in pool if s not in self._tradable]
+
+    async def _ingest_benchmark_candidates(self):
+        """把相關性候選池的日 K 補齊。已是最新的標的會被 _sync_symbol_term_data 直接跳過。"""
+        candidates = self._correlation_candidates()
+        if not candidates:
+            return
+
+        settings = self.config.get("benchmark_settings") or {}
+        timeframe = settings.get("correlation_timeframe", "1 day")
+        term = next(
+            (
+                t
+                for t in ("long_term", "mid_term", "short_term")
+                if self._get_term_settings(t)["bar_size"] == timeframe
+            ),
+            "long_term",
+        )
+
+        logger.info(
+            f"📐 補齊 benchmark 候選池 ({len(candidates)} 檔，僅 {timeframe})..."
+        )
+        for symbol in candidates:
+            contract = await self.ib_data.qualify(symbol)
+            if contract is None:
+                continue
+            try:
+                await self._sync_symbol_term_data(symbol, term, contract)
+            except Exception as e:
+                logger.warning(f"	⚠️ [{symbol}] 候選池資料同步失敗: {e}")
+
     def _get_term_settings(self, term: str) -> dict:
         """根據交易週期 (term) 返回最適合的 K線級別、總下載天數、與單次分批天數"""
         if term == "short_term":
-            return {"bar_size": self.config.get("general_settings.short_term_bar_size", "5 mins"), "total_days": 60, "chunk_days": 30}
+            return {
+                "bar_size": self.config.get(
+                    "general_settings.short_term_bar_size", "5 mins"
+                ),
+                "total_days": 60,
+                "chunk_days": 30,
+            }
         elif term == "mid_term":
-            return {"bar_size": self.config.get("general_settings.mid_term_bar_size", "1 hour"), "total_days": 180, "chunk_days": 90}
-        else: 
-            return {"bar_size": self.config.get("general_settings.long_term_bar_size", "1 day"), "total_days": 730, "chunk_days": 365}
+            return {
+                "bar_size": self.config.get(
+                    "general_settings.mid_term_bar_size", "1 hour"
+                ),
+                "total_days": 180,
+                "chunk_days": 90,
+            }
+        else:
+            return {
+                "bar_size": self.config.get(
+                    "general_settings.long_term_bar_size", "1 day"
+                ),
+                "total_days": 730,
+                "chunk_days": 365,
+            }
 
     async def _sync_symbol_term_data(self, symbol: str, term: str, contract: Stock):
         """核心資料抓取模組，支援動態按需調用"""
@@ -80,35 +205,35 @@ class PipelineManager:
         bar_size = settings["bar_size"]
         total_days = settings["total_days"]
         chunk_days = settings["chunk_days"]
-        
+
         logger.debug(f"	-> 🔄 正在同步 {term} ({bar_size}) 資料...")
         df_existing = self.db.get_market_data_sync(symbol, timeframe=bar_size)
         days_to_fetch = 0
-        
+
         if df_existing.empty or len(df_existing) < 50:
             days_to_fetch = total_days
         else:
             last_date = pd.Timestamp(df_existing.index[-1])
             if last_date.tz is None:
-                last_date = last_date.tz_localize('UTC')
-            last_date_ny = last_date.tz_convert('America/New_York')
-            now_ny = pd.Timestamp.now(tz='America/New_York')
-            
+                last_date = last_date.tz_localize("UTC")
+            last_date_ny = last_date.tz_convert("America/New_York")
+            now_ny = pd.Timestamp.now(tz="America/New_York")
+
             bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
-            
+
             if bus_days_diff <= 0:
                 logger.debug(f"	✅ 資料已是最新狀態，無須同步。")
                 return
-                
+
             days_to_fetch = min(bus_days_diff + 1, total_days)
 
         df_new_list = []
         remaining_days = days_to_fetch
         current_end_date = datetime.now()
-        
+
         while remaining_days > 0:
             fetch_days = min(remaining_days, chunk_days)
-            
+
             # 針對大跨度轉換為 Y (年) 或 M (月) 的格式，提升 IBKR 接受度
             if fetch_days >= 365:
                 duration_str = f"{fetch_days // 365} Y"
@@ -116,26 +241,35 @@ class PipelineManager:
                 duration_str = f"{fetch_days // 30} M"
             else:
                 duration_str = f"{fetch_days} D"
-                
-            end_date_str = current_end_date.strftime('%Y%m%d %H:%M:%S')
-            
+
+            end_date_str = current_end_date.strftime("%Y%m%d %H:%M:%S")
+
+            # [修正] 舊版的重試迴圈是 pacing violation 的直接來源：
+            # IBKR 明文規定「15 秒內不得送出完全相同的歷史請求」，而舊版是
+            # 每 5 秒重送一次同樣的請求、連送 3 次。第 2、3 次必定違規，
+            # 而違規本身又是以 Error 162 回報 —— 於是重試把小失敗放大成連鎖失敗。
+            #
+            # 現在：重試間隔拉到 20 秒 (跨過 15 秒窗)，且只在「非合約性錯誤」時重試。
+            # 合約解析不了的標的，重試一萬次也不會成功。
             df_chunk = await self.ib_data.fetch_historical_data(
                 contract=contract,
                 end_datetime=end_date_str,
                 duration=duration_str,
                 bar_size=bar_size,
-                what_to_show='TRADES'
+                what_to_show="TRADES",
             )
 
             if df_chunk.empty:
-                logger.warning(f"	-> [{symbol}] {duration_str}/{bar_size} 首次請求無資料，20 秒後重試一次...")
+                logger.warning(
+                    f"	-> [{symbol}] {duration_str}/{bar_size} 首次請求無資料，20 秒後重試一次..."
+                )
                 await asyncio.sleep(20)
                 df_chunk = await self.ib_data.fetch_historical_data(
                     contract=contract,
                     end_datetime=end_date_str,
                     duration=duration_str,
                     bar_size=bar_size,
-                    what_to_show='TRADES',
+                    what_to_show="TRADES",
                     allow_cache=False,
                 )
 
@@ -143,59 +277,84 @@ class PipelineManager:
                 df_chunk.index = pd.to_datetime(df_chunk.index, utc=True)
                 df_new_list.append(df_chunk)
                 first_dt = df_chunk.index[0]
-                if isinstance(first_dt, str): first_dt = pd.to_datetime(first_dt, utc=True)
+                if isinstance(first_dt, str):
+                    first_dt = pd.to_datetime(first_dt, utc=True)
                 current_end_date = first_dt
             else:
                 break
-                
+
             remaining_days -= fetch_days
             await asyncio.sleep(1)
-        
+
         if df_new_list:
             df_new = pd.concat(df_new_list)
             df_new.index = pd.to_datetime(df_new.index, utc=True)
             df_new.sort_index(inplace=True)
-            df_new = df_new[~df_new.index.duplicated(keep='last')]
-            df_new.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
+            df_new = df_new[~df_new.index.duplicated(keep="last")]
+            df_new.rename(
+                columns={
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                },
+                inplace=True,
+            )
+            cols_to_keep = ["Open", "High", "Low", "Close", "Volume"]
             df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
             if not df_existing.empty:
+                # [修正] save_bulk_market_data 用的是 INSERT OR REPLACE，
                 df_combined = df_new
                 df_combined.sort_index(inplace=True)
                 self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
             else:
                 self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
-                
+
             logger.info(f"	✅ [{symbol}] 併入 {len(df_new)} 筆 {bar_size} K線。")
         else:
             if days_to_fetch > 0:
                 logger.error(f"❌ [{symbol}] 該週期所有分批資料獲取皆失敗。")
 
-    def _train_dl_models(self, symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, macro_data: dict):
+    def _train_dl_models(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        bench_df: pd.DataFrame,
+        macro_data: dict,
+        benchmark_symbol: str = None,
+    ):
         """訓練深度學習模型（LSTM、Transformer）並儲存 .keras"""
         logger.info(f"🔍 [{symbol}] 開始訓練深度學習模型...")
         logger.info(f"[{symbol}] 資料量: {len(df)} 筆，特徵數量: {df.shape[1]} 欄")
         if df.empty or len(df) < 60:
-            logger.warning(f"⚠️ [{symbol}] 資料量極度不足 (僅 {len(df)} 筆)，跳過 DL 訓練。")
+            logger.warning(
+                f"⚠️ [{symbol}] 資料量極度不足 (僅 {len(df)} 筆)，跳過 DL 訓練。"
+            )
             return
 
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
-        
+
         df_adv = self.pipeline.engineer_advanced_features(df, bench_df, macro_data)
         df_adv = df_adv.ffill().bfill().fillna(0)
-        
+
         scale_cols = self.pipeline.select_model_features(df_adv)
         price_rel = self.pipeline.classify_price_relative(df_adv, scale_cols)
         minmax_cols = [c for c in scale_cols if c not in price_rel]
 
         self.pipeline.save_feature_manifest(
-            symbol, scale_cols, price_relative=price_rel,
-            target_mode="log_return", target_scale=100.0,
+            symbol,
+            scale_cols,
+            price_relative=price_rel,
+            target_mode="log_return",
+            target_scale=100.0,
+            benchmark=benchmark_symbol or self.benchmark_for(symbol),
         )
         logger.info(
             f"	=> 特徵欄位: {len(scale_cols)} 個 "
-            f"(價格相對 {len(price_rel)} / Min-Max {len(minmax_cols)})，目標: 對數報酬率")
+            f"(價格相對 {len(price_rel)} / Min-Max {len(minmax_cols)})，目標: 對數報酬率"
+        )
 
         split = int(len(df_adv) * 0.8)
         df_train = df_adv.iloc[:split]
@@ -205,16 +364,21 @@ class PipelineManager:
 
         look_back = 60
         X, y = self.pipeline.create_sequences(
-            df_scaled, scale_cols, look_back,
-            raw_close=df_adv['Close'],
+            df_scaled,
+            scale_cols,
+            look_back,
+            raw_close=df_adv["Close"],
             price_relative=price_rel,
-            target_mode="log_return", target_scale=100.0,
+            target_mode="log_return",
+            target_scale=100.0,
         )
-        
+
         logger.info(f"	=> 總 K 線數: {len(df_adv)} 筆，產出有效訓練序列: {len(X)} 組")
-        
+
         if len(X) < 16:
-            logger.warning(f"⚠️ [{symbol}] 有效序列數量不足以支撐梯度下降 (僅 {len(X)} 組)，跳過 DL 訓練。")
+            logger.warning(
+                f"⚠️ [{symbol}] 有效序列數量不足以支撐梯度下降 (僅 {len(X)} 組)，跳過 DL 訓練。"
+            )
             return
 
         dynamic_batch_size = min(32, max(8, len(X) // 4))
@@ -224,36 +388,48 @@ class PipelineManager:
             from ibkrpy.models.lstm import LSTMModel
             from ibkrpy.models.transformer import TransformerModel
 
-            callbacks = [EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)]
+            callbacks = [
+                EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+            ]
             fit_kwargs = dict(
-                epochs=25, batch_size=dynamic_batch_size, verbose=0,
-                callbacks=callbacks, validation_split=0.2, shuffle=False,  # 時序資料不可打亂
+                epochs=25,
+                batch_size=dynamic_batch_size,
+                verbose=0,
+                callbacks=callbacks,
+                validation_split=0.2,
+                shuffle=False,  # 時序資料不可打亂
             )
 
             logger.info(f"	-> 🚀 擬合 LSTM 模型 (Batch Size: {dynamic_batch_size})...")
-            lstm = LSTMModel(look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR)
+            lstm = LSTMModel(
+                look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR
+            )
             lstm.model = lstm._build_model()
             lstm.model.fit(X, y, **fit_kwargs)
             lstm_path = os.path.join(WEIGHTS_DIR, f"{symbol}_LSTM.keras")
             lstm.model.save(lstm_path)
-            
+
             if os.path.exists(lstm_path):
                 logger.info(f"	✅ [成功] LSTM 權重已實體寫入: {lstm_path}")
             else:
                 logger.error(f"	❌ [失敗] LSTM 寫入異常！")
 
-            logger.info(f"	-> 🚀 擬合 Transformer 模型 (Batch Size: {dynamic_batch_size})...")
-            transformer = TransformerModel(look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR)
+            logger.info(
+                f"	-> 🚀 擬合 Transformer 模型 (Batch Size: {dynamic_batch_size})..."
+            )
+            transformer = TransformerModel(
+                look_back=look_back, feature_cols=scale_cols, weights_dir=WEIGHTS_DIR
+            )
             transformer.model = transformer._build_model()
             transformer.model.fit(X, y, **fit_kwargs)
             tf_path = os.path.join(WEIGHTS_DIR, f"{symbol}_Transformer.keras")
             transformer.model.save(tf_path)
-            
+
             if os.path.exists(tf_path):
                 logger.info(f"	✅ [成功] Transformer 權重已實體寫入: {tf_path}")
             else:
                 logger.error(f"	❌ [失敗] Transformer 寫入異常！")
-            
+
             logger.info(f"✅ [{symbol}] 深度學習模型訓練完畢。\n")
         except ImportError:
             logger.warning(f"⚠️ 尚未安裝 TensorFlow/Keras，跳過深度學習訓練。")
@@ -266,7 +442,10 @@ class PipelineManager:
         if df.empty or len(df) < 50:
             logger.warning(f"⚠️ [{symbol}] 資料量不足以進行有效訓練，跳過統計模型。")
             return
-        
+
+        # [修正] 舊版此處用 os.path.abspath("weights") —— 相對於 cwd，
+        # 而 _train_dl_models 與 main.py 用的是專案根目錄的 WEIGHTS_DIR。
+        # cwd 不是專案根目錄時，訓練成果永遠載入不到。
         weights_dir = WEIGHTS_DIR
         os.makedirs(weights_dir, exist_ok=True)
 
@@ -275,10 +454,11 @@ class PipelineManager:
         logger.info(f"	-> 擬合 ARIMA 模型...")
         try:
             from statsmodels.tsa.arima.model import ARIMA
-            series = df['Close'].dropna().values
+
+            series = df["Close"].dropna().values
             model_arima = ARIMA(series, order=(5, 1, 0))
             res_arima = model_arima.fit()
-            classical_bundle['arima'] = res_arima
+            classical_bundle["arima"] = res_arima
             logger.info(f"	✅ ARIMA 模型訓練完成")
         except Exception as e:
             logger.warning(f"	⚠️ ARIMA 訓練失敗: {e}")
@@ -286,11 +466,12 @@ class PipelineManager:
         logger.info(f"	-> 擬合 GARCH 模型...")
         try:
             from arch import arch_model
-            returns = np.log(df['Close'] / df['Close'].shift(1)).dropna() * 100.0
+
+            returns = np.log(df["Close"] / df["Close"].shift(1)).dropna() * 100.0
             if len(returns) > 20:
-                am = arch_model(returns, vol='Garch', p=1, q=1, dist='normal')
-                res_garch = am.fit(disp='off')
-                classical_bundle['garch'] = res_garch.params
+                am = arch_model(returns, vol="Garch", p=1, q=1, dist="normal")
+                res_garch = am.fit(disp="off")
+                classical_bundle["garch"] = res_garch.params
                 logger.info(f"	✅ GARCH 模型訓練完成")
         except Exception as e:
             logger.warning(f"	⚠️ GARCH 訓練失敗: {e}")
@@ -303,7 +484,7 @@ class PipelineManager:
 
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
-        
+
         if os.path.exists(bundle_path):
             logger.info(f"	✅ [{symbol}] 統計模型整合包 (Classical Bundle) 寫入完成。")
 
@@ -325,12 +506,16 @@ class PipelineManager:
         out = pd.Series("SIDEWAYS_QUIET", index=df.index, dtype=object)
 
         try:
-            adx = ta.adx(df['High'], df['Low'], df['Close'], length=d.adx_period)
-            adx_val = adx.iloc[:, 0] if adx is not None and not adx.empty else pd.Series(0.0, index=df.index)
-            sma_s = ta.sma(df['Close'], length=d.ma_short)
-            sma_l = ta.sma(df['Close'], length=d.ma_long)
-            atr = ta.atr(df['High'], df['Low'], df['Close'], length=d.atr_period)
-            atr_pct = (atr / df['Close']).fillna(0.0)
+            adx = ta.adx(df["High"], df["Low"], df["Close"], length=d.adx_period)
+            adx_val = (
+                adx.iloc[:, 0]
+                if adx is not None and not adx.empty
+                else pd.Series(0.0, index=df.index)
+            )
+            sma_s = ta.sma(df["Close"], length=d.ma_short)
+            sma_l = ta.sma(df["Close"], length=d.ma_long)
+            atr = ta.atr(df["High"], df["Low"], df["Close"], length=d.atr_period)
+            atr_pct = (atr / df["Close"]).fillna(0.0)
 
             trending = adx_val.fillna(0.0) > d.adx_threshold
             volatile = atr_pct > d.vol_threshold
@@ -345,7 +530,9 @@ class PipelineManager:
 
         return out
 
-    def _walk_forward_predictions(self, symbol: str, df: pd.DataFrame, term: str) -> pd.DataFrame:
+    def _walk_forward_predictions(
+        self, symbol: str, df: pd.DataFrame, term: str
+    ) -> pd.DataFrame:
         """
         在 out-of-sample 區段產生「真實的」模型預測。
 
@@ -369,20 +556,21 @@ class PipelineManager:
             return pd.DataFrame()
 
         oos = df.iloc[split:].copy()
-        close = df['Close'].astype(float).values
+        close = df["Close"].astype(float).values
 
         preds = np.full(len(oos), np.nan)
 
         if "ARIMA" in wf_models:
             try:
                 from statsmodels.tsa.arima.model import ARIMA
+
                 # 只在 in-sample 擬合一次，取得參數
                 base = ARIMA(close[:split], order=(5, 1, 0)).fit()
 
                 for k in range(len(oos)):
-                    t = split + k                      # 要預測 close[t]
+                    t = split + k  # 要預測 close[t]
                     lo = max(0, t - max_hist)
-                    hist = close[lo:t]                 # 只用 t 之前的資料，無前視
+                    hist = close[lo:t]  # 只用 t 之前的資料，無前視
                     if len(hist) < 20:
                         continue
                     try:
@@ -397,29 +585,38 @@ class PipelineManager:
         if dl_wanted:
             dl_preds = self._walk_forward_dl(symbol, df, split, dl_wanted)
             if dl_preds is not None:
-                stacked = [p for p in ([preds] if "ARIMA" in wf_models else []) + [dl_preds]]
+                stacked = [
+                    p for p in ([preds] if "ARIMA" in wf_models else []) + [dl_preds]
+                ]
                 preds = np.nanmean(np.vstack(stacked), axis=0)
 
-        oos['prediction'] = preds
-        oos = oos[np.isfinite(oos['prediction'])]
+        oos["prediction"] = preds
+        oos = oos[np.isfinite(oos["prediction"])]
         if oos.empty:
             logger.warning(f"	⚠️ {term} 未能產生任何有效的 OOS 預測。")
             return pd.DataFrame()
 
-        log_ret = np.log(df['Close'] / df['Close'].shift(1))
-        bar_vol = log_ret.rolling(20).std().reindex(oos.index).fillna(0.005).replace(0, 0.005)
-        oos['volatility'] = bar_vol
+        log_ret = np.log(df["Close"] / df["Close"].shift(1))
+        bar_vol = (
+            log_ret.rolling(20).std().reindex(oos.index).fillna(0.005).replace(0, 0.005)
+        )
+        oos["volatility"] = bar_vol
 
-        oos['regime'] = self._vectorised_regimes(df).reindex(oos.index).fillna("SIDEWAYS_QUIET")
+        oos["regime"] = (
+            self._vectorised_regimes(df).reindex(oos.index).fillna("SIDEWAYS_QUIET")
+        )
 
-        edge = (oos['prediction'] / oos['Close'] - 1).abs()
+        edge = (oos["prediction"] / oos["Close"] - 1).abs()
         logger.info(
             f"	=> OOS 樣本 {len(oos)} 根 (總計 {n})，尋優模型 {wf_models}；"
-            f"預測邊際中位數 {edge.median()*100:.3f}%，每根波動中位數 {bar_vol.median()*100:.3f}%")
+            f"預測邊際中位數 {edge.median()*100:.3f}%，每根波動中位數 {bar_vol.median()*100:.3f}%"
+        )
 
         return oos
 
-    def _walk_forward_dl(self, symbol: str, df: pd.DataFrame, split: int, model_types: list):
+    def _walk_forward_dl(
+        self, symbol: str, df: pd.DataFrame, split: int, model_types: list
+    ):
         """在 in-sample 訓練神經網路，對 OOS 逐窗推論 (成本高，非預設路徑)"""
         try:
             from keras.callbacks import EarlyStopping
@@ -430,7 +627,9 @@ class PipelineManager:
             return None
 
         try:
-            df_adv = self.pipeline.engineer_advanced_features(df).ffill().bfill().fillna(0)
+            df_adv = (
+                self.pipeline.engineer_advanced_features(df).ffill().bfill().fillna(0)
+            )
             feats = self.pipeline.select_model_features(df_adv)
             price_rel = self.pipeline.classify_price_relative(df_adv, feats)
             minmax = [c for c in feats if c not in price_rel]
@@ -442,8 +641,13 @@ class PipelineManager:
 
             look_back = 60
             X, y = self.pipeline.create_sequences(
-                df_s, feats, look_back, raw_close=df_adv['Close'],
-                price_relative=price_rel, target_mode="log_return", target_scale=100.0,
+                df_s,
+                feats,
+                look_back,
+                raw_close=df_adv["Close"],
+                price_relative=price_rel,
+                target_mode="log_return",
+                target_scale=100.0,
             )
             if len(X) < 100:
                 return None
@@ -452,16 +656,28 @@ class PipelineManager:
             seq_pos = np.arange(len(X)) + look_back
             in_mask = seq_pos < adv_split
 
-            cb = [EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)]
+            cb = [
+                EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+            ]
             outputs = []
             for mt in model_types:
                 cls = LSTMModel if mt == "LSTM" else TransformerModel
-                m = cls(look_back=look_back, feature_cols=feats, weights_dir=WEIGHTS_DIR)
+                m = cls(
+                    look_back=look_back, feature_cols=feats, weights_dir=WEIGHTS_DIR
+                )
                 m.model = m._build_model()
-                m.model.fit(X[in_mask], y[in_mask], epochs=12, batch_size=32,
-                            verbose=0, validation_split=0.2, shuffle=False, callbacks=cb)
+                m.model.fit(
+                    X[in_mask],
+                    y[in_mask],
+                    epochs=12,
+                    batch_size=32,
+                    verbose=0,
+                    validation_split=0.2,
+                    shuffle=False,
+                    callbacks=cb,
+                )
                 raw = m.model.predict(X[~in_mask], verbose=0).reshape(-1)
-                anchors = df_adv['Close'].values[seq_pos[~in_mask] - 1]
+                anchors = df_adv["Close"].values[seq_pos[~in_mask] - 1]
                 outputs.append(anchors * np.exp(raw / 100.0))
 
             oos_idx = df_adv.index[seq_pos[~in_mask]]
@@ -473,7 +689,14 @@ class PipelineManager:
         finally:
             self.pipeline.invalidate(f"__wf_{symbol}")
 
-    def _run_optuna_optimization(self, symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, macro_data: dict, term: str) -> Tuple[dict, float]:
+    def _run_optuna_optimization(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        bench_df: pd.DataFrame,
+        macro_data: dict,
+        term: str,
+    ) -> Tuple[dict, float]:
         """在真實的 out-of-sample 預測上做參數尋優，並回傳 (最佳參數, 複合評分)"""
         default_params = {
             "min_prediction_threshold_pct": 0.005,
@@ -498,9 +721,21 @@ class PipelineManager:
     async def run_data_ingestion(self):
         """階段一：日常增量下載資料並寫入資料庫 (按需下載模式)"""
         logger.info("[Pipeline] 啟動資料增量下載與資料庫同步 (Daily Sync)")
-        
+
         all_terms = ["long_term", "mid_term", "short_term"]
-        
+
+        # 1. 先補齊相關性候選池的日 K，讓 benchmark 解析有資料可用
+        await self._ingest_benchmark_candidates()
+
+        # 2. 候選池就緒後重新解析一次，相關性法此時才真正生效
+        if hasattr(self.benchmark_resolver, "invalidate"):
+            self.benchmark_resolver.invalidate()
+            self._refresh_benchmark_map()
+
+        # [修正] 舊版在此原地複製了 _sync_symbol_term_data 的 90 行邏輯，
+        # 兩份程式碼已經開始分歧 (舊版這裡的 duration 一律用 "N D"，
+        # 沒有像 _sync_symbol_term_data 那樣轉成 Y/M 格式)，屬於明確的技術債。
+        # 現在統一走同一條路徑。
         skipped = []
         for symbol in self.symbols:
             logger.debug(f"[{symbol}] 檢核並同步最新市場資料...")
@@ -536,45 +771,59 @@ class PipelineManager:
     async def run_training_and_tuning(self):
         """階段二：多週期選拔 (Tournament-based Selection)，淘汰弱勢週期，適應並訓練最佳模型"""
         logger.info("[Pipeline] 啟動多週期選拔 (Term Tournament) 與 AI 訓練")
-        
+
+        # 冷啟動時 __init__ 解析 benchmark 的當下資料庫還是空的，相關性法只能棄權。
+        # 資料下載完之後在這裡重新解析一次，讓它有機會真正發揮作用。
+        if hasattr(self.benchmark_resolver, "invalidate"):
+            self.benchmark_resolver.invalidate()
+            self._refresh_benchmark_map()
+
         all_terms = ["long_term", "mid_term", "short_term"]
         os.makedirs(DATA_DIR, exist_ok=True)
-        
+
         # 1. 永久儲存 FRED 數據至 data/
         global_vix_series = None
         fred_cache_path = os.path.join(DATA_DIR, "fred_vix_cache.csv")
         need_fetch_fred = True
-        
+
         if os.path.exists(fred_cache_path):
             mod_time = os.path.getmtime(fred_cache_path)
             if (time.time() - mod_time) < 43200:
                 try:
-                    global_vix_series = pd.read_csv(fred_cache_path, index_col=0, parse_dates=True).squeeze("columns")
+                    global_vix_series = pd.read_csv(
+                        fred_cache_path, index_col=0, parse_dates=True
+                    ).squeeze("columns")
                     need_fetch_fred = False
                     logger.debug("   -> 🌍 從本地 data/ 讀取 FRED VIX 歷史快取...")
-                except Exception: pass
-                
+                except Exception:
+                    pass
+
         if need_fetch_fred and self.ext:
             logger.debug("   -> 🌍 正在向 FRED 請求最新全局宏觀數據 (VIXCLS)...")
             try:
                 global_vix_series = await self.ext.fetch_fred_series("VIXCLS")
                 if global_vix_series is not None and not global_vix_series.empty:
                     global_vix_series.to_csv(fred_cache_path)
-                    logger.info(f"	✅ FRED VIX 數據獲取成功，已儲存至 {fred_cache_path}。")
+                    logger.info(
+                        f"	✅ FRED VIX 數據獲取成功，已儲存至 {fred_cache_path}。"
+                    )
             except Exception as e:
                 logger.warning(f"	⚠️ FRED API 請求失敗: {e}")
                 if os.path.exists(fred_cache_path):
-                    global_vix_series = pd.read_csv(fred_cache_path, index_col=0, parse_dates=True).squeeze("columns")
+                    global_vix_series = pd.read_csv(
+                        fred_cache_path, index_col=0, parse_dates=True
+                    ).squeeze("columns")
 
         # 2. 讀取 FMP 基本面本地快取
         fmp_cache_path = os.path.join(WEIGHTS_DIR, "fmp_cache.json")
         fmp_cache = {}
         if os.path.exists(fmp_cache_path):
             try:
-                with open(fmp_cache_path, 'r', encoding='utf-8') as f:
+                with open(fmp_cache_path, "r", encoding="utf-8") as f:
                     fmp_cache = json.load(f)
-            except Exception: pass
-        
+            except Exception:
+                pass
+
         trained_any = False
         for symbol in self.symbols:
             if symbol in getattr(self, "_reference_only", set()):
@@ -586,7 +835,7 @@ class PipelineManager:
 
             trained_any = True
             logger.info(f"🔥 啟動週期選拔與訓練任務: {symbol} 🔥")
-            
+
             fmp_data = {}
             if self.ext and self.ext.fmp_api_key:
                 if symbol in fmp_cache:
@@ -600,33 +849,45 @@ class PipelineManager:
                             fmp_data = fmp_profile
                             fmp_cache[symbol] = fmp_data
                             os.makedirs(WEIGHTS_DIR, exist_ok=True)
-                            with open(fmp_cache_path, 'w', encoding='utf-8') as f:
+                            with open(fmp_cache_path, "w", encoding="utf-8") as f:
                                 json.dump(fmp_cache, f, indent=4)
                     except Exception as e:
                         logger.warning(f"	=> ⚠️ FMP API 請求發生例外錯誤: {e}")
-            
+
             best_term = None
-            best_score = -float('inf')
+            best_score = -float("inf")
             best_params = {}
             best_df = pd.DataFrame()
             best_macro = {}
-            
+
             for term in all_terms:
                 settings = self._get_term_settings(term)
                 bar_size = settings["bar_size"]
 
                 df = self.db.get_market_data_sync(symbol, timeframe=bar_size)
-                
-                last_date = pd.Timestamp(df.index[-1]).normalize() if not df.empty else None
+
+                last_date = (
+                    pd.Timestamp(df.index[-1]).normalize() if not df.empty else None
+                )
                 now_date = pd.Timestamp.now().normalize()
-                stale_days = np.busday_count(last_date.date(), now_date.date()) if last_date else 999
+                stale_days = (
+                    np.busday_count(last_date.date(), now_date.date())
+                    if last_date
+                    else 999
+                )
 
                 if df.empty or len(df) < 100 or stale_days > 5:
-                    logger.info(f"	-> 🔍 為了評估 {term}，發現資料空缺或過期，啟動即時下載...")
+                    logger.info(
+                        f"	-> 🔍 為了評估 {term}，發現資料空缺或過期，啟動即時下載..."
+                    )
                     try:
+                        # [修正] 使用會檢查回傳值的 qualify()，避免帶著 conId=0 的
+                        # 空殼合約去請求歷史資料 (Error 162 的來源之一)
                         contract = await self.ib_data.qualify(symbol)
                         if contract is None:
-                            logger.error(f"	-> ❌ [{symbol}] 合約無法解析，跳過 {term} 評估。")
+                            logger.error(
+                                f"	-> ❌ [{symbol}] 合約無法解析，跳過 {term} 評估。"
+                            )
                             continue
                         await self._sync_symbol_term_data(symbol, term, contract)
                         df = self.db.get_market_data_sync(symbol, timeframe=bar_size)
@@ -636,28 +897,44 @@ class PipelineManager:
                 if df.empty or len(df) < 100:
                     logger.warning(f"	-> ⚠️ {term} 資料仍不足，跳過該週期評估。")
                     continue
-                
-                bench_df = self.db.get_market_data_sync(self.benchmark_symbol, timeframe=bar_size)
+
+                bench_df = self.db.get_market_data_sync(
+                    self.benchmark_for(symbol), timeframe=bar_size
+                )
                 if not bench_df.empty:
-                    bench_df = bench_df.reindex(df.index, method='ffill').bfill()
-                
+                    bench_df = bench_df.reindex(df.index, method="ffill").bfill()
+                else:
+                    logger.warning(
+                        f"	-> ⚠️ benchmark {self.benchmark_for(symbol)} 在 {bar_size} 上沒有資料，"
+                        f"bench_return / bench_correlation 兩個特徵本輪將缺席。"
+                    )
+
                 macro_data = {}
                 if global_vix_series is not None and not global_vix_series.empty:
-                    if getattr(global_vix_series.index, 'tz', None) is not None:
+                    if getattr(global_vix_series.index, "tz", None) is not None:
                         global_vix_series.index = global_vix_series.index
                     vix_daily = global_vix_series.copy()
                     vix_daily.index = vix_daily.index.normalize()
-                    
-                    df_idx_naive = df.index if getattr(df.index, 'tz', None) is not None else df.index
+
+                    df_idx_naive = (
+                        df.index
+                        if getattr(df.index, "tz", None) is not None
+                        else df.index
+                    )
                     vix_aligned_values = df_idx_naive.normalize().map(vix_daily)
-                    vix_aligned = pd.Series(vix_aligned_values, index=df.index).ffill().bfill()
-                    if vix_aligned.isna().all(): vix_aligned = pd.Series(20.0, index=df.index)
-                    macro_data['VIX'] = vix_aligned
+                    vix_aligned = (
+                        pd.Series(vix_aligned_values, index=df.index).ffill().bfill()
+                    )
+                    if vix_aligned.isna().all():
+                        vix_aligned = pd.Series(20.0, index=df.index)
+                    macro_data["VIX"] = vix_aligned
 
                 logger.info(f"	-> ⏳ 正在評估 {term} 策略潛力...")
-                params, score = self._run_optuna_optimization(symbol, df, bench_df, macro_data, term)
+                params, score = self._run_optuna_optimization(
+                    symbol, df, bench_df, macro_data, term
+                )
                 logger.info(f"	=> {term} 複合評分預期: {score:.2f}")
-                
+
                 if score > best_score:
                     best_score = score
                     best_term = term
@@ -665,7 +942,9 @@ class PipelineManager:
                     best_df = df
                     best_macro = macro_data
 
-            MIN_VIABLE_SCORE = self.config.get("tuning_settings.min_viable_score", -900.0)
+            MIN_VIABLE_SCORE = self.config.get(
+                "tuning_settings.min_viable_score", -900.0
+            )
 
             if best_term is None or best_score <= MIN_VIABLE_SCORE:
                 logger.error(
@@ -674,22 +953,40 @@ class PipelineManager:
                 )
                 continue
 
-            logger.info(f"🎉 [{symbol}] 選拔結束！冠軍週期為: {best_term} (得分: {best_score:.2f})")
-            
-            best_params['term'] = best_term
+            logger.info(
+                f"🎉 [{symbol}] 選拔結束！冠軍週期為: {best_term} (得分: {best_score:.2f})"
+            )
+
+            best_params["term"] = best_term
             if fmp_data:
-                best_params['fmp_sector'] = fmp_data.get('sector')
-                best_params['fmp_industry'] = fmp_data.get('industry')
-                best_params['fmp_beta'] = fmp_data.get('beta')
-                best_params['fmp_mktCap'] = fmp_data.get('mktCap')
-            
-            bench_df = self.db.get_market_data_sync(self.benchmark_symbol, timeframe=self._get_term_settings(best_term)["bar_size"])
+                best_params["fmp_sector"] = fmp_data.get("sector")
+                best_params["fmp_industry"] = fmp_data.get("industry")
+                best_params["fmp_beta"] = fmp_data.get("beta")
+                best_params["fmp_mktCap"] = fmp_data.get("mktCap")
+
+            chosen_benchmark = self.benchmark_for(symbol)
+            best_params["benchmark"] = chosen_benchmark
+
+            bench_df = self.db.get_market_data_sync(
+                chosen_benchmark,
+                timeframe=self._get_term_settings(best_term)["bar_size"],
+            )
             if not bench_df.empty:
-                bench_df = bench_df.reindex(best_df.index, method='ffill').bfill()
-            
-            self._train_dl_models(symbol, best_df, bench_df, best_macro)
+                bench_df = bench_df.reindex(best_df.index, method="ffill").bfill()
+
+            logger.info(f"	-> 📐 本次訓練使用的對照基準: {chosen_benchmark}")
+            self._train_dl_models(
+                symbol, best_df, bench_df, best_macro, benchmark_symbol=chosen_benchmark
+            )
             self._train_safe_models(symbol, best_df)
-            
+
+            # 把決定寫進對應表，讓實盤端能沿用完全相同的 benchmark
+            if self.benchmark_store is not None:
+                try:
+                    self.benchmark_store.set(symbol, chosen_benchmark)
+                except Exception as e:
+                    logger.warning(f"	⚠️ benchmark 對應表寫入失敗: {e}")
+
             weights_dir = WEIGHTS_DIR
             os.makedirs(weights_dir, exist_ok=True)
 
@@ -697,15 +994,16 @@ class PipelineManager:
             global_params = {}
             if os.path.exists(param_path):
                 try:
-                    with open(param_path, 'r', encoding='utf-8') as f:
+                    with open(param_path, "r", encoding="utf-8") as f:
                         global_params = json.load(f)
-                except Exception: pass
-                
+                except Exception:
+                    pass
+
             global_params[symbol] = best_params
-            
-            with open(param_path, 'w', encoding='utf-8') as f:
+
+            with open(param_path, "w", encoding="utf-8") as f:
                 json.dump(global_params, f, indent=4)
-                
+
             logger.info(f"	✅ 最佳策略參數已更新至全域檔案: {param_path}")
             self.symbol_terms[symbol] = best_term
             logger.info(f"🏆 {symbol} ({best_term}) 模型訓練與參數尋優徹底完成。")

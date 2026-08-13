@@ -8,8 +8,11 @@ import pandas as pd
 from typing import Dict, Any, Optional
 from .system_log import global_logger
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, "data", "trading_data.db")
+
 
 class DatabaseManager:
     """輕量化 SQLite 非同步/同步雙軌管理器 (具備 WAL 併發防護與 Upsert 增量寫入)"""
@@ -18,7 +21,7 @@ class DatabaseManager:
         # 統一將資料庫路徑綁定在專案目錄下
         self.db_path = db_path or DEFAULT_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        
+
         self.logger = global_logger
         self._init_tables()
 
@@ -98,36 +101,52 @@ class DatabaseManager:
         self._execute_sync(query_account)
         self._execute_sync(query_positions)
         self._execute_sync(query_equity_history)
-        
-        self._execute_sync("CREATE INDEX IF NOT EXISTS idx_trade_logs_timestamp ON trade_logs(timestamp DESC)")
-        self._execute_sync("CREATE INDEX IF NOT EXISTS idx_equity_history_timestamp ON equity_history(timestamp DESC)")
 
-    async def update_account_info(self, net_liq: float, avail_funds: float, positions: dict):
+        self._execute_sync(
+            "CREATE INDEX IF NOT EXISTS idx_trade_logs_timestamp ON trade_logs(timestamp DESC)"
+        )
+        self._execute_sync(
+            "CREATE INDEX IF NOT EXISTS idx_equity_history_timestamp ON equity_history(timestamp DESC)"
+        )
+
+    async def update_account_info(
+        self, net_liq: float, avail_funds: float, positions: dict
+    ):
         """非同步更新帳戶資金與持倉狀態，並記錄收益歷史"""
+
         def _sync_update():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO account_state (id, net_liquidation, available_funds, timestamp)
                     VALUES (1, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(id) DO UPDATE SET
                     net_liquidation=excluded.net_liquidation,
                     available_funds=excluded.available_funds,
                     timestamp=CURRENT_TIMESTAMP
-                """, (net_liq, avail_funds))
-                
+                """,
+                    (net_liq, avail_funds),
+                )
+
                 cursor.execute("DELETE FROM portfolio_positions")
                 for sym, pos in positions.items():
                     if pos != 0:
-                        cursor.execute("""
+                        cursor.execute(
+                            """
                             INSERT INTO portfolio_positions (symbol, position, timestamp)
                             VALUES (?, ?, CURRENT_TIMESTAMP)
-                        """, (sym, pos))
-                        
-                cursor.execute("""
+                        """,
+                            (sym, pos),
+                        )
+
+                cursor.execute(
+                    """
                     INSERT INTO equity_history (net_liquidation, timestamp)
                     VALUES (?, CURRENT_TIMESTAMP)
-                """, (net_liq,))
+                """,
+                    (net_liq,),
+                )
                 conn.commit()
 
         try:
@@ -141,9 +160,12 @@ class DatabaseManager:
         VALUES (?, ?, ?, ?, ?, ?)
         """
         params = (
-            trade_data.get("symbol"), trade_data.get("action"),
-            trade_data.get("quantity", 0), trade_data.get("price", 0.0),
-            trade_data.get("regime", "UNKNOWN"), trade_data.get("reason", "")
+            trade_data.get("symbol"),
+            trade_data.get("action"),
+            trade_data.get("quantity", 0),
+            trade_data.get("price", 0.0),
+            trade_data.get("regime", "UNKNOWN"),
+            trade_data.get("reason", ""),
         )
         try:
             await asyncio.to_thread(self._execute_sync, query, params)
@@ -159,51 +181,85 @@ class DatabaseManager:
             self.logger.error(f"獲取交易紀錄失敗: {e}")
             return pd.DataFrame()
 
-    def save_bulk_market_data(self, symbol: str, df: pd.DataFrame, timeframe: str = "1 day"):
+    def save_bulk_market_data(
+        self, symbol: str, df: pd.DataFrame, timeframe: str = "1 day"
+    ):
         """儲存市場資料，採用 Upsert 達成無損增量寫入"""
-        if df.empty: return
-        
+        if df.empty:
+            return
+
         df_db = df.copy()
-        df_db['symbol'] = symbol
-        df_db['timeframe'] = timeframe
-        
-        if df_db.index.name != 'timestamp':
-            df_db.index.name = 'timestamp'
+        df_db["symbol"] = symbol
+        df_db["timeframe"] = timeframe
+
+        if df_db.index.name != "timestamp":
+            df_db.index.name = "timestamp"
         df_db = df_db.reset_index()
-        
-        df_db['timestamp'] = pd.to_datetime(df_db['timestamp'], utc=True).dt.strftime('%Y-%m-%d %H:%M:%S')
-        
-        df_db.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
-        cols = ['timestamp', 'symbol', 'timeframe', 'open', 'high', 'low', 'close', 'volume']
+
+        df_db["timestamp"] = pd.to_datetime(df_db["timestamp"], utc=True).dt.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        df_db.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            },
+            inplace=True,
+        )
+        cols = [
+            "timestamp",
+            "symbol",
+            "timeframe",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
         df_db = df_db[cols]
-        
+
         data_tuples = list(df_db.itertuples(index=False, name=None))
-        
+
         query = """
         INSERT OR REPLACE INTO market_data (timestamp, symbol, timeframe, open, high, low, close, volume)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
-        
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.executemany(query, data_tuples)
             conn.commit()
 
-    def get_market_data_sync(self, symbol: str, timeframe: str = "1 day") -> pd.DataFrame:
+    def get_market_data_sync(
+        self, symbol: str, timeframe: str = "1 day"
+    ) -> pd.DataFrame:
         """同步提取完整歷史市場資料"""
         query = "SELECT * FROM market_data WHERE symbol = ? AND timeframe = ? ORDER BY timestamp ASC"
         results = self._fetch_sync(query, (symbol, timeframe))
-        
+
         if not results:
             return pd.DataFrame()
-            
+
         df = pd.DataFrame(results)
-        
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
-        
-        df.set_index('timestamp', inplace=True)
-        df = df[~df.index.duplicated(keep='last')]
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+        df.set_index("timestamp", inplace=True)
+        df = df[~df.index.duplicated(keep="last")]
         df.sort_index(inplace=True)
-        
-        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+
+        df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            },
+            inplace=True,
+        )
         return df

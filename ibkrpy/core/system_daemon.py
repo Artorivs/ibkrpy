@@ -13,7 +13,9 @@ from ibkrpy.manager.trading_engine import TradingEngine
 from ibkrpy.manager.pipeline_manager import PipelineManager
 from ibkrpy.data.ibkr_data_manager import IBKRDataManager
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 STATE_PATH = os.path.join(PROJECT_ROOT, "data", "daemon_state.json")
 
 try:
@@ -95,7 +97,10 @@ class SystemDaemon:
             try:
                 sched = self._calendar.schedule(start_date=day, end_date=day)
                 if not sched.empty:
-                    session = (sched.iloc[0]["market_open"], sched.iloc[0]["market_close"])
+                    session = (
+                        sched.iloc[0]["market_open"],
+                        sched.iloc[0]["market_close"],
+                    )
             except Exception as e:
                 self.logger.error(f"查詢交易日曆失敗 ({day}): {e}")
 
@@ -110,7 +115,7 @@ class SystemDaemon:
 
         if self._calendar is not None:
             if session is None:
-                return False   # 週末或假日
+                return False  # 週末或假日
             market_open, market_close = session
             return market_open <= now_ny <= market_close
 
@@ -133,13 +138,17 @@ class SystemDaemon:
         try:
             await self.ib_manager.connect()
             if self._reconnect_failures:
-                self.logger.info(f"IBKR 重新連接成功（先前失敗 {self._reconnect_failures} 次）。")
+                self.logger.info(
+                    f"IBKR 重新連接成功（先前失敗 {self._reconnect_failures} 次）。"
+                )
             else:
                 self.logger.info("IBKR 重新連接成功！")
             self._reconnect_failures = 0
         except Exception as e:
             self._reconnect_failures += 1
-            msg = f"重連失敗 (第 {self._reconnect_failures} 次): {e}，將在下個迴圈重試。"
+            msg = (
+                f"重連失敗 (第 {self._reconnect_failures} 次): {e}，將在下個迴圈重試。"
+            )
             if self._reconnect_failures >= 3:
                 self.logger.error(msg)
             else:
@@ -160,11 +169,17 @@ class SystemDaemon:
           3. GIL 完全隔離，主迴圈的心跳絕對不會被拖慢。
         """
         cmd = [
-            sys.executable, "-m", "ibkrpy.core.main",
-            "--mode", "autopilot",
-            "--client-id", str(self.retrain_client_id),
+            sys.executable,
+            "-m",
+            "ibkrpy.core.main",
+            "--mode",
+            "autopilot",
+            "--client-id",
+            str(self.retrain_client_id),
         ]
-        self.logger.info(f"🛠️ 啟動重訓子行程 (client_id={self.retrain_client_id}): {' '.join(cmd)}")
+        self.logger.info(
+            f"🛠️ 啟動重訓子行程 (client_id={self.retrain_client_id}): {' '.join(cmd)}"
+        )
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -188,7 +203,9 @@ class SystemDaemon:
                 self.logger.info("已清除模型快取，下一輪將載入新權重。")
                 return True
 
-            self.logger.error(f"❌ 重訓子行程異常結束 (exit code {rc})，本週保養未完成。")
+            self.logger.error(
+                f"❌ 重訓子行程異常結束 (exit code {rc})，本週保養未完成。"
+            )
             return False
 
         except asyncio.CancelledError:
@@ -234,7 +251,7 @@ class SystemDaemon:
             return []
         n = len(self.symbols)
         self._scan_offset = (self._scan_offset + 1) % n
-        return self.symbols[self._scan_offset:] + self.symbols[:self._scan_offset]
+        return self.symbols[self._scan_offset :] + self.symbols[: self._scan_offset]
 
     async def run_24_7(self):
         """24 小時主迴圈"""
@@ -261,30 +278,42 @@ class SystemDaemon:
                 if is_open:
                     # ===== 盤中：執行高頻實盤交易 =====
                     if self._retrain_task is not None:
-                        self.logger.warning("⚠️ 重訓仍在進行中，本輪僅維持連線，不進行交易決策。")
+                        self.logger.warning(
+                            "⚠️ 重訓仍在進行中，本輪僅維持連線，不進行交易決策。"
+                        )
                         await asyncio.sleep(60)
                         continue
 
                     self.logger.info("=" * 40)
-                    self.logger.info(f"📈 盤中時間 (NY: {now_ny.strftime('%H:%M')}) - 執行 AI 掃描與決策")
+                    self.logger.info(
+                        f"📈 盤中時間 (NY: {now_ny.strftime('%H:%M')}) - 執行 AI 掃描與決策"
+                    )
                     self.logger.info("=" * 40)
 
                     if self.ib_manager.ib.isConnected():
                         await self.engine.update_system_state()
                         for symbol in self._scan_order():
                             await self.engine.run_tick(symbol)
-                            await asyncio.sleep(2)   # 避免 API 風險
+                            await asyncio.sleep(2)  # 避免 API 風險
 
-                    self.logger.info(f"✅ 掃描完成。等待下一個 {self.tick_interval_minutes} 分鐘 K 線...")
+                    self.logger.info(
+                        f"✅ 掃描完成。等待下一個 {self.tick_interval_minutes} 分鐘 K 線..."
+                    )
                     await asyncio.sleep(self.tick_interval_minutes * 60)
 
                 else:
                     # ===== 盤後/週末：維護與模型重訓 =====
-                    self.logger.info(f"🌙 盤後時間 (NY: {now_ny.strftime('%H:%M')}) - 系統進入休眠/維護模式。")
+                    self.logger.info(
+                        f"🌙 盤後時間 (NY: {now_ny.strftime('%H:%M')}) - 系統進入休眠/維護模式。"
+                    )
 
                     if self._should_retrain(now_ny):
-                        self.logger.info("🛠️ 觸發週末定期保養：以獨立行程更新歷史數據與模型重訓。")
-                        self._retrain_task = asyncio.create_task(self._run_retrain_subprocess())
+                        self.logger.info(
+                            "🛠️ 觸發週末定期保養：以獨立行程更新歷史數據與模型重訓。"
+                        )
+                        self._retrain_task = asyncio.create_task(
+                            self._run_retrain_subprocess()
+                        )
 
                     # 盤後每 5 分鐘檢查一次，隔天開盤最多延遲數分鐘就會甦醒
                     await asyncio.sleep(300)

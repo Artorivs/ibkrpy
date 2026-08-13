@@ -36,7 +36,9 @@ class ModelOrchestrator:
         self.factory = model_factory
         self.pipeline = data_pipeline
 
-        self.weights_dir = weights_dir or getattr(model_factory, "weights_dir", "weights")
+        self.weights_dir = weights_dir or getattr(
+            model_factory, "weights_dir", "weights"
+        )
 
         # Cache: { "AAPL_LSTM": model_instance }
         self._loaded_models: Dict[str, Any] = {}
@@ -143,7 +145,9 @@ class ModelOrchestrator:
             if self._loaded_mtimes.get(cache_key) == current_mtime:
                 return cached
 
-            logger.debug(f"[{symbol}] 偵測到 {model_type} 權重已更新，重新載入至記憶體...")
+            logger.debug(
+                f"[{symbol}] 偵測到 {model_type} 權重已更新，重新載入至記憶體..."
+            )
             self._loaded_models.pop(cache_key, None)
             self._loaded_mtimes.pop(cache_key, None)
             self._invalidate_scaler(symbol)
@@ -183,7 +187,9 @@ class ModelOrchestrator:
     # 預測介面
     # ------------------------------------------------------------------
 
-    def predict(self, symbol: str, df: pd.DataFrame, model_type: str = "LSTM") -> Tuple[float, float]:
+    def predict(
+        self, symbol: str, df: pd.DataFrame, model_type: str = "LSTM"
+    ) -> Tuple[float, float]:
         """
         執行連續數值預測並返回 (預測價格, 預測波動率)
         主要適用於: LSTM, Transformer, ARIMA, GARCH
@@ -197,7 +203,9 @@ class ModelOrchestrator:
 
             # 未訓練的神經網路一律拒絕出手
             if not self._is_model_usable(model, symbol, model_type):
-                logger.warning(f"[{symbol}] ⛔ {model_type} 尚未訓練，已排除於 Ensemble 之外。")
+                logger.warning(
+                    f"[{symbol}] ⛔ {model_type} 尚未訓練，已排除於 Ensemble 之外。"
+                )
                 return 0.0, 0.0
 
             prediction = model.predict_next_price(df)
@@ -206,5 +214,5 @@ class ModelOrchestrator:
         except Exception as e:
             logger.warning(f"[{symbol}] {model_type} 數值預測失敗: {e}")
             # 模型失效時的安全回退機制 (Fallback)
-            current_price = df['Close'].iloc[-1]
+            current_price = df["Close"].iloc[-1]
             return current_price, 0.02

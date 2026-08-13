@@ -5,12 +5,19 @@ import logging
 import os
 import queue
 import atexit
-from logging.handlers import RotatingFileHandler, SMTPHandler, QueueHandler, QueueListener
+from logging.handlers import (
+    RotatingFileHandler,
+    SMTPHandler,
+    QueueHandler,
+    QueueListener,
+)
 from typing import Dict, Any
 
 from datetime import datetime
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 _log_listener = None
 
@@ -29,11 +36,12 @@ class RateLimitFilter(logging.Filter):
     def __init__(self, interval_seconds: int = 1800):
         super().__init__()
         self.interval = interval_seconds
-        self._last = {}      # key -> 上次放行的時間
+        self._last = {}  # key -> 上次放行的時間
         self._suppressed = {}  # key -> 期間被抑制的次數
 
     def filter(self, record: logging.LogRecord) -> bool:
         import time
+
         key = (record.module, record.lineno, record.levelno)
         now = time.time()
         last = self._last.get(key)
@@ -51,7 +59,9 @@ class RateLimitFilter(logging.Filter):
         return True
 
 
-def setup_logger(config: Dict[str, Any] = None, enable_file: bool = True) -> logging.Logger:
+def setup_logger(
+    config: Dict[str, Any] = None, enable_file: bool = True
+) -> logging.Logger:
     """
     初始化全域日誌系統。
 
@@ -77,11 +87,15 @@ def setup_logger(config: Dict[str, Any] = None, enable_file: bool = True) -> log
     # 不向 root 傳遞，避免第三方套件呼叫 basicConfig() 後造成重複輸出
     logger.propagate = False
 
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d - %(message)s')
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d - %(message)s"
+    )
     io_handlers = []
 
     # 1. 控制台輸出 —— 等級改由 log_settings.level 決定
-    console_level = getattr(logging, str(cfg.get("level", "INFO")).upper(), logging.INFO)
+    console_level = getattr(
+        logging, str(cfg.get("level", "INFO")).upper(), logging.INFO
+    )
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
     console_handler.setFormatter(formatter)
@@ -92,7 +106,9 @@ def setup_logger(config: Dict[str, Any] = None, enable_file: bool = True) -> log
         log_dir = os.path.join(PROJECT_ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
         file_handler = RotatingFileHandler(
-            os.path.join(log_dir, f"trading_bot_{datetime.now().strftime('%Y-%m-%d')}.log"),
+            os.path.join(
+                log_dir, f"trading_bot_{datetime.now().strftime('%Y-%m-%d')}.log"
+            ),
             maxBytes=10 * 1024 * 1024,
             backupCount=5,
             encoding="utf-8",
@@ -122,9 +138,11 @@ def setup_logger(config: Dict[str, Any] = None, enable_file: bool = True) -> log
             mail_handler.setLevel(logging.ERROR)
             mail_handler.setFormatter(formatter)
             # 只對 email 套用節流；控制台與檔案仍完整記錄每一次事件
-            mail_handler.addFilter(RateLimitFilter(
-                interval_seconds=int(cfg.get("alert_throttle_minutes", 30)) * 60
-            ))
+            mail_handler.addFilter(
+                RateLimitFilter(
+                    interval_seconds=int(cfg.get("alert_throttle_minutes", 30)) * 60
+                )
+            )
             io_handlers.append(mail_handler)
 
     log_queue = queue.Queue(-1)

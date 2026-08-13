@@ -7,9 +7,10 @@ import pandas as pd
 from typing import Optional, Dict, Any
 from fredapi import Fred
 
+
 class ExternalDataFetcher:
     """統合外部 API (FMP, FRED) 的數據獲取"""
-    
+
     def __init__(self, fmp_api_key: str = None, fred_api_key: str = None):
         self.fmp_api_key = fmp_api_key
         self.fred = Fred(api_key=fred_api_key) if fred_api_key else None
@@ -20,7 +21,7 @@ class ExternalDataFetcher:
         if not self.fmp_api_key:
             print("未配置 FMP API Key。")
             return None
-            
+
         url = f"{self.fmp_base_url}/profile/{symbol}?apikey={self.fmp_api_key}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -39,7 +40,7 @@ class ExternalDataFetcher:
         if not self.fred:
             print("未配置 FRED API Key。")
             return pd.Series(dtype=float)
-            
+
         try:
             # fredapi 本身是同步的，使用 to_thread 避免阻塞
             series = await asyncio.to_thread(self.fred.get_series, series_id)

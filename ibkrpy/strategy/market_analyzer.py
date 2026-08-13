@@ -10,31 +10,48 @@ from ibkrpy.shared.config_manager import ConfigManager
 
 logger = logging.getLogger("ibkrpy")
 
+
 class MarketAnalyzer:
     """
     機構級市場全局分析器 (Global Market Context)
     提取股票間的相關性矩陣、Beta 值、產業板塊資金流向、宏觀趨勢，並計算最佳化投資組合權重。
     """
+
     def __init__(self, db_manager: DatabaseManager, config_manager: ConfigManager):
         self.db = db_manager
         self.config = config_manager
-        self.lookback_periods = config_manager.get("general_settings.analyzer_lookback", 60)
-        self.benchmark_symbol = config_manager.get("general_settings.benchmark_symbol", "QQQ")
+        self.lookback_periods = config_manager.get(
+            "general_settings.analyzer_lookback", 60
+        )
+        self.benchmark_symbol = config_manager.get(
+            "general_settings.benchmark_symbol", "QQQ"
+        )
+
+        self.base_position_pct = float(
+            config_manager.get("strategy_settings.base_position_pct", 0.08)
+        )
+        self.min_tilt = float(
+            config_manager.get("strategy_settings.min_risk_parity_tilt", 0.5)
+        )
+        self.max_tilt = float(
+            config_manager.get("strategy_settings.max_risk_parity_tilt", 2.0)
+        )
 
     def get_global_context(self) -> Dict[str, Any]:
         """
-        計算並回傳全局市場狀態 
+        計算並回傳全局市場狀態
         (建議在 trading_engine 的每一輪迴圈開頭呼叫一次，然後傳給各個標的)
         """
         context = {
-            "correlation_matrix": {},   # 標的間的相關係數矩陣
-            "beta_values": {},          # 各標的相對於大盤的 Beta 值 (系統性風險)
-            "macro_trend": "NEUTRAL",   # 大盤短期趨勢
-            "symbols": [],              # 納入本次計算的標的
-            "optimal_weights": {},      # 投資組合最佳化目標權重
-            "is_valid": False           # 數據是否足夠計算
+            "correlation_matrix": {},  # 標的間的相關係數矩陣
+            "beta_values": {},  # 各標的相對於大盤的 Beta 值 (系統性風險)
+            "macro_trend": "NEUTRAL",  # 大盤短期趨勢
+            "symbols": [],  # 納入本次計算的標的
+            "optimal_weights": {},  # 投資組合最佳化目標權重 (總和為 1)
+            "risk_parity_tilt": {},  # 相對傾斜倍數 (平均為 1.0)
+            "is_valid": False,  # 數據是否足夠計算
         }
-        
+
         symbols = [p.symbol for p in self.config.asset_profiles]
         if not symbols:
             return context
@@ -47,7 +64,7 @@ class MarketAnalyzer:
 
             df = self.db.get_market_data_sync(sym)
             if not df.empty and len(df) >= self.lookback_periods:
-                price_dict[sym] = df['Close'].tail(self.lookback_periods)
+                price_dict[sym] = df["Close"].tail(self.lookback_periods)
 
         if not price_dict:
             return context
@@ -60,7 +77,7 @@ class MarketAnalyzer:
                 f"本輪相關性 / Beta / 風險平價全部退回預設值。"
             )
             return context
-            
+
         returns_df = np.log(prices_df / prices_df.shift(1)).dropna()
         context["is_valid"] = True
 
@@ -70,10 +87,13 @@ class MarketAnalyzer:
 
         # 4. 評估大盤宏觀趨勢與 Beta 值
         if self.benchmark_symbol in prices_df.columns:
-            benchmark_cum_ret = (prices_df[self.benchmark_symbol].iloc[-1] / prices_df[self.benchmark_symbol].iloc[0]) - 1
-            if benchmark_cum_ret > 0.003:   
+            benchmark_cum_ret = (
+                prices_df[self.benchmark_symbol].iloc[-1]
+                / prices_df[self.benchmark_symbol].iloc[0]
+            ) - 1
+            if benchmark_cum_ret > 0.003:
                 context["macro_trend"] = "BULLISH"
-            elif benchmark_cum_ret < -0.003: 
+            elif benchmark_cum_ret < -0.003:
                 context["macro_trend"] = "BEARISH"
 
             bench_var = returns_df[self.benchmark_symbol].var()
@@ -85,20 +105,31 @@ class MarketAnalyzer:
                     else:
                         context["beta_values"][sym] = 1.0
 
-
         # 6. 投資組合最佳化: 基於風險平價 (Risk Parity / Inverse Variance)
         # 讓波動大的股票權重小，波動小的股票權重大，實現整體 Portfolio 波動率最小化與夏普最大化
         variances = returns_df.var()
         if not variances.empty:
-            # 避免變異數為 0 導致除以零錯誤
             variances = variances.replace(0, 1e-6)
             inv_variances = 1.0 / variances
-            optimal_weights = (inv_variances / inv_variances.sum()).to_dict()
-            context["optimal_weights"] = optimal_weights
+            weights = inv_variances / inv_variances.sum()
+            context["optimal_weights"] = weights.to_dict()
+
+            mean_weight = float(weights.mean())
+            if mean_weight > 0:
+                tilts = (weights / mean_weight).clip(
+                    lower=self.min_tilt, upper=self.max_tilt
+                )
+                context["risk_parity_tilt"] = tilts.to_dict()
 
         return context
 
-    def analyze_stock_risk(self, symbol: str, context: Dict[str, Any], action: str = "BUY", current_positions: Dict[str, float] = None) -> Dict[str, Any]:
+    def analyze_stock_risk(
+        self,
+        symbol: str,
+        context: Dict[str, Any],
+        action: str = "BUY",
+        current_positions: Dict[str, float] = None,
+    ) -> Dict[str, Any]:
         """
         針對單一股票，結合全局上下文進行橫截面分析 (Cross-Sectional Analysis)
         """
@@ -106,23 +137,26 @@ class MarketAnalyzer:
             "macro_alignment": "NEUTRAL",
             "benchmark_correlation": 0.0,
             "beta": 1.0,
-            "conviction_multiplier": 1.0,  
-            "target_weight": 0.10,
-            "warnings": []
+            "conviction_multiplier": 1.0,
+            "target_weight": self.base_position_pct,
+            "warnings": [],
         }
-        
+
         if not context.get("is_valid") or symbol not in context.get("symbols", []):
             return analysis
 
-        # 提取投資組合最佳化目標權重
-        analysis["target_weight"] = context.get("optimal_weights", {}).get(symbol, 0.10)
+        # 目標部位 = 基準大小 × 風險平價傾斜。低波動標的拿到較大部位，
+        # 高波動標的較小，但兩者都圍繞在一個明確、可設定的基準值附近。
+        tilt = context.get("risk_parity_tilt", {}).get(symbol, 1.0)
+        analysis["risk_parity_tilt"] = tilt
+        analysis["target_weight"] = self.base_position_pct * tilt
 
         # --- A. 大盤宏觀對齊與 Beta 風險分析 ---
         macro_trend = context.get("macro_trend", "NEUTRAL")
         beta = context.get("beta_values", {}).get(symbol, 1.0)
         analysis["macro_alignment"] = macro_trend
         analysis["beta"] = beta
-        
+
         if macro_trend == "BULLISH" and action == "BUY":
             analysis["conviction_multiplier"] += 0.15
         elif macro_trend == "BEARISH" and action == "SELL":
@@ -133,26 +167,36 @@ class MarketAnalyzer:
         elif macro_trend == "BEARISH" and action == "BUY":
             analysis["conviction_multiplier"] -= 0.15
             analysis["warnings"].append("逆勢警告: 大盤處於下降趨勢，做多勝率較低。")
-            
+
             if beta > 1.3:
                 analysis["conviction_multiplier"] -= 0.1
-                analysis["warnings"].append(f"高 Beta 警告: 大盤偏空且該標的 Beta 極高 ({beta:.2f})，跌幅可能超越大盤。")
+                analysis["warnings"].append(
+                    f"高 Beta 警告: 大盤偏空且該標的 Beta 極高 ({beta:.2f})，跌幅可能超越大盤。"
+                )
             elif beta < 0.8:
-                analysis["conviction_multiplier"] += 0.1 
-                analysis["warnings"].append(f"防禦屬性: 該標的 Beta 較低 ({beta:.2f})，具備一定的抗跌能力。")
+                analysis["conviction_multiplier"] += 0.1
+                analysis["warnings"].append(
+                    f"防禦屬性: 該標的 Beta 較低 ({beta:.2f})，具備一定的抗跌能力。"
+                )
 
         # --- B. 投資組合過度集中風險 (Portfolio Concentration Risk) ---
         corr_matrix = context.get("correlation_matrix", {})
-        
+
         if current_positions and symbol in corr_matrix:
             max_corr_with_holdings = 0.0
             highly_correlated_peers = []
 
             for pos_sym, pos_qty in current_positions.items():
-                if pos_qty != 0 and pos_sym != symbol and pos_sym in corr_matrix[symbol]:
+                if (
+                    pos_qty != 0
+                    and pos_sym != symbol
+                    and pos_sym in corr_matrix[symbol]
+                ):
                     corr = corr_matrix[symbol][pos_sym]
-                    
-                    if (action == "BUY" and pos_qty > 0) or (action == "SELL" and pos_qty < 0):
+
+                    if (action == "BUY" and pos_qty > 0) or (
+                        action == "SELL" and pos_qty < 0
+                    ):
                         if corr > max_corr_with_holdings:
                             max_corr_with_holdings = corr
                         if corr > 0.75:
@@ -164,6 +208,8 @@ class MarketAnalyzer:
                     f"集中度風險: 與當前持倉 {highly_correlated_peers} 高度正相關 (Max R={max_corr_with_holdings:.2f})，將縮減倉位分散風險。"
                 )
 
-        analysis["conviction_multiplier"] = max(0.4, min(1.6, analysis["conviction_multiplier"]))
-        
+        analysis["conviction_multiplier"] = max(
+            0.4, min(1.6, analysis["conviction_multiplier"])
+        )
+
         return analysis

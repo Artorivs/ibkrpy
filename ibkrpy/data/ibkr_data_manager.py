@@ -12,12 +12,29 @@ from ib_insync import IB, Contract, Stock, util
 logger = logging.getLogger("ibkrpy")
 
 _BAR_SECONDS = {
-    "1 secs": 1, "5 secs": 5, "10 secs": 10, "15 secs": 15, "30 secs": 30,
-    "1 min": 60, "1 mins": 60, "2 mins": 120, "3 mins": 180, "5 mins": 300,
-    "10 mins": 600, "15 mins": 900, "20 mins": 1200, "30 mins": 1800,
-    "1 hour": 3600, "1 hours": 3600, "2 hours": 7200, "3 hours": 10800,
-    "4 hours": 14400, "8 hours": 28800,
-    "1 day": 86400, "1 week": 604800, "1 month": 2592000,
+    "1 secs": 1,
+    "5 secs": 5,
+    "10 secs": 10,
+    "15 secs": 15,
+    "30 secs": 30,
+    "1 min": 60,
+    "1 mins": 60,
+    "2 mins": 120,
+    "3 mins": 180,
+    "5 mins": 300,
+    "10 mins": 600,
+    "15 mins": 900,
+    "20 mins": 1200,
+    "30 mins": 1800,
+    "1 hour": 3600,
+    "1 hours": 3600,
+    "2 hours": 7200,
+    "3 hours": 10800,
+    "4 hours": 14400,
+    "8 hours": 28800,
+    "1 day": 86400,
+    "1 week": 604800,
+    "1 month": 2592000,
 }
 
 
@@ -33,13 +50,13 @@ class IBKRDataManager:
     #   - 15 秒內不得送出「完全相同」的歷史請求
     #   - 2 秒內同一 Contract+Exchange+TickType 不得超過 6 次
     HIST_WINDOW_SECONDS = 600
-    HIST_MAX_IN_WINDOW = 50          # 對 60 留 10 次緩衝給臨時補資料
-    IDENTICAL_COOLDOWN = 16.0        # 官方 15s，取 16s 留餘裕
+    HIST_MAX_IN_WINDOW = 50  # 對 60 留 10 次緩衝給臨時補資料
+    IDENTICAL_COOLDOWN = 16.0  # 官方 15s，取 16s 留餘裕
     SAME_CONTRACT_WINDOW = 2.0
-    SAME_CONTRACT_MAX = 4            # 官方 6 次，取 4 次
-    MIN_REQUEST_GAP = 0.25           # 全域最小間隔，避免觸發「軟節流」
+    SAME_CONTRACT_MAX = 4  # 官方 6 次，取 4 次
+    MIN_REQUEST_GAP = 0.25  # 全域最小間隔，避免觸發「軟節流」
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 7497, client_id: int = 1):
+    def __init__(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1):
         self.ib = IB()
         self.host = host
         self.port = port
@@ -50,9 +67,9 @@ class IBKRDataManager:
         self.max_subscriptions = 55
 
         # ---- 歷史數據速率控制 ----
-        self._hist_req_timestamps: list = []            # 全域 10 分鐘窗
-        self._identical_last: Dict[str, float] = {}     # 請求簽章 -> 上次送出時間
-        self._contract_hits: Dict[str, list] = {}       # 合約鍵 -> 近 2 秒的送出時間
+        self._hist_req_timestamps: list = []  # 全域 10 分鐘窗
+        self._identical_last: Dict[str, float] = {}  # 請求簽章 -> 上次送出時間
+        self._contract_hits: Dict[str, list] = {}  # 合約鍵 -> 近 2 秒的送出時間
         self._last_request_at = 0.0
         self._hist_req_lock = asyncio.Lock()
 
@@ -76,11 +93,15 @@ class IBKRDataManager:
             return
         try:
             await self.ib.connectAsync(self.host, self.port, self.client_id)
-            logger.info(f"IBKR 連線成功: {self.host}:{self.port} (Client ID: {self.client_id})")
+            logger.info(
+                f"IBKR 連線成功: {self.host}:{self.port} (Client ID: {self.client_id})"
+            )
             self._install_error_hook()
         except Exception as e:
             logger.warning(f"IBKR 連線失敗: {e}")
-            raise ConnectionError(f"無法連線至 IBKR {self.host}:{self.port}: {e}") from e
+            raise ConnectionError(
+                f"無法連線至 IBKR {self.host}:{self.port}: {e}"
+            ) from e
 
     async def _ensure_connected(self) -> bool:
         """資料讀取路徑專用：連線失敗時降級為 False，不中斷整輪掃描"""
@@ -138,7 +159,9 @@ class IBKRDataManager:
                     f"(缺 symbol / currency / primaryExchange)，或該 conId 已下市 / 更名。原文: {msg}"
                 )
             elif "no historical market data" in msg.lower():
-                logger.warning(f"[IBKR][{sym}] 該區間沒有歷史資料 (可能早於上市日)。原文: {msg}")
+                logger.warning(
+                    f"[IBKR][{sym}] 該區間沒有歷史資料 (可能早於上市日)。原文: {msg}"
+                )
             else:
                 logger.error(f"[IBKR][{sym}] 歷史資料服務錯誤 ({errorCode}): {msg}")
             return
@@ -162,7 +185,9 @@ class IBKRDataManager:
         """IBKR 的多股別代碼用空白分隔 (BRK B / BF B)，不是點或減號。"""
         return str(symbol).strip().upper().replace(".", " ").replace("-", " ")
 
-    async def qualify(self, symbol: str, primary_exchange: str = None) -> Optional[Contract]:
+    async def qualify(
+        self, symbol: str, primary_exchange: str = None
+    ) -> Optional[Contract]:
         """
         取得「完整」合約並快取。回傳 None 代表該代碼無法解析，呼叫端應直接跳過。
 
@@ -244,7 +269,7 @@ class IBKRDataManager:
         try:
             summary = await self.ib.accountSummaryAsync()
             for item in summary:
-                if item.tag == 'NetLiquidationByCurrency' and item.currency == currency:
+                if item.tag == "NetLiquidationByCurrency" and item.currency == currency:
                     return float(item.value)
         except Exception as e:
             logger.warning(f"獲取帳戶淨值失敗: {e}")
@@ -255,13 +280,24 @@ class IBKRDataManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _signature(contract: Contract, end_datetime: str, duration: str,
-                   bar_size: str, what_to_show: str, use_rth: bool) -> str:
-        return "|".join([
-            str(getattr(contract, "conId", 0) or getattr(contract, "symbol", "?")),
-            end_datetime or "NOW",
-            duration, bar_size, what_to_show, str(use_rth),
-        ])
+    def _signature(
+        contract: Contract,
+        end_datetime: str,
+        duration: str,
+        bar_size: str,
+        what_to_show: str,
+        use_rth: bool,
+    ) -> str:
+        return "|".join(
+            [
+                str(getattr(contract, "conId", 0) or getattr(contract, "symbol", "?")),
+                end_datetime or "NOW",
+                duration,
+                bar_size,
+                what_to_show,
+                str(use_rth),
+            ]
+        )
 
     @staticmethod
     def _contract_key(contract: Contract, what_to_show: str) -> str:
@@ -294,15 +330,20 @@ class IBKRDataManager:
                     wait = max(wait, self.IDENTICAL_COOLDOWN - gap)
 
             # 規則 2：2 秒內同合約不得超過 N 次
-            hits = [t for t in self._contract_hits.get(contract_key, [])
-                    if now - t < self.SAME_CONTRACT_WINDOW]
+            hits = [
+                t
+                for t in self._contract_hits.get(contract_key, [])
+                if now - t < self.SAME_CONTRACT_WINDOW
+            ]
             self._contract_hits[contract_key] = hits
             if len(hits) >= self.SAME_CONTRACT_MAX:
                 wait = max(wait, self.SAME_CONTRACT_WINDOW - (now - hits[0]) + 0.05)
 
             # 規則 3：10 分鐘內不得超過 N 次
             self._hist_req_timestamps = [
-                t for t in self._hist_req_timestamps if now - t < self.HIST_WINDOW_SECONDS
+                t
+                for t in self._hist_req_timestamps
+                if now - t < self.HIST_WINDOW_SECONDS
             ]
             if len(self._hist_req_timestamps) >= self.HIST_MAX_IN_WINDOW:
                 oldest = self._hist_req_timestamps[0]
@@ -331,7 +372,9 @@ class IBKRDataManager:
 
     def pacing_stats(self) -> Dict[str, Any]:
         now = time.time()
-        live = [t for t in self._hist_req_timestamps if now - t < self.HIST_WINDOW_SECONDS]
+        live = [
+            t for t in self._hist_req_timestamps if now - t < self.HIST_WINDOW_SECONDS
+        ]
         return {
             "requests_in_window": len(live),
             "window_limit": self.HIST_MAX_IN_WINDOW,
@@ -348,10 +391,10 @@ class IBKRDataManager:
     async def fetch_historical_data(
         self,
         contract: Contract,
-        end_datetime: str = '',
-        duration: str = '1 Y',
-        bar_size: str = '1 day',
-        what_to_show: str = 'TRADES',
+        end_datetime: str = "",
+        duration: str = "1 Y",
+        bar_size: str = "1 day",
+        what_to_show: str = "TRADES",
         use_rth: bool = True,
         allow_cache: bool = True,
     ) -> pd.DataFrame:
@@ -368,7 +411,9 @@ class IBKRDataManager:
         if not await self._ensure_connected():
             return pd.DataFrame()
 
-        signature = self._signature(contract, end_datetime, duration, bar_size, what_to_show, use_rth)
+        signature = self._signature(
+            contract, end_datetime, duration, bar_size, what_to_show, use_rth
+        )
         ttl = self._cache_ttl(bar_size, end_datetime)
 
         if allow_cache:
@@ -385,7 +430,9 @@ class IBKRDataManager:
         contract_key = self._contract_key(contract, what_to_show)
         wait = await self._acquire_hist_slot(signature, contract_key)
         if wait > 0:
-            logger.debug(f"[{contract.symbol}] 速率控制等待 {wait:.2f}s ({bar_size}/{duration})")
+            logger.debug(
+                f"[{contract.symbol}] 速率控制等待 {wait:.2f}s ({bar_size}/{duration})"
+            )
             await asyncio.sleep(wait)
 
         try:
@@ -420,14 +467,24 @@ class IBKRDataManager:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        df.set_index('date', inplace=True)
-        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low',
-                           'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        df.set_index("date", inplace=True)
+        df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            },
+            inplace=True,
+        )
 
         if allow_cache:
             self._hist_cache[signature] = (time.time(), df.copy())
             if len(self._hist_cache) > 4000:
-                oldest = sorted(self._hist_cache.items(), key=lambda kv: kv[1][0])[:1000]
+                oldest = sorted(self._hist_cache.items(), key=lambda kv: kv[1][0])[
+                    :1000
+                ]
                 for k, _ in oldest:
                     self._hist_cache.pop(k, None)
 
@@ -444,8 +501,9 @@ class IBKRDataManager:
     # 實時訂閱
     # ------------------------------------------------------------------
 
-    async def subscribe_realtime_bars(self, contract: Contract, bar_size: int = 5,
-                                      callback: Callable = None):
+    async def subscribe_realtime_bars(
+        self, contract: Contract, bar_size: int = 5, callback: Callable = None
+    ):
         """訂閱實時 K 線 (5 秒 bar)。實時訂閱不佔用歷史請求配額。"""
         if not await self._ensure_connected():
             return
@@ -466,7 +524,7 @@ class IBKRDataManager:
             return
 
         try:
-            bars = self.ib.reqRealTimeBars(contract, bar_size, 'TRADES', False)
+            bars = self.ib.reqRealTimeBars(contract, bar_size, "TRADES", False)
             if callback:
                 bars.updateEvent += callback
             self._active_subscriptions[sub_key] = {"bars": bars, "callback": callback}

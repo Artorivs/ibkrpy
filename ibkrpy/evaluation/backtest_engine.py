@@ -54,7 +54,11 @@ class BacktestEngine:
 
     def _fill_price(self, price: float, is_buy: bool) -> float:
         """買入滑價使成本變高，賣出滑價使收入變少"""
-        return price * (1 + self.slippage_pct) if is_buy else price * (1 - self.slippage_pct)
+        return (
+            price * (1 + self.slippage_pct)
+            if is_buy
+            else price * (1 - self.slippage_pct)
+        )
 
     # ------------------------------------------------------------------
     # 主迴圈
@@ -73,10 +77,10 @@ class BacktestEngine:
         :param signals: 策略生成的信號列表 (含 stop_loss_price / take_profit_price)
         :param benchmark_df: (可選) 大盤數據，用於 Alpha、資訊比率等指標
         """
-        if df.empty or 'Close' not in df.columns:
+        if df.empty or "Close" not in df.columns:
             return self._empty_metrics()
 
-        has_hl = 'High' in df.columns and 'Low' in df.columns
+        has_hl = "High" in df.columns and "Low" in df.columns
         simulate_bracket = self.use_bracket_exits and has_hl
 
         capital = self.initial_capital
@@ -85,22 +89,28 @@ class BacktestEngine:
         active_tp: Optional[float] = None
 
         equity_curve = []
-        trades = []          # 每次部位變動
-        round_trips = 0      # 完整的進出場來回次數
+        trades = []  # 每次部位變動
+        round_trips = 0  # 完整的進出場來回次數
 
         signal_dict = {sig["timestamp"]: sig for sig in signals}
 
         for ts, row in df.iterrows():
-            price = float(row['Close'])
+            price = float(row["Close"])
             if not np.isfinite(price) or price <= 0:
-                equity_curve.append({"timestamp": ts, "equity": capital + position * price})
+                equity_curve.append(
+                    {"timestamp": ts, "equity": capital + position * price}
+                )
                 continue
 
             # ========== 1. 先檢查既有部位是否觸發 bracket 出場 ==========
             # 必須在處理新訊號之前，因為停損停利在盤中隨時可能成交。
-            if simulate_bracket and position != 0 and (active_sl is not None or active_tp is not None):
-                high = float(row['High'])
-                low = float(row['Low'])
+            if (
+                simulate_bracket
+                and position != 0
+                and (active_sl is not None or active_tp is not None)
+            ):
+                high = float(row["High"])
+                low = float(row["Low"])
                 exit_price = None
                 exit_kind = None
 
@@ -124,12 +134,14 @@ class BacktestEngine:
                     capital -= closing_qty * fill
                     capital -= abs(closing_qty) * self.commission
 
-                    trades.append({
-                        "type": exit_kind,
-                        "price": exit_price,
-                        "size": closing_qty,
-                        "timestamp": ts,
-                    })
+                    trades.append(
+                        {
+                            "type": exit_kind,
+                            "price": exit_price,
+                            "size": closing_qty,
+                            "timestamp": ts,
+                        }
+                    )
                     round_trips += 1
 
                     position = 0
@@ -161,12 +173,14 @@ class BacktestEngine:
 
                     position = target_position
 
-                    trades.append({
-                        "type": action,
-                        "price": price,
-                        "size": trade_size,
-                        "timestamp": ts,
-                    })
+                    trades.append(
+                        {
+                            "type": action,
+                            "price": price,
+                            "size": trade_size,
+                            "timestamp": ts,
+                        }
+                    )
 
                     if position != 0:
                         active_sl = sig.get("stop_loss_price")
@@ -179,7 +193,7 @@ class BacktestEngine:
 
         # ========== 3. 回測結束強制平倉結算 ==========
         if position != 0:
-            last_price = float(df['Close'].iloc[-1])
+            last_price = float(df["Close"].iloc[-1])
             closing_qty = -position
             fill = self._fill_price(last_price, is_buy=closing_qty > 0)
             capital -= closing_qty * fill
@@ -205,14 +219,14 @@ class BacktestEngine:
             return self._empty_metrics()
 
         df_eq = pd.DataFrame(equity_curve).set_index("timestamp")
-        df_eq['return'] = df_eq['equity'].pct_change().fillna(0)
+        df_eq["return"] = df_eq["equity"].pct_change().fillna(0)
 
         periods_per_year = self._infer_periods_per_year(df_eq.index)
         ann_factor = np.sqrt(periods_per_year)
 
-        total_return_pct = (df_eq['equity'].iloc[-1] / self.initial_capital - 1) * 100
+        total_return_pct = (df_eq["equity"].iloc[-1] / self.initial_capital - 1) * 100
 
-        bar_returns = df_eq['return']
+        bar_returns = df_eq["return"]
         std = bar_returns.std()
         sharpe_ratio = (bar_returns.mean() / std * ann_factor) if std > 0 else 0.0
 
@@ -220,31 +234,41 @@ class BacktestEngine:
         downside = bar_returns[bar_returns < 0]
         downside_std = downside.std() * ann_factor if len(downside) > 1 else 0.0
         sortino_ratio = (
-            (bar_returns.mean() * periods_per_year / downside_std) if downside_std > 0 else 0.0
+            (bar_returns.mean() * periods_per_year / downside_std)
+            if downside_std > 0
+            else 0.0
         )
 
         # 獲利因子 (以每根 K 線的損益衡量，非逐筆交易的損益)
         gains = bar_returns[bar_returns > 0].sum()
         losses = abs(bar_returns[bar_returns < 0].sum())
-        profit_factor = (gains / losses) if losses > 0 else float('inf')
+        profit_factor = (gains / losses) if losses > 0 else float("inf")
 
         # 最大回撤
-        roll_max = df_eq['equity'].cummax()
-        drawdown = df_eq['equity'] / roll_max - 1
+        roll_max = df_eq["equity"].cummax()
+        drawdown = df_eq["equity"] / roll_max - 1
         max_drawdown_pct = abs(drawdown.min()) * 100
 
         # 資訊比率與追蹤誤差
         tracking_error = 0.0
         information_ratio = 0.0
 
-        if benchmark_df is not None and not benchmark_df.empty and 'Close' in benchmark_df.columns:
-            bench_returns = benchmark_df['Close'].pct_change().fillna(0)
-            aligned = pd.concat([bar_returns, bench_returns], axis=1, join='inner').dropna()
+        if (
+            benchmark_df is not None
+            and not benchmark_df.empty
+            and "Close" in benchmark_df.columns
+        ):
+            bench_returns = benchmark_df["Close"].pct_change().fillna(0)
+            aligned = pd.concat(
+                [bar_returns, bench_returns], axis=1, join="inner"
+            ).dropna()
             if len(aligned) > 1:
                 active_returns = aligned.iloc[:, 0] - aligned.iloc[:, 1]
                 tracking_error = active_returns.std() * ann_factor
                 if tracking_error > 0:
-                    information_ratio = (active_returns.mean() * periods_per_year) / tracking_error
+                    information_ratio = (
+                        active_returns.mean() * periods_per_year
+                    ) / tracking_error
 
         return {
             "total_return_pct": round(total_return_pct, 2),
@@ -256,15 +280,19 @@ class BacktestEngine:
             "max_drawdown_pct": round(max_drawdown_pct, 2),
             "total_trades": round_trips,
             "periods_per_year": round(periods_per_year, 1),
-            "final_equity": round(df_eq['equity'].iloc[-1], 2),
+            "final_equity": round(df_eq["equity"].iloc[-1], 2),
         }
 
     def _empty_metrics(self) -> Dict[str, Any]:
         return {
-            "total_return_pct": 0.0, "sharpe_ratio": 0.0,
-            "sortino_ratio": 0.0, "profit_factor": 0.0,
-            "information_ratio": 0.0, "tracking_error_pct": 0.0,
-            "max_drawdown_pct": 0.0, "total_trades": 0,
+            "total_return_pct": 0.0,
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "profit_factor": 0.0,
+            "information_ratio": 0.0,
+            "tracking_error_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "total_trades": 0,
             "periods_per_year": 252.0,
             "final_equity": self.initial_capital,
         }
