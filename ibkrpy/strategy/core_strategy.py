@@ -1,9 +1,5 @@
 # ibkrpy/strategy/core_strategy.py
-# 核心策略 (支援多模型 Ensemble 與動態進場閾值)。
-#
-# 本版唯一的結構性改動：generate_signal 的每一條 return None 都會先寫入
-# self.last_decision。舊版有 9 條靜默的 return None —— 策略天天在做決定，
-# 但外界完全看不到它決定了什麼、為什麼，這正是「交易好像沒在動」的成因。
+# 核心策略 (支援多模型 Ensemble 與動態進場閾值)
 
 from typing import Dict, Any, Optional
 import numpy as np
@@ -30,7 +26,7 @@ class CoreStrategy:
         self.tp_multiplier = self.config.get("volatility_take_profit_multiplier", 3.0)
         self.entry_sigma_mult = self.config.get("entry_sigma_multiplier", 1.0)
         self.tp_capture_ratio = self.config.get("tp_capture_ratio", 0.8)
-        self.min_edge_pct = self.config.get("min_edge_pct", 0.0025)
+        self.min_edge_pct = self.config.get("min_edge_pct", 0.0005)
         self.sl_noise_floor_mult = self.config.get("sl_noise_floor_multiplier", 0.5)
         self.min_reward_risk = self.config.get("min_reward_risk_ratio", 1.0)
 

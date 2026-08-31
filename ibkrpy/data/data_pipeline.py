@@ -74,8 +74,16 @@ _NEVER_PRICE_RELATIVE = (
 class DataPipeline:
     """負責數據的本地快取存取，以及機器學習所需的預處理"""
 
-    def __init__(self):
+    def __init__(self, artifact_store=None):
         self.scalers: Dict[str, Dict] = {}
+
+        if artifact_store is None:
+            from ibkrpy.data.artifact_store import build_artifact_store
+
+            artifact_store = build_artifact_store(
+                WEIGHTS_DIR, getattr(self, "config", None)
+            )
+        self.artifacts = artifact_store
         self._manifests: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------------
@@ -203,6 +211,7 @@ class DataPipeline:
         return out
 
     def _manifest_path(self, symbol: str) -> str:
+        """僅供舊工具與測試參考。實際讀寫一律經由 self.artifacts。"""
         return os.path.join(WEIGHTS_DIR, f"{symbol}_features.json")
 
     def save_feature_manifest(
@@ -222,9 +231,7 @@ class DataPipeline:
             "target_scale": target_scale,  # log_return 乘上的倍率 (100 = 百分比)
             "benchmark": (str(benchmark).upper() if benchmark else None),
         }
-        os.makedirs(WEIGHTS_DIR, exist_ok=True)
-        with open(self._manifest_path(symbol), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=4, ensure_ascii=False)
+        self.artifacts.save_manifest(symbol, manifest)
         self._manifests[symbol] = manifest
         logger.debug(
             f"[{symbol}] 特徵清單已保存 ({len(features)} 欄，"
@@ -237,14 +244,9 @@ class DataPipeline:
         if symbol in self._manifests:
             return self._manifests[symbol]
 
-        path = self._manifest_path(symbol)
-        if not os.path.exists(path):
-            return None
-
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-            if not manifest.get("features"):
+            manifest = self.artifacts.load_manifest(symbol)
+            if not manifest or not manifest.get("features"):
                 return None
             manifest.setdefault("price_relative", [])
             manifest.setdefault("target_mode", "level")
@@ -286,6 +288,38 @@ class DataPipeline:
 
         return df, features
 
+    def save_training_artifacts(
+        self,
+        symbol: str,
+        scaler: Dict,
+        features: List[str],
+        price_relative: List[str] = None,
+        target_mode: str = "log_return",
+        target_scale: float = 100.0,
+        benchmark: str = None,
+    ):
+        """
+        [訓練階段專用] 一次原子寫入 scaler 與 manifest。
+
+        分開呼叫 save_feature_manifest() 與 fit_scale() 時，兩次寫入之間
+        若發生例外，磁碟上會留下「新 manifest 配舊 scaler」的狀態，而且
+        不會有任何錯誤 —— 模型只是安靜地吃到錯誤的分布。用這個方法就不會。
+        """
+        manifest = {
+            "features": list(features),
+            "price_relative": list(price_relative or []),
+            "target_mode": target_mode,
+            "target_scale": target_scale,
+            "benchmark": (str(benchmark).upper() if benchmark else None),
+        }
+        self.artifacts.save_bundle(symbol, scaler=scaler, manifest=manifest)
+        self.scalers[symbol] = scaler
+        self._manifests[symbol] = manifest
+        logger.debug(
+            f"[{symbol}] 訓練產物已原子寫入 ({len(features)} 個特徵，"
+            f"{len(scaler)} 個縮放欄位)。"
+        )
+
     def invalidate(self, symbol: str = None):
         """清除記憶體快取。重訓後必須呼叫，否則會用舊 scaler 配新模型。"""
         if symbol is None:
@@ -318,14 +352,11 @@ class DataPipeline:
         [訓練階段專用] 僅在 Training Set 上呼叫。
 
         此函式「會寫檔」，因此絕不可從 transform_scale 之類的讀取路徑呼叫。
+        寫到哪裡由 ScalerStore 決定 —— 本模組不再知道檔案佈局。
         """
         scaler_dict = self._compute_scaler(df, columns)
         self.scalers[symbol] = scaler_dict
-
-        os.makedirs(WEIGHTS_DIR, exist_ok=True)
-        scaler_path = os.path.join(WEIGHTS_DIR, f"{symbol}_scaler.json")
-        with open(scaler_path, "w", encoding="utf-8") as f:
-            json.dump(scaler_dict, f, indent=4)
+        self.artifacts.save_scaler(symbol, scaler_dict)
 
         if "__wf" not in symbol:
             logger.info(f"[{symbol}] 特徵縮放參數 (Scaler) 已適配並儲存。")
@@ -344,10 +375,9 @@ class DataPipeline:
         df_scaled = df.copy()
 
         if symbol not in self.scalers:
-            scaler_path = os.path.join(WEIGHTS_DIR, f"{symbol}_scaler.json")
-            if os.path.exists(scaler_path):
-                with open(scaler_path, "r", encoding="utf-8") as f:
-                    self.scalers[symbol] = json.load(f)
+            stored = self.artifacts.load_scaler(symbol)
+            if stored is not None:
+                self.scalers[symbol] = stored
             else:
                 logger.error(
                     f"[{symbol}] 找不到預訓練的 Scaler，僅在記憶體中臨時計算 (不落盤)。"

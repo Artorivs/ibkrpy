@@ -7,6 +7,7 @@ import time
 from typing import Dict, Any
 from ib_insync import Order, LimitOrder, Stock, TagValue
 from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
+from ibkrpy.shared.session_clock import Session, build_session_clock
 import pandas as pd
 import numpy as np
 import logging
@@ -73,6 +74,8 @@ class TradingEngine:
         # σ 的唯一來源。模型輸出僅作為候選值，必須通過實現波動率的驗證。
         self.vol_estimator = build_volatility_estimator(self.config)
 
+        self.session_clock = build_session_clock(self.config)
+
         self.global_context = {}
         self.cached_funds = 0.0
         self.cached_net_liq = 0.0
@@ -131,22 +134,36 @@ class TradingEngine:
             liveness[name] = 1.0 if s is None else max(min(s / peak, 1.0), 0.0)
         return liveness
 
+    @property
+    def _extended_poll_multiplier(self) -> float:
+        return float(self.config.get("session_settings.extended_poll_multiplier", 3.0))
+
     def _poll_interval(self, symbol: str) -> int:
         term = self.symbol_terms.get(symbol, "long_term")
         default = _TERM_POLL_SECONDS.get(term, 3600)
         return int(self.config.get(f"general_settings.poll_seconds_{term}", default))
 
-    def should_tick(self, symbol: str) -> bool:
+    def should_tick(self, symbol: str, session=None) -> bool:
         """
         由 bar size 決定該不該真的去問 IBKR。持倉中的標的例外 —— 有部位時
         風險是實時的，不能等下一根 K 線。
+
+        非常規時段 (盤前/盤後/夜盤) 會拉長輪詢間隔: 那些時段的 K 線稀疏，
+        用日盤的頻率去問只會拿到同一根未完成的 bar，白白消耗 API 配額。
         """
+        if session is not None and not session.is_tradable:
+            return False
+
         if self.cached_positions.get(symbol):
             return True
         last = self._last_tick_at.get(symbol)
         if last is None:
             return True
-        return (time.time() - last) >= self._poll_interval(symbol)
+
+        interval = self._poll_interval(symbol)
+        if session is not None and session.is_extended:
+            interval = int(interval * self._extended_poll_multiplier)
+        return (time.time() - last) >= interval
 
     @staticmethod
     def _normalise_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
@@ -685,7 +702,7 @@ class TradingEngine:
             # 稍微等待 IBKR 系統同步取消狀態
             await asyncio.sleep(0.5)
 
-    async def run_tick(self, symbol: str):
+    async def run_tick(self, symbol: str, session=None):
         self._last_tick_at[symbol] = time.time()
 
         available_funds = self.cached_funds
@@ -902,9 +919,7 @@ class TradingEngine:
         _, model_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
         if isinstance(model_volatility, (list, np.ndarray)):
             model_volatility = (
-                float(model_volatility[0])
-                if len(model_volatility) > 0
-                else float("nan")
+                float(model_volatility[0]) if len(model_volatility) > 0 else float("nan")
             )
 
         if is_short_term:

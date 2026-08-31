@@ -95,11 +95,6 @@ class PipelineManager:
     def _refresh_benchmark_map(self):
         """
         解析每檔標的的 benchmark，並把所有用到的 benchmark 併進下載清單。
-
-        [修正] 舊版只把單一 general_settings.benchmark_symbol 加進 _reference_only。
-        改成 per-symbol 之後，可能同時用到 SMH / XLF / XLV 等多檔 ETF，
-        每一檔都必須先有歷史資料，否則 engineer_advanced_features 拿到空的
-        benchmark_df，bench_return / bench_correlation 兩欄就整個消失。
         """
         self._benchmark_for = {}
         for symbol in self._tradable:
@@ -128,11 +123,6 @@ class PipelineManager:
     def _correlation_candidates(self) -> list:
         """
         相關性法要比較的候選池。
-
-        [雞生蛋問題] CorrelationBenchmarkResolver 需要候選池的歷史資料才能運作，
-        但候選 ETF 只有在「被選中」之後才會進下載清單 —— 沒資料就選不中，
-        選不中就沒資料。因此候選池必須獨立下載，不能等它被選中。
-        只抓相關性計算用的那一個週期 (預設日 K)，把 API 成本壓到最低。
         """
         settings = self.config.get("benchmark_settings") or {}
         if not settings.get("enable_correlation", True):
@@ -334,14 +324,6 @@ class PipelineManager:
         price_rel = self.pipeline.classify_price_relative(df_adv, scale_cols)
         minmax_cols = [c for c in scale_cols if c not in price_rel]
 
-        self.pipeline.save_feature_manifest(
-            symbol,
-            scale_cols,
-            price_relative=price_rel,
-            target_mode="log_return",
-            target_scale=100.0,
-            benchmark=benchmark_symbol or self.benchmark_for(symbol),
-        )
         logger.info(
             f"	=> 特徵欄位: {len(scale_cols)} 個 "
             f"(價格相對 {len(price_rel)} / Min-Max {len(minmax_cols)})，目標: 對數報酬率"
@@ -350,7 +332,15 @@ class PipelineManager:
         split = int(len(df_adv) * 0.8)
         df_train = df_adv.iloc[:split]
 
-        self.pipeline.fit_scale(df_train, minmax_cols, symbol)
+        self.pipeline.save_training_artifacts(
+            symbol,
+            scaler=self.pipeline._compute_scaler(df_train, minmax_cols),
+            features=scale_cols,
+            price_relative=price_rel,
+            target_mode="log_return",
+            target_scale=100.0,
+            benchmark=benchmark_symbol or self.benchmark_for(symbol),
+        )
         df_scaled = self.pipeline.transform_scale(df_adv, minmax_cols, symbol)
 
         look_back = 60
@@ -482,7 +472,7 @@ class PipelineManager:
         (每次重算全序列指標) 改為向量化計算一次 —— 結果一致但快上數個量級。
         """
         import pandas_ta as ta
-        from ibkrpy.strategy.regime_detector import MarketRegimeDetector
+        from ibkrpy.strategy.strategy_components import MarketRegimeDetector
 
         d = MarketRegimeDetector()
         out = pd.Series("SIDEWAYS_QUIET", index=df.index, dtype=object)

@@ -190,29 +190,54 @@ async def live_trading_loop(
     """
     由 engine.should_tick() 依 bar size 決定該不該問：日 K 標的每小時一次、
     小時 K 每 15 分鐘一次、5 分 K 才每 5 分鐘一次。有持倉的標的不受節流限制。
-    掃描迴圈本身仍維持 1 分鐘一次，讓短線標的與持倉監控保持即時。
+
+    休市時進入 deepsleep —— 直接睡到下一個時段開始，而不是每分鐘醒來確認一次。
+    原本的迴圈完全不知道市場是否開盤，週末與假日照樣每 60 秒喚醒並呼叫
+    update_system_state()，一個週末就是 3,330 次無用的喚醒與 IBKR 請求。
     """
     offset = 0
     loop_seconds = 60
+    clock = engine.session_clock
+    last_session = None
+
     try:
         while True:
+            state = clock.state()
+
+            if not state.session.is_tradable:
+                # deepsleep。上限 6 小時是為了讓長睡眠仍能定期確認連線與日曆，
+                # 跨越長週末時會分成幾段睡完，而不是一次睡 79 小時。
+                nap = min(state.seconds_until_change, 6 * 3600)
+                logger.info(
+                    f"😴 {state.session.value} —— 深度休眠 {nap / 3600:.2f} 小時，"
+                    f"{state.next_change:%m-%d %H:%M} 進入 {state.next_session.value}"
+                )
+                await asyncio.sleep(max(nap, 1.0))
+                continue
+
+            if state.session is not last_session:
+                logger.info(f"🔔 進入 {state.session.value} 時段")
+                last_session = state.session
+
             await engine.update_system_state()
             # 輪替起點，避免資金耗盡時清單後段的標的長期被跳過
             order = symbols[offset:] + symbols[:offset]
             offset = (offset + 1) % max(len(symbols), 1)
 
-            due = [s for s in order if engine.should_tick(s)]
+            due = [s for s in order if engine.should_tick(s, state.session)]
             if due:
                 logger.info(
                     f"🔁 本輪待掃描 {len(due)}/{len(symbols)} 檔: {', '.join(due[:12])}"
                     + (" ..." if len(due) > 12 else "")
                 )
             for symbol in due:
-                await engine.run_tick(symbol)
+                await engine.run_tick(symbol, session=state.session)
                 await asyncio.sleep(0.5)
 
             engine.log_cycle_summary()
-            await asyncio.sleep(loop_seconds)
+
+            # 不要睡過時段邊界，否則開盤瞬間會遲到最多 60 秒。
+            await asyncio.sleep(min(loop_seconds, max(state.seconds_until_change, 1.0)))
     except asyncio.CancelledError:
         pass
 
