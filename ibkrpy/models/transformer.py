@@ -146,14 +146,11 @@ class TransformerModel:
 
         if os.path.exists(file_path):
             try:
-                # PositionalEmbedding 已透過 register_keras_serializable 註冊，
-                # 只要本模組被 import 過就不需要傳 custom_objects。
                 self.model = load_model(file_path)
                 self.is_trained = True
                 print(f"[{symbol}] Transformer 模型權重載入成功。")
                 return
             except Exception as e:
-                # 架構變更後，舊的 .keras 會在此失敗 —— 這是預期行為，需重新訓練。
                 print(f"❌ [{symbol}] Transformer 權重載入失敗: {e}")
                 print(
                     f"❌ [{symbol}] 若此檔為舊架構 (無位置編碼) 所存，請重新執行 --mode train。"

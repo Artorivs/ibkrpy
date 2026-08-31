@@ -137,11 +137,3 @@ class ModelTuner:
         except Exception as e:
             logger.warning(f"⚠️ Optuna 優化失敗: {e}")
             return {}, -999.0
-
-
-# 註：原 optimize_hyperparameters 與 select_best_model 已移除。
-#   - optimize_hyperparameters 的目標函式是 `-abs(look_back-60) + dropout*2`，
-#     沒有訓練任何模型，回傳的「最佳超參數」恆為 look_back=60 加最大 dropout。
-#   - select_best_model 對每個候選模型都套用同一組硬編碼的 simulated_perf，
-#     分數完全相同，永遠回傳 candidate_models[0]。
-#   兩者都未被 pipeline_manager 呼叫。留著只會讓人誤以為系統具備這些能力。

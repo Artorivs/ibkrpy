@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 class ModelOrchestrator:
     """管理各類預測模型 (LSTM, Transformer, ARIMA, GARCH) 的單例與生命週期"""
 
-    # 各模型類型對應的權重檔名樣板。ARIMA / GARCH / HMM 共用同一個整合包。
     _WEIGHT_FILE_PATTERNS = {
         "LSTM": "{symbol}_LSTM.keras",
         "Transformer": "{symbol}_Transformer.keras",
@@ -20,9 +19,6 @@ class ModelOrchestrator:
         "GARCH": "{symbol}_classical.pkl",
     }
 
-    # 沒有權重就完全不可用的模型。隨機初始化的神經網路輸出是純噪音，
-    # 絕不能參與 Ensemble 投票。
-    # ARIMA / GARCH 不在此列 —— 它們在缺少整合包時會退回實時擬合，那是合法的降級路徑。
     _REQUIRES_TRAINED_WEIGHTS = {"LSTM", "Transformer"}
 
     def __init__(self, model_factory, weights_dir: str = None, data_pipeline=None):

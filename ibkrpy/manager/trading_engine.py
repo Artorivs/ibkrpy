@@ -6,6 +6,7 @@ import math
 import time
 from typing import Dict, Any
 from ib_insync import Order, LimitOrder, Stock, TagValue
+from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
 import pandas as pd
 import numpy as np
 import logging
@@ -68,6 +69,9 @@ class TradingEngine:
             )
         self.benchmark_resolver = benchmark_resolver
         self._benchmark_logged = set()
+
+        # σ 的唯一來源。模型輸出僅作為候選值，必須通過實現波動率的驗證。
+        self.vol_estimator = build_volatility_estimator(self.config)
 
         self.global_context = {}
         self.cached_funds = 0.0
@@ -847,11 +851,6 @@ class TradingEngine:
             else:
                 regime = self.regime_detector.detect(df_adv)
 
-        # [關鍵修正] 風險閘門只擋「新增曝險」，不擋「減碼與出場」。
-        #
-        # 舊版在此無條件 return，於是 VIX 一旦衝破門檻，整個系統對既有持倉
-        # 完全失明 —— 而 VIX 飆升的時刻，正是最需要能夠出場的時刻。
-        # 風控的目的是限制風險，不是在風險最高時剝奪處置風險的能力。
         context = {
             "vix_series": macro_dict.get("VIX"),
             "current_price": current_price,
@@ -900,21 +899,37 @@ class TradingEngine:
                 f"根本解法是重新訓練 —— 見 PREDICTION_FIX.md。"
             )
 
-        _, annual_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
-        if isinstance(annual_volatility, (list, np.ndarray)):
-            annual_volatility = (
-                float(annual_volatility[0]) if len(annual_volatility) > 0 else 0.15
+        _, model_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
+        if isinstance(model_volatility, (list, np.ndarray)):
+            model_volatility = (
+                float(model_volatility[0])
+                if len(model_volatility) > 0
+                else float("nan")
             )
 
-        if pd.isna(annual_volatility) or annual_volatility <= 0:
-            annual_volatility = 0.15
-
         if is_short_term:
-            adjusted_volatility = annual_volatility / math.sqrt(252 * 78)
+            bars_per_year = 252 * 78
         elif term == "mid_term":
-            adjusted_volatility = annual_volatility / math.sqrt(252 * 6.5)
+            bars_per_year = 252 * 6.5
         else:
-            adjusted_volatility = annual_volatility / math.sqrt(252)
+            bars_per_year = 252
+
+        try:
+            model_vol_per_bar = float(model_volatility) / math.sqrt(bars_per_year)
+        except (TypeError, ValueError):
+            model_vol_per_bar = None
+
+        # df_adv 就是策略本輪使用的 K 線，實現波動率與它同尺度，
+        # 不需要任何去年化，因此沒有慣例可以搞錯。
+        vol = self.vol_estimator.estimate(symbol, df_adv, model_vol_per_bar)
+        adjusted_volatility = vol.value
+
+        logger.debug(
+            f"[{symbol}] σ={adjusted_volatility * 100:.3f}% "
+            f"(來源 {vol.source}; 實現 {vol.realized * 100:.3f}%"
+            + (f"; 模型/實現 ×{vol.ratio:.2f}" if vol.ratio is not None else "")
+            + ")"
+        )
 
         strategy = self.strategies.get(symbol)
         if not strategy:

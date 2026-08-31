@@ -64,7 +64,6 @@ class PipelineManager:
                 else ["AAPL"]
             )
 
-        # [DIP] 依賴抽象；未注入時退回「全部標的共用同一檔 benchmark」的舊行為。
         if benchmark_resolver is None:
             from ibkrpy.data.benchmark_resolver import StaticBenchmarkResolver
 
@@ -244,13 +243,6 @@ class PipelineManager:
 
             end_date_str = current_end_date.strftime("%Y%m%d %H:%M:%S")
 
-            # [修正] 舊版的重試迴圈是 pacing violation 的直接來源：
-            # IBKR 明文規定「15 秒內不得送出完全相同的歷史請求」，而舊版是
-            # 每 5 秒重送一次同樣的請求、連送 3 次。第 2、3 次必定違規，
-            # 而違規本身又是以 Error 162 回報 —— 於是重試把小失敗放大成連鎖失敗。
-            #
-            # 現在：重試間隔拉到 20 秒 (跨過 15 秒窗)，且只在「非合約性錯誤」時重試。
-            # 合約解析不了的標的，重試一萬次也不會成功。
             df_chunk = await self.ib_data.fetch_historical_data(
                 contract=contract,
                 end_datetime=end_date_str,
@@ -305,7 +297,6 @@ class PipelineManager:
             df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
             if not df_existing.empty:
-                # [修正] save_bulk_market_data 用的是 INSERT OR REPLACE，
                 df_combined = df_new
                 df_combined.sort_index(inplace=True)
                 self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
@@ -443,9 +434,6 @@ class PipelineManager:
             logger.warning(f"⚠️ [{symbol}] 資料量不足以進行有效訓練，跳過統計模型。")
             return
 
-        # [修正] 舊版此處用 os.path.abspath("weights") —— 相對於 cwd，
-        # 而 _train_dl_models 與 main.py 用的是專案根目錄的 WEIGHTS_DIR。
-        # cwd 不是專案根目錄時，訓練成果永遠載入不到。
         weights_dir = WEIGHTS_DIR
         os.makedirs(weights_dir, exist_ok=True)
 
@@ -476,12 +464,6 @@ class PipelineManager:
         except Exception as e:
             logger.warning(f"	⚠️ GARCH 訓練失敗: {e}")
 
-        # 註：原 HMM 訓練已移除。grep 確認 ModelOrchestrator.detect_regime
-        # 全專案只有定義處出現過一次，TradingEngine 從未呼叫 ——
-        # 實盤情境判定一律走 MarketRegimeDetector (ADX/SMA/ATR)。
-        # 每次重訓為一個沒有消費者的模型跑 100 次 EM 迭代是純粹的浪費。
-        # 若日後要啟用，請先把 detect_regime 接進 run_tick 再恢復此段。
-
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
 
@@ -500,7 +482,7 @@ class PipelineManager:
         (每次重算全序列指標) 改為向量化計算一次 —— 結果一致但快上數個量級。
         """
         import pandas_ta as ta
-        from ibkrpy.strategy.strategy_components import MarketRegimeDetector
+        from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 
         d = MarketRegimeDetector()
         out = pd.Series("SIDEWAYS_QUIET", index=df.index, dtype=object)
@@ -732,10 +714,6 @@ class PipelineManager:
             self.benchmark_resolver.invalidate()
             self._refresh_benchmark_map()
 
-        # [修正] 舊版在此原地複製了 _sync_symbol_term_data 的 90 行邏輯，
-        # 兩份程式碼已經開始分歧 (舊版這裡的 duration 一律用 "N D"，
-        # 沒有像 _sync_symbol_term_data 那樣轉成 Y/M 格式)，屬於明確的技術債。
-        # 現在統一走同一條路徑。
         skipped = []
         for symbol in self.symbols:
             logger.debug(f"[{symbol}] 檢核並同步最新市場資料...")
@@ -772,8 +750,6 @@ class PipelineManager:
         """階段二：多週期選拔 (Tournament-based Selection)，淘汰弱勢週期，適應並訓練最佳模型"""
         logger.info("[Pipeline] 啟動多週期選拔 (Term Tournament) 與 AI 訓練")
 
-        # 冷啟動時 __init__ 解析 benchmark 的當下資料庫還是空的，相關性法只能棄權。
-        # 資料下載完之後在這裡重新解析一次，讓它有機會真正發揮作用。
         if hasattr(self.benchmark_resolver, "invalidate"):
             self.benchmark_resolver.invalidate()
             self._refresh_benchmark_map()
@@ -881,8 +857,6 @@ class PipelineManager:
                         f"	-> 🔍 為了評估 {term}，發現資料空缺或過期，啟動即時下載..."
                     )
                     try:
-                        # [修正] 使用會檢查回傳值的 qualify()，避免帶著 conId=0 的
-                        # 空殼合約去請求歷史資料 (Error 162 的來源之一)
                         contract = await self.ib_data.qualify(symbol)
                         if contract is None:
                             logger.error(
