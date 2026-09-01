@@ -26,7 +26,7 @@ class ModelOrchestrator:
         :param model_factory: 具備 create_model(model_type) 的工廠
         :param weights_dir:   權重目錄。未指定時自動沿用 factory.weights_dir
         :param data_pipeline: (可選) DataPipeline 實例。傳入後，權重更新時會一併
-                              清掉對應的 scaler 快取 —— 否則會出現「新模型配舊 scaler」
+                              清掉對應的訓練產物快取 —— 否則會出現「新模型配舊 scaler」
                               的錯配，預測值會被還原到錯誤的價格區間。
         """
         self.factory = model_factory
@@ -82,15 +82,21 @@ class ModelOrchestrator:
             self._loaded_models.pop(k, None)
             self._loaded_mtimes.pop(k, None)
 
-        self._invalidate_scaler(symbol)
+        self._invalidate_artifacts(symbol)
 
-    def _invalidate_scaler(self, symbol: str):
-        """權重更新後，記憶體中的 scaler 也必須跟著重讀，否則會與新模型錯配"""
-        if self.pipeline is not None:
-            try:
-                self.pipeline.scalers.pop(symbol, None)
-            except Exception:
-                pass
+    def _invalidate_artifacts(self, symbol: str):
+        """
+        權重更新後，記憶體中的訓練產物也必須跟著重讀，否則會與新模型錯配。
+        """
+        if self.pipeline is None:
+            return
+        try:
+            self.pipeline.invalidate(symbol)
+        except Exception as e:
+            logger.warning(f"[{symbol}] 清除訓練產物快取失敗: {e}")
+
+    # 舊名稱保留為別名，避免外部呼叫端一起改動
+    _invalidate_scaler = _invalidate_artifacts
 
     def _is_model_usable(self, model, symbol: str, model_type: str) -> bool:
         """
@@ -146,7 +152,7 @@ class ModelOrchestrator:
             )
             self._loaded_models.pop(cache_key, None)
             self._loaded_mtimes.pop(cache_key, None)
-            self._invalidate_scaler(symbol)
+            self._invalidate_artifacts(symbol)
         else:
             logger.debug(f"[{symbol}] 載入 {model_type} 模型至記憶體...")
 
@@ -175,8 +181,9 @@ class ModelOrchestrator:
             logger.error(
                 f"[{symbol}] {model_type} 權重是以 {trained_features} 個特徵訓練的，"
                 f"但目前的特徵清單有 {len(expected)} 個 —— 兩者必須一致。"
-                f"該模型已被排除。請確認 weights/{symbol}_features.json 存在，"
-                f"且 ModelOrchestrator 有把 symbol 傳給工廠；否則請重新執行 --mode train。"
+                f"該模型已被排除。請確認 weights/_training_artifacts.json 中有 "
+                f"{symbol} 的 manifest，且 ModelOrchestrator 有把 symbol 傳給工廠；"
+                f"否則請重新執行 --mode train。"
             )
 
     # ------------------------------------------------------------------

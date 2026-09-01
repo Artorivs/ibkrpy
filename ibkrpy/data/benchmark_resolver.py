@@ -509,12 +509,7 @@ class DatabaseReturnsProvider(ReturnsProvider):
 
 class ManifestBenchmarkReader(BenchmarkReader):
     """
-    從 DataPipeline 的特徵清單 (weights/{symbol}_features.json) 讀出訓練時
-    實際使用的 benchmark。
-
-    這是最高權威的來源：模型權重就是配著那一檔 benchmark 訓練出來的。
-    比 benchmark_map.json 更可信 —— 對應表可能在重訓之間被改動，
-    但 manifest 是與 .keras 權重同時寫出的。
+    讀出訓練時實際使用的 benchmark。
     """
 
     def __init__(self, data_pipeline):
@@ -633,7 +628,7 @@ def build_benchmark_resolver(
 
     優先順序：
       1. 訓練時寫進特徵清單的選擇 (最高權威：權重就是配著它訓練的)
-      2. benchmark_map.json 的紀錄
+      2. _benchmark_map.json 的紀錄
       3. config 明確指定
       4. 產業 / 板塊 ETF 對應
       5. 歷史報酬相關性

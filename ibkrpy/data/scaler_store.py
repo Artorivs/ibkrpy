@@ -134,7 +134,7 @@ class _FileLock:
 
 class ConsolidatedScalerStore(ScalerStore):
     """
-    單一 weights/scalers.json
+    單一 weights/_scalers.json
 
         {
           "version": 1,
@@ -168,7 +168,7 @@ class ConsolidatedScalerStore(ScalerStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"scalers.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"_scalers.json 讀取失敗 ({self.path}): {e}")
             return self._cache or {}
 
     def _write_all(self, data: Dict[str, ScalerDict]) -> None:
@@ -256,5 +256,5 @@ def build_scaler_store(weights_dir: str, config=None) -> ScalerStore:
         return LegacyPerSymbolStore(weights_dir)
     legacy = LegacyPerSymbolStore(weights_dir)
     return ConsolidatedScalerStore(
-        os.path.join(weights_dir, s.get("filename", "scalers.json")), fallback=legacy
+        os.path.join(weights_dir, s.get("filename", "_scalers.json")), fallback=legacy
     )

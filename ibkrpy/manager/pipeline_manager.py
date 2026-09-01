@@ -77,7 +77,7 @@ class PipelineManager:
         self._refresh_benchmark_map()
 
         self.symbol_terms = {}
-        param_path = os.path.join(WEIGHTS_DIR, "global_best_params.json")
+        param_path = os.path.join(WEIGHTS_DIR, "_global_best_params.json")
         if os.path.exists(param_path):
             try:
                 with open(param_path, "r", encoding="utf-8") as f:
@@ -472,7 +472,7 @@ class PipelineManager:
         (每次重算全序列指標) 改為向量化計算一次 —— 結果一致但快上數個量級。
         """
         import pandas_ta as ta
-        from ibkrpy.strategy.strategy_components import MarketRegimeDetector
+        from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 
         d = MarketRegimeDetector()
         out = pd.Series("SIDEWAYS_QUIET", index=df.index, dtype=object)
@@ -954,7 +954,7 @@ class PipelineManager:
             weights_dir = WEIGHTS_DIR
             os.makedirs(weights_dir, exist_ok=True)
 
-            param_path = os.path.join(weights_dir, "global_best_params.json")
+            param_path = os.path.join(weights_dir, "_global_best_params.json")
             global_params = {}
             if os.path.exists(param_path):
                 try:

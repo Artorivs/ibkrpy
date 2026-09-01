@@ -74,15 +74,13 @@ _NEVER_PRICE_RELATIVE = (
 class DataPipeline:
     """負責數據的本地快取存取，以及機器學習所需的預處理"""
 
-    def __init__(self, artifact_store=None):
+    def __init__(self, artifact_store=None, config=None):
         self.scalers: Dict[str, Dict] = {}
-
+        self.config = config
         if artifact_store is None:
             from ibkrpy.data.artifact_store import build_artifact_store
 
-            artifact_store = build_artifact_store(
-                WEIGHTS_DIR, getattr(self, "config", None)
-            )
+            artifact_store = build_artifact_store(WEIGHTS_DIR, config)
         self.artifacts = artifact_store
         self._manifests: Dict[str, List[str]] = {}
 
@@ -210,10 +208,6 @@ class DataPipeline:
 
         return out
 
-    def _manifest_path(self, symbol: str) -> str:
-        """僅供舊工具與測試參考。實際讀寫一律經由 self.artifacts。"""
-        return os.path.join(WEIGHTS_DIR, f"{symbol}_features.json")
-
     def save_feature_manifest(
         self,
         symbol: str,
@@ -321,7 +315,9 @@ class DataPipeline:
         )
 
     def invalidate(self, symbol: str = None):
-        """清除記憶體快取。重訓後必須呼叫，否則會用舊 scaler 配新模型。"""
+        """
+        清除記憶體快取。重訓後必須呼叫，否則會用舊 scaler 配新模型。
+        """
         if symbol is None:
             self.scalers.clear()
             self._manifests.clear()

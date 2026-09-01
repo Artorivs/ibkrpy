@@ -919,7 +919,9 @@ class TradingEngine:
         _, model_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
         if isinstance(model_volatility, (list, np.ndarray)):
             model_volatility = (
-                float(model_volatility[0]) if len(model_volatility) > 0 else float("nan")
+                float(model_volatility[0])
+                if len(model_volatility) > 0
+                else float("nan")
             )
 
         if is_short_term:

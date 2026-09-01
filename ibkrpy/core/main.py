@@ -117,7 +117,7 @@ def _build_benchmark_stack(config, db_manager, data_pipeline):
     要改規則只改這一個函式。
     """
     weights_dir = os.path.join(project_root, "weights")
-    store = JsonBenchmarkStore(os.path.join(weights_dir, "benchmark_map.json"))
+    store = JsonBenchmarkStore(os.path.join(weights_dir, "_benchmark_map.json"))
     resolver = build_benchmark_resolver(
         config=config,
         db_manager=db_manager,
@@ -134,7 +134,7 @@ async def run_pipeline_mode(
 ):
     config = ConfigManager()
     db_manager = DatabaseManager()
-    data_pipeline = DataPipeline()
+    data_pipeline = DataPipeline(config=config)
     ext_fetcher = ExternalDataFetcher(
         fred_api_key=config.get("api_keys_settings.fred_api_key")
     )
@@ -249,7 +249,7 @@ async def run_live_mode(args):
         fred_api_key=config.get("api_keys_settings.fred_api_key")
     )
     market_analyzer = MarketAnalyzer(db_manager=db_manager, config_manager=config)
-    data_pipeline = DataPipeline()
+    data_pipeline = DataPipeline(config=config)
     regime_detector = MarketRegimeDetector(config.get("regime_settings") or {})
 
     ib_manager = IBKRDataManager(
@@ -315,7 +315,7 @@ async def run_live_mode(args):
     symbol_terms = {}
 
     global_params_path = os.path.join(
-        project_root, "weights", "global_best_params.json"
+        project_root, "weights", "_global_best_params.json"
     )
     global_params = {}
     if os.path.exists(global_params_path):

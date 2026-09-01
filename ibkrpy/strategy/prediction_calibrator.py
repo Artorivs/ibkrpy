@@ -365,6 +365,6 @@ def build_prediction_history(config, weights_dir: str) -> PredictionHistoryStore
     maxlen = int(s.get("history_length", 500))
     if s.get("persist_history", True):
         return JsonPredictionHistory(
-            os.path.join(weights_dir, "prediction_history.json"), maxlen=maxlen
+            os.path.join(weights_dir, "_prediction_history.json"), maxlen=maxlen
         )
     return InMemoryPredictionHistory(maxlen=maxlen)

@@ -3,7 +3,7 @@
 #
 # 檔案佈局
 # --------
-#   weights/training_artifacts.json
+#   weights/_training_artifacts.json
 #   {
 #     "version": 1,
 #     "artifacts": {
@@ -75,13 +75,26 @@ class ArtifactStore(ABC):
 class NullArtifactStore(ArtifactStore):
     """不落盤。walk-forward 與測試使用。"""
 
-    def load_scaler(self, symbol): return None
-    def load_manifest(self, symbol): return None
-    def save_scaler(self, symbol, scaler): pass
-    def save_manifest(self, symbol, manifest): pass
-    def save_bundle(self, symbol, scaler=None, manifest=None): pass
-    def delete(self, symbol): pass
-    def symbols(self): return []
+    def load_scaler(self, symbol):
+        return None
+
+    def load_manifest(self, symbol):
+        return None
+
+    def save_scaler(self, symbol, scaler):
+        pass
+
+    def save_manifest(self, symbol, manifest):
+        pass
+
+    def save_bundle(self, symbol, scaler=None, manifest=None):
+        pass
+
+    def delete(self, symbol):
+        pass
+
+    def symbols(self):
+        return []
 
 
 class LegacyFileStore(ArtifactStore):
@@ -113,10 +126,17 @@ class LegacyFileStore(ArtifactStore):
         with open(self._path(symbol, kind), "w", encoding="utf-8") as f:
             json.dump(blob, f, indent=4, ensure_ascii=False)
 
-    def load_scaler(self, symbol): return self._read(symbol, SCALER)
-    def load_manifest(self, symbol): return self._read(symbol, MANIFEST)
-    def save_scaler(self, symbol, scaler): self._write(symbol, SCALER, scaler)
-    def save_manifest(self, symbol, manifest): self._write(symbol, MANIFEST, manifest)
+    def load_scaler(self, symbol):
+        return self._read(symbol, SCALER)
+
+    def load_manifest(self, symbol):
+        return self._read(symbol, MANIFEST)
+
+    def save_scaler(self, symbol, scaler):
+        self._write(symbol, SCALER, scaler)
+
+    def save_manifest(self, symbol, manifest):
+        self._write(symbol, MANIFEST, manifest)
 
     def save_bundle(self, symbol, scaler=None, manifest=None):
         # 舊格式本質上做不到跨檔原子性，這正是要遷移的理由之一。
@@ -141,6 +161,104 @@ class LegacyFileStore(ArtifactStore):
                 if name.endswith(suffix):
                     found.add(name[: -len(suffix)])
         return sorted(found)
+
+
+class LegacyScalersJsonStore(ArtifactStore):
+    """
+    過渡格式: weights/_scalers.json ({"version":1,"scalers":{...}})。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._cache: Dict[str, ScalerDict] = {}
+        self._mtime: float = -1.0
+
+    def _read_all(self) -> Dict[str, ScalerDict]:
+        if not os.path.exists(self.path):
+            return {}
+        try:
+            mtime = os.path.getmtime(self.path)
+            if mtime == self._mtime and self._cache:
+                return self._cache
+            with open(self.path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+            data = blob.get("scalers", {}) if isinstance(blob, dict) else {}
+            self._cache, self._mtime = data, mtime
+            return data
+        except Exception as e:
+            logger.error(f"_scalers.json 讀取失敗 ({self.path}): {e}")
+            return self._cache or {}
+
+    def load_scaler(self, symbol):
+        return self._read_all().get(symbol)
+
+    def load_manifest(self, symbol):
+        return None  # 此格式不含 manifest
+
+    def save_scaler(self, symbol, scaler):
+        pass  # 唯讀
+
+    def save_manifest(self, symbol, manifest):
+        pass
+
+    def save_bundle(self, symbol, scaler=None, manifest=None):
+        pass
+
+    def delete(self, symbol):
+        pass
+
+    def symbols(self):
+        return sorted(self._read_all().keys())
+
+
+class ChainedArtifactStore(ArtifactStore):
+    """
+    依序嘗試多個唯讀退路。第一個給出非 None 的就採用。
+    """
+
+    def __init__(self, stores: List[ArtifactStore]):
+        self.stores = [s for s in stores if s is not None]
+
+    def _first(self, method: str, symbol: str):
+        for st in self.stores:
+            try:
+                blob = getattr(st, method)(symbol)
+            except Exception:
+                continue
+            if blob is not None:
+                return blob
+        return None
+
+    def load_scaler(self, symbol):
+        return self._first("load_scaler", symbol)
+
+    def load_manifest(self, symbol):
+        return self._first("load_manifest", symbol)
+
+    def save_scaler(self, symbol, scaler):
+        pass
+
+    def save_manifest(self, symbol, manifest):
+        pass
+
+    def save_bundle(self, symbol, scaler=None, manifest=None):
+        pass
+
+    def delete(self, symbol):
+        for st in self.stores:
+            try:
+                st.delete(symbol)
+            except Exception:
+                pass
+
+    def symbols(self):
+        out = set()
+        for st in self.stores:
+            try:
+                out.update(st.symbols())
+            except Exception:
+                pass
+        return sorted(out)
 
 
 class _FileLock:
@@ -213,7 +331,7 @@ class ConsolidatedArtifactStore(ArtifactStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"training_artifacts.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"_training_artifacts.json 讀取失敗 ({self.path}): {e}")
             return self._cache or {}
 
     def _write_all(self, data: Dict[str, dict]) -> None:
@@ -327,11 +445,17 @@ class ConsolidatedArtifactStore(ArtifactStore):
         for sym, entry in self._read_all().items():
             has_s = entry.get(SCALER) is not None
             has_m = entry.get(MANIFEST) is not None
-            key = "paired" if (has_s and has_m) else ("scaler_only" if has_s else "manifest_only")
+            key = (
+                "paired"
+                if (has_s and has_m)
+                else ("scaler_only" if has_s else "manifest_only")
+            )
             out[key].append(sym)
         return {k: sorted(v) for k, v in out.items()}
 
-    def migrate_from(self, legacy: ArtifactStore, remove_old: bool = False) -> Tuple[int, int]:
+    def migrate_from(
+        self, legacy: ArtifactStore, remove_old: bool = False
+    ) -> Tuple[int, int]:
         """把舊的逐檔產物併入單一檔案。回傳 (標的數, 產物數)。可重複執行。"""
         syms = moved = 0
         with _FileLock(self.path):
@@ -368,13 +492,45 @@ class ConsolidatedArtifactStore(ArtifactStore):
         return syms, moved
 
 
+def _setting(config, key: str, default):
+    """
+    config 可能是 dict，也可能是 ConfigManager (用點路徑的 get)。
+    兩種都要能讀，否則設定值會靜默地取不到 —— DataPipeline 過去
+    用 getattr(self, "config", None) 拿設定，而它根本沒有 config 屬性，
+    結果 scaler_settings.filename 從來沒被讀過。
+    """
+    if config is None:
+        return default
+    try:
+        val = config.get(f"scaler_settings.{key}")
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    try:
+        section = config.get("scaler_settings")
+        if isinstance(section, dict) and key in section:
+            return section[key]
+    except Exception:
+        pass
+    return default
+
+
 def build_artifact_store(weights_dir: str, config=None) -> ArtifactStore:
-    """Composition Root 使用。預設合併格式，並保留舊格式的讀取退路。"""
-    s = (config.get("scaler_settings") or {}) if config else {}
-    legacy = LegacyFileStore(weights_dir)
-    if not s.get("consolidated", True):
-        return legacy
+    """
+    Composition Root 使用。預設合併格式，並保留所有舊格式的讀取退路。
+    """
+    legacy_files = LegacyFileStore(weights_dir)
+    if not _setting(config, "consolidated", True):
+        return legacy_files
+
+    filename = _setting(config, "filename", "_training_artifacts.json")
+    fallback = ChainedArtifactStore(
+        [
+            LegacyScalersJsonStore(os.path.join(weights_dir, "_scalers.json")),
+            legacy_files,
+        ]
+    )
     return ConsolidatedArtifactStore(
-        os.path.join(weights_dir, s.get("filename", "training_artifacts.json")),
-        fallback=legacy,
+        os.path.join(weights_dir, filename), fallback=fallback
     )

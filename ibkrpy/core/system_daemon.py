@@ -198,7 +198,6 @@ class SystemDaemon:
             rc = await proc.wait()
             if rc == 0:
                 self.logger.info("✅ 重訓子行程正常結束。")
-                # 權重已更新：清掉記憶體中的模型與 scaler，讓下一輪載入新版本
                 self.engine.models.invalidate()
                 self.logger.info("已清除模型快取，下一輪將載入新權重。")
                 return True
