@@ -8,7 +8,6 @@ import joblib
 import warnings
 from statsmodels.tsa.arima.model import ARIMA, ARIMAResultsWrapper
 
-# 抑制 statsmodels 的收斂與日期索引警告
 warnings.filterwarnings("ignore")
 
 
@@ -49,18 +48,15 @@ class ARIMAModel:
         series = df["Close"].dropna()
         last_price = float(series.iloc[-1])
 
-        # 確保數據量大於 ARIMA 的最大滯後階數
         if len(series) < max(self.order) + 1:
             return last_price
 
         try:
             if self.model_results is not None:
-                # 模式 1: 使用已保存的模型，灌入最新數據更新狀態並預測
                 updated_model = self.model_results.apply(series.values)
                 forecast = updated_model.forecast(steps=1)
                 return float(forecast[0])
             else:
-                # 模式 2: 實時擬合 (Fallback)
                 model = ARIMA(series.values, order=self.order)
                 res = model.fit()
                 forecast = res.forecast(steps=1)
@@ -68,7 +64,7 @@ class ARIMAModel:
 
         except Exception as e:
             print(f"ARIMA 預測失敗: {e}")
-            return last_price  # 發生任何錯誤時，回退到最後已知價格
+            return last_price
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
         """Fallback：計算歷史波動率 (ARIMA 本身不負責波動率)"""

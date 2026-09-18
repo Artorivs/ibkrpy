@@ -36,8 +36,8 @@ class RateLimitFilter(logging.Filter):
     def __init__(self, interval_seconds: int = 1800):
         super().__init__()
         self.interval = interval_seconds
-        self._last = {}  # key -> 上次放行的時間
-        self._suppressed = {}  # key -> 期間被抑制的次數
+        self._last = {}
+        self._suppressed = {}
 
     def filter(self, record: logging.LogRecord) -> bool:
         import time
@@ -68,13 +68,6 @@ def setup_logger(
     :param config: config.yaml 中 log_settings 區塊的內容 (dict)。
                    例如 ConfigManager().get("log_settings")
     :param enable_file: 是否掛載檔案 handler。
-
-    [修正] RotatingFileHandler 不是多行程安全的 —— 輪替時是「重新命名再開新檔」，
-    兩個行程同時觸發，其中一方會繼續寫入已被改名的 inode，那段日誌就此消失。
-    daemon 主行程與重訓子行程都會呼叫本函式，因此子行程必須傳 enable_file=False。
-    子行程的 stdout 本來就由 SystemDaemon 逐行轉發進日誌，重複寫檔既冗餘又危險。
-
-    導入 QueueListener 實現非阻塞架構，確保寫檔與寄送 Email 不會卡死 asyncio 迴圈。
     """
     global _log_listener
     cfg = config or {}
@@ -84,7 +77,6 @@ def setup_logger(
         return logger
 
     logger.setLevel(logging.DEBUG)
-    # 不向 root 傳遞，避免第三方套件呼叫 basicConfig() 後造成重複輸出
     logger.propagate = False
 
     formatter = logging.Formatter(
@@ -92,7 +84,6 @@ def setup_logger(
     )
     io_handlers = []
 
-    # 1. 控制台輸出 —— 等級改由 log_settings.level 決定
     console_level = getattr(
         logging, str(cfg.get("level", "INFO")).upper(), logging.INFO
     )
@@ -101,7 +92,6 @@ def setup_logger(
     console_handler.setFormatter(formatter)
     io_handlers.append(console_handler)
 
-    # 2. 檔案輸出 (DEBUG 及以上，帶有自動輪轉機制)
     if enable_file:
         log_dir = os.path.join(PROJECT_ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -117,12 +107,10 @@ def setup_logger(
         file_handler.setFormatter(formatter)
         io_handlers.append(file_handler)
 
-    # 3. Email 警報機制 (僅 ERROR 與 CRITICAL)
     if cfg.get("enable_email_alerts"):
         required = ("smtp_server", "sender_email", "receiver_email", "sender_password")
         missing = [k for k in required if not cfg.get(k)]
         if missing:
-            # 明確報錯，而不是靜默跳過
             logging.getLogger("ibkrpy").error(
                 f"已啟用 email 警報，但 log_settings 缺少必要欄位: {missing}，警報未生效。"
             )
@@ -137,7 +125,6 @@ def setup_logger(
             )
             mail_handler.setLevel(logging.ERROR)
             mail_handler.setFormatter(formatter)
-            # 只對 email 套用節流；控制台與檔案仍完整記錄每一次事件
             mail_handler.addFilter(
                 RateLimitFilter(
                     interval_seconds=int(cfg.get("alert_throttle_minutes", 30)) * 60
@@ -155,5 +142,4 @@ def setup_logger(
     return logger
 
 
-# 提供一個全域實例供其他模組導入
 global_logger = logging.getLogger("ibkrpy")

@@ -43,20 +43,19 @@ class MarketAnalyzer:
         (建議在 trading_engine 的每一輪迴圈開頭呼叫一次，然後傳給各個標的)
         """
         context = {
-            "correlation_matrix": {},  # 標的間的相關係數矩陣
-            "beta_values": {},  # 各標的相對於大盤的 Beta 值 (系統性風險)
-            "macro_trend": "NEUTRAL",  # 大盤短期趨勢
-            "symbols": [],  # 納入本次計算的標的
-            "optimal_weights": {},  # 投資組合最佳化目標權重 (總和為 1)
-            "risk_parity_tilt": {},  # 相對傾斜倍數 (平均為 1.0)
-            "is_valid": False,  # 數據是否足夠計算
+            "correlation_matrix": {},
+            "beta_values": {},
+            "macro_trend": "NEUTRAL",
+            "symbols": [],
+            "optimal_weights": {},
+            "risk_parity_tilt": {},
+            "is_valid": False,
         }
 
         symbols = [p.symbol for p in self.config.asset_profiles]
         if not symbols:
             return context
 
-        # 1. 獲取所有標的近期的收盤價並對齊
         price_dict = {}
         for profile in self.config.asset_profiles:
             sym = profile.symbol
@@ -69,7 +68,6 @@ class MarketAnalyzer:
         if not price_dict:
             return context
 
-        # 2. 組裝成 DataFrame 並計算對數報酬率
         prices_df = pd.DataFrame(price_dict).ffill().dropna()
         if len(prices_df) < 10:
             logger.warning(
@@ -81,11 +79,9 @@ class MarketAnalyzer:
         returns_df = np.log(prices_df / prices_df.shift(1)).dropna()
         context["is_valid"] = True
 
-        # 3. 計算相關係數矩陣
         corr_matrix = returns_df.corr()
         context["correlation_matrix"] = corr_matrix.to_dict()
 
-        # 4. 評估大盤宏觀趨勢與 Beta 值
         if self.benchmark_symbol in prices_df.columns:
             benchmark_cum_ret = (
                 prices_df[self.benchmark_symbol].iloc[-1]
@@ -105,8 +101,6 @@ class MarketAnalyzer:
                     else:
                         context["beta_values"][sym] = 1.0
 
-        # 6. 投資組合最佳化: 基於風險平價 (Risk Parity / Inverse Variance)
-        # 讓波動大的股票權重小，波動小的股票權重大，實現整體 Portfolio 波動率最小化與夏普最大化
         variances = returns_df.var()
         if not variances.empty:
             variances = variances.replace(0, 1e-6)
@@ -145,13 +139,10 @@ class MarketAnalyzer:
         if not context.get("is_valid") or symbol not in context.get("symbols", []):
             return analysis
 
-        # 目標部位 = 基準大小 × 風險平價傾斜。低波動標的拿到較大部位，
-        # 高波動標的較小，但兩者都圍繞在一個明確、可設定的基準值附近。
         tilt = context.get("risk_parity_tilt", {}).get(symbol, 1.0)
         analysis["risk_parity_tilt"] = tilt
         analysis["target_weight"] = self.base_position_pct * tilt
 
-        # --- A. 大盤宏觀對齊與 Beta 風險分析 ---
         macro_trend = context.get("macro_trend", "NEUTRAL")
         beta = context.get("beta_values", {}).get(symbol, 1.0)
         analysis["macro_alignment"] = macro_trend
@@ -179,7 +170,6 @@ class MarketAnalyzer:
                     f"防禦屬性: 該標的 Beta 較低 ({beta:.2f})，具備一定的抗跌能力。"
                 )
 
-        # --- B. 投資組合過度集中風險 (Portfolio Concentration Risk) ---
         corr_matrix = context.get("correlation_matrix", {})
 
         if current_positions and symbol in corr_matrix:

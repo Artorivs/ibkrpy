@@ -15,14 +15,10 @@ WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "weights")
 
 logger = logging.getLogger("ibkrpy")
 
-# 永遠不會進入模型的欄位 (資料庫識別欄位)
 _EXCLUDED_FEATURES = {"symbol", "timeframe"}
 
-# 基礎價量欄位，永遠排在特徵清單最前面以保證順序穩定
 _BASE_FEATURES = ["Open", "High", "Low", "Close", "Volume"]
 
-# 與價格等比例縮放的欄位 (名稱前綴)。涵蓋 add_technical_indicators 產生的所有
-# 價格量綱指標：移動平均、布林上中下軌、ATR、MACD 等。
 _PRICE_RELATIVE_PREFIXES = (
     "Open",
     "High",
@@ -37,20 +33,19 @@ _PRICE_RELATIVE_PREFIXES = (
     "VWAP",
     "BBL_",
     "BBM_",
-    "BBU_",  # 布林上中下軌 (價格量綱)
+    "BBU_",
     "ATR_",
     "ATRr_",
     "TRUERANGE",
     "MACD_",
     "MACDh_",
-    "MACDs_",  # MACD 三線皆為價格差量綱
+    "MACDs_",
     "HL2",
     "HLC3",
     "OHLC4",
     "STDEV",
 )
 
-# 明確不隨價格縮放的欄位 (振盪指標、比例、外部數據)
 _NEVER_PRICE_RELATIVE = (
     "Volume",
     "RSI_",
@@ -76,6 +71,7 @@ class DataPipeline:
 
     def __init__(self, artifact_store=None, config=None):
         self.scalers: Dict[str, Dict] = {}
+
         self.config = config
         if artifact_store is None:
             from ibkrpy.data.artifact_store import build_artifact_store
@@ -84,9 +80,6 @@ class DataPipeline:
         self.artifacts = artifact_store
         self._manifests: Dict[str, List[str]] = {}
 
-    # ------------------------------------------------------------------
-    # 特徵工程
-    # ------------------------------------------------------------------
 
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """使用 pandas_ta 快速計算技術指標"""
@@ -98,7 +91,6 @@ class DataPipeline:
         df_copy.ta.rsi(length=14, append=True)
         df_copy.ta.atr(length=14, append=True)
 
-        # 增加 MACD 與 布林通道，增強對 5m 雜訊的過濾能力
         df_copy.ta.macd(fast=12, slow=26, signal=9, append=True)
         df_copy.ta.bbands(length=20, std=2, append=True)
         return df_copy.dropna()
@@ -112,7 +104,6 @@ class DataPipeline:
         """進階特徵工程：融合技術指標、大盤相關性與宏觀經濟數據"""
         df_adv = self.add_technical_indicators(df)
 
-        # 1. 跨資產相關性 (例如 QQQ 大盤表現)
         if benchmark_df is not None and not benchmark_df.empty:
             bench_ret = np.log(benchmark_df["Close"] / benchmark_df["Close"].shift(1))
             df_adv["bench_return"] = bench_ret.reindex(df_adv.index).fillna(0)
@@ -121,7 +112,6 @@ class DataPipeline:
                 stock_ret.rolling(20).corr(df_adv["bench_return"]).fillna(0)
             )
 
-        # 2. 宏觀數據 (例如 VIX 恐慌指數)
         if macro_dict:
             for name, series in macro_dict.items():
                 if series is not None and not series.empty:
@@ -129,9 +119,6 @@ class DataPipeline:
 
         return df_adv.dropna()
 
-    # ------------------------------------------------------------------
-    # 特徵清單 (Manifest)
-    # ------------------------------------------------------------------
 
     def select_model_features(self, df: pd.DataFrame) -> List[str]:
         """
@@ -152,7 +139,6 @@ class DataPipeline:
             series = df[col].replace([np.inf, -np.inf], np.nan)
             if series.isna().any():
                 continue
-            # 全常數欄位沒有資訊量，且會讓 Min-Max 退化成 0.5
             if float(series.max()) == float(series.min()):
                 continue
             extras.append(col)
@@ -193,7 +179,6 @@ class DataPipeline:
             ):
                 continue
 
-            # 未知欄位的保守數值判準
             if col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
                 continue
             ratio = (df[col] / close).replace([np.inf, -np.inf], np.nan).dropna()
@@ -221,8 +206,8 @@ class DataPipeline:
         manifest = {
             "features": list(features),
             "price_relative": list(price_relative or []),
-            "target_mode": target_mode,  # "log_return" 或 "level"
-            "target_scale": target_scale,  # log_return 乘上的倍率 (100 = 百分比)
+            "target_mode": target_mode,
+            "target_scale": target_scale,
             "benchmark": (str(benchmark).upper() if benchmark else None),
         }
         self.artifacts.save_manifest(symbol, manifest)
@@ -317,6 +302,10 @@ class DataPipeline:
     def invalidate(self, symbol: str = None):
         """
         清除記憶體快取。重訓後必須呼叫，否則會用舊 scaler 配新模型。
+
+        scaler 與 manifest 必須一起清 —— 它們是同一次訓練的兩半。只清一半
+        會在記憶體裡重建磁碟上已經消滅的錯配 (model_orchestrator 以前就是
+        只 pop scalers)。外部模組請一律呼叫本方法，不要直接動這兩個 dict。
         """
         if symbol is None:
             self.scalers.clear()
@@ -325,9 +314,6 @@ class DataPipeline:
             self.scalers.pop(symbol, None)
             self._manifests.pop(symbol, None)
 
-    # ------------------------------------------------------------------
-    # 特徵縮放
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _compute_scaler(
@@ -471,7 +457,6 @@ class DataPipeline:
         if mode == "log_return":
             scale = float(manifest.get("target_scale", 100.0)) or 100.0
             log_ret = float(raw) / scale
-            # 單根 K 線的對數報酬超過 ±0.5 (約 ±65%) 必為模型失效
             if abs(log_ret) > 0.5:
                 logger.warning(
                     f"[{symbol}] 模型輸出的報酬率異常 ({log_ret:.3f})，已剔除。"
@@ -479,12 +464,8 @@ class DataPipeline:
                 return None
             return float(current_price * np.exp(log_ret))
 
-        # 舊格式 (價格水位) 的相容路徑
         return self.inverse_transform_scale(raw, "Close", symbol)
 
-    # ------------------------------------------------------------------
-    # 序列建構
-    # ------------------------------------------------------------------
 
     def create_sequences(
         self,

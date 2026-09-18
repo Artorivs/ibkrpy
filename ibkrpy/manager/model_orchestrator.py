@@ -36,14 +36,9 @@ class ModelOrchestrator:
             model_factory, "weights_dir", "weights"
         )
 
-        # Cache: { "AAPL_LSTM": model_instance }
         self._loaded_models: Dict[str, Any] = {}
-        # 對應的權重檔 mtime: { "AAPL_LSTM": 1712345678.9 }
         self._loaded_mtimes: Dict[str, float] = {}
 
-    # ------------------------------------------------------------------
-    # 快取管理
-    # ------------------------------------------------------------------
 
     def _weight_path(self, symbol: str, model_type: str) -> Optional[str]:
         pattern = self._WEIGHT_FILE_PATTERNS.get(model_type)
@@ -95,7 +90,6 @@ class ModelOrchestrator:
         except Exception as e:
             logger.warning(f"[{symbol}] 清除訓練產物快取失敗: {e}")
 
-    # 舊名稱保留為別名，避免外部呼叫端一起改動
     _invalidate_scaler = _invalidate_artifacts
 
     def _is_model_usable(self, model, symbol: str, model_type: str) -> bool:
@@ -181,14 +175,11 @@ class ModelOrchestrator:
             logger.error(
                 f"[{symbol}] {model_type} 權重是以 {trained_features} 個特徵訓練的，"
                 f"但目前的特徵清單有 {len(expected)} 個 —— 兩者必須一致。"
-                f"該模型已被排除。請確認 weights/_training_artifacts.json 中有 "
+                f"該模型已被排除。請確認 weights/training_artifacts.json 中有 "
                 f"{symbol} 的 manifest，且 ModelOrchestrator 有把 symbol 傳給工廠；"
                 f"否則請重新執行 --mode train。"
             )
 
-    # ------------------------------------------------------------------
-    # 預測介面
-    # ------------------------------------------------------------------
 
     def predict(
         self, symbol: str, df: pd.DataFrame, model_type: str = "LSTM"
@@ -201,10 +192,8 @@ class ModelOrchestrator:
             return 0.0, 0.0
 
         try:
-            # 載入找不到整合包時會主動拋錯
             model = self._get_or_load_model(symbol, model_type)
 
-            # 未訓練的神經網路一律拒絕出手
             if not self._is_model_usable(model, symbol, model_type):
                 logger.warning(
                     f"[{symbol}] ⛔ {model_type} 尚未訓練，已排除於 Ensemble 之外。"
@@ -216,6 +205,5 @@ class ModelOrchestrator:
             return prediction, volatility
         except Exception as e:
             logger.warning(f"[{symbol}] {model_type} 數值預測失敗: {e}")
-            # 模型失效時的安全回退機制 (Fallback)
             current_price = df["Close"].iloc[-1]
             return current_price, 0.02

@@ -18,7 +18,6 @@ class DatabaseManager:
     """輕量化 SQLite 非同步/同步雙軌管理器 (具備 WAL 併發防護與 Upsert 增量寫入)"""
 
     def __init__(self, db_path: str = None):
-        # 統一將資料庫路徑綁定在專案目錄下
         self.db_path = db_path or DEFAULT_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 

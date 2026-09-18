@@ -24,10 +24,10 @@ class RegimeAssessment:
     """
 
     regime: MarketRegime
-    reversal_risk: float = 0.0  # 0~1，趨勢反轉的近期風險
-    trend_strength: float = 0.0  # 0~1，由 ADX 正規化而來
+    reversal_risk: float = 0.0
+    trend_strength: float = 0.0
     bars_in_regime: int = 0
-    raw_regime: MarketRegime = MarketRegime.SIDEWAYS_QUIET  # 未經遲滯的即時判定
+    raw_regime: MarketRegime = MarketRegime.SIDEWAYS_QUIET
     reasons: List[str] = field(default_factory=list)
 
     @property
@@ -151,7 +151,6 @@ class ReversalRiskModel:
         norm = float(positive.median())
         if norm <= 0:
             return 0.0
-        # 斜率從常態正值降到 0 → 0.7 分；轉為同幅度負值 → 滿分
         return _clamp01((norm - now) / (2.0 * norm))
 
     @staticmethod
@@ -165,7 +164,6 @@ class ReversalRiskModel:
         if not np.isfinite(ma_fast) or ma_fast <= 0:
             return 0.0
         gap = (ma_fast - last) / ma_fast
-        # 跌破 3% 視為滿分
         return _clamp01(gap / 0.03)
 
     @staticmethod
@@ -276,11 +274,9 @@ class MarketRegimeDetector:
         self.adx_threshold = float(cfg.get("regime_adx_trend_threshold", 20.0))
         self.vol_threshold = float(cfg.get("regime_volatility_threshold_pct", 0.02))
 
-        # 非對稱確認：轉空比轉多快。這是刻意的防禦性偏誤。
         self.bull_confirm_bars = int(cfg.get("regime_bull_confirm_bars", 3))
         self.bear_confirm_bars = int(cfg.get("regime_bear_confirm_bars", 1))
 
-        # 盤中重複評估時，未收盤的當根 K 會讓均線交叉反覆穿越。
         self.use_closed_bars_only = bool(cfg.get("regime_use_closed_bars_only", True))
 
         self.reversal_lookback = int(cfg.get("regime_reversal_lookback", 20))
@@ -394,7 +390,6 @@ class MarketRegimeDetector:
             lookback=self.reversal_lookback,
         )
 
-        # 反轉風險只在多頭情境下有意義；空頭與盤整期不必再談「反轉向下」。
         if regime is not MarketRegime.BULL_TREND:
             reversal *= 0.5
 

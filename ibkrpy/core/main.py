@@ -11,12 +11,10 @@ import logging
 import warnings
 import caffeine
 
-# ========== macOS 基礎防禦 ==========
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 warnings.filterwarnings("ignore")
-# ====================================
 
 project_root = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -117,7 +115,7 @@ def _build_benchmark_stack(config, db_manager, data_pipeline):
     要改規則只改這一個函式。
     """
     weights_dir = os.path.join(project_root, "weights")
-    store = JsonBenchmarkStore(os.path.join(weights_dir, "_benchmark_map.json"))
+    store = JsonBenchmarkStore(os.path.join(weights_dir, "benchmark_map.json"))
     resolver = build_benchmark_resolver(
         config=config,
         db_manager=db_manager,
@@ -205,8 +203,6 @@ async def live_trading_loop(
             state = clock.state()
 
             if not state.session.is_tradable:
-                # deepsleep。上限 6 小時是為了讓長睡眠仍能定期確認連線與日曆，
-                # 跨越長週末時會分成幾段睡完，而不是一次睡 79 小時。
                 nap = min(state.seconds_until_change, 6 * 3600)
                 logger.info(
                     f"😴 {state.session.value} —— 深度休眠 {nap / 3600:.2f} 小時，"
@@ -220,7 +216,6 @@ async def live_trading_loop(
                 last_session = state.session
 
             await engine.update_system_state()
-            # 輪替起點，避免資金耗盡時清單後段的標的長期被跳過
             order = symbols[offset:] + symbols[:offset]
             offset = (offset + 1) % max(len(symbols), 1)
 
@@ -236,7 +231,6 @@ async def live_trading_loop(
 
             engine.log_cycle_summary()
 
-            # 不要睡過時段邊界，否則開盤瞬間會遲到最多 60 秒。
             await asyncio.sleep(min(loop_seconds, max(state.seconds_until_change, 1.0)))
     except asyncio.CancelledError:
         pass
@@ -293,7 +287,6 @@ async def run_live_mode(args):
     symbols = (
         [p.symbol for p in config.asset_profiles] if config.asset_profiles else ["AAPL"]
     )
-    # 覆蓋為單一標的 (若有提供)
     if args.symbol:
         symbols = [args.symbol]
 
@@ -315,7 +308,7 @@ async def run_live_mode(args):
     symbol_terms = {}
 
     global_params_path = os.path.join(
-        project_root, "weights", "_global_best_params.json"
+        project_root, "weights", "global_best_params.json"
     )
     global_params = {}
     if os.path.exists(global_params_path):

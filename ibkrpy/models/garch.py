@@ -47,7 +47,6 @@ class GARCHModel:
         if df.empty or "Close" not in df.columns:
             return 0.02
 
-        # arch_model 預期數值較大的百分比收益率 (避免優化器收斂失敗)
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna() * 100.0
 
         if len(returns) < 20:
@@ -57,17 +56,13 @@ class GARCHModel:
             model = arch_model(returns, vol="Garch", p=self.p, q=self.q, dist=self.dist)
 
             if self.saved_params is not None:
-                # 模式 1: 使用已儲存的參數 (固定權重) 直接預測
                 res = model.fix(self.saved_params)
             else:
-                # 模式 2: 實時擬合最新數據
                 res = model.fit(disp="off")
 
-            # 預測下一期方差 (此為百分比單位的方差)
             forecasts = res.forecast(horizon=1, method="analytic")
             predicted_var = forecasts.variance.iloc[-1].item()
 
-            # 還原為小數形式的日波動率，再轉化為年化波動率
             predicted_vol_daily = np.sqrt(predicted_var) / 100.0
             annual_vol = predicted_vol_daily * np.sqrt(252)
 
@@ -75,7 +70,6 @@ class GARCHModel:
 
         except Exception as e:
             print(f"GARCH 預測失敗: {e}")
-            # Fallback: 若預測失敗，返回簡單的歷史年化標準差
             return float((returns.tail(20).std() / 100.0) * np.sqrt(252))
 
     def predict_next_price(self, df: pd.DataFrame) -> float:

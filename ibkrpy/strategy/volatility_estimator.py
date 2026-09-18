@@ -15,11 +15,8 @@ logger = logging.getLogger("ibkrpy.volatility")
 
 _TRADING_DAYS = 252.0
 
-# 每根 K 線的波動率下限 (小數)。低於此值代表估計失敗，不是市場真的不動。
-# 最安靜的大型股日波動率也在 0.4% 以上; 取 0.05% 作為極寬鬆的下限。
 _ABS_FLOOR_PER_BAR = 0.0005
 
-# 模型值相對實現值的可接受倍數帶。超出即視為尺度錯誤。
 _BAND_LO = 1.0 / 3.0
 _BAND_HI = 3.0
 
@@ -28,11 +25,11 @@ _BAND_HI = 3.0
 class VolatilityEstimate:
     """一次波動率估計的完整結果，含來源與診斷資訊。"""
 
-    value: float  # 每根 K 線的波動率 (小數, 恆為正)
-    source: str  # "model" | "realized" | "floor"
-    realized: float  # 實現波動率 (每根 K 線, 小數)
-    model: Optional[float]  # 模型給出的值 (每根 K 線, 小數); None 表示沒有
-    ratio: Optional[float]  # model / realized
+    value: float
+    source: str
+    realized: float
+    model: Optional[float]
+    ratio: Optional[float]
     detail: str = ""
 
     @property
@@ -41,9 +38,6 @@ class VolatilityEstimate:
         return self.value * math.sqrt(_TRADING_DAYS)
 
 
-# ----------------------------------------------------------------------
-# 實現波動率
-# ----------------------------------------------------------------------
 
 
 def _close_to_close(
@@ -55,7 +49,6 @@ def _close_to_close(
         return float("nan")
     rets = rets.iloc[-lookback:]
     if halflife:
-        # EWMA 變異數: 近期樣本權重較高，但不像 GARCH 那樣需要擬合參數。
         weights = 0.5 ** (np.arange(len(rets))[::-1] / float(halflife))
         weights /= weights.sum()
         mean = float(np.sum(weights * rets.to_numpy()))
@@ -88,11 +81,8 @@ def _yang_zhang(df: pd.DataFrame, lookback: int) -> float:
     if n < 5:
         return float("nan")
 
-    # 隔夜 (前收 -> 開盤)
     overnight = np.log(frame["o"] / frame["pc"])
-    # 盤中 (開盤 -> 收盤)
     open_close = np.log(frame["c"] / frame["o"])
-    # Rogers-Satchell: 對漂移免疫的盤中估計
     rs = np.log(frame["h"] / frame["c"]) * np.log(frame["h"] / frame["o"]) + np.log(
         frame["l"] / frame["c"]
     ) * np.log(frame["l"] / frame["o"])
@@ -129,9 +119,6 @@ def realized_volatility(
     return ctc if np.isfinite(ctc) and ctc > 0 else float("nan")
 
 
-# ----------------------------------------------------------------------
-# 估計器
-# ----------------------------------------------------------------------
 
 
 class VolatilityEstimator:
@@ -151,6 +138,7 @@ class VolatilityEstimator:
         band_hi: float = _BAND_HI,
         abs_floor: float = _ABS_FLOOR_PER_BAR,
         trust_model: bool = True,
+        distrust_symbols=None,
     ):
         self.lookback = int(lookback)
         self.halflife = float(halflife)
@@ -158,6 +146,7 @@ class VolatilityEstimator:
         self.band_hi = float(band_hi)
         self.abs_floor = float(abs_floor)
         self.trust_model = bool(trust_model)
+        self.distrust = {str(x).upper() for x in (distrust_symbols or [])}
         self._warned: set = set()
 
     def estimate(
@@ -174,7 +163,6 @@ class VolatilityEstimator:
         realized = realized_volatility(df, self.lookback, self.halflife)
 
         if not np.isfinite(realized) or realized <= 0:
-            # 連實現波動率都算不出來，代表 K 線本身有問題。
             fallback = max(self.abs_floor, 0.01)
             return VolatilityEstimate(
                 fallback,
@@ -186,6 +174,22 @@ class VolatilityEstimator:
             )
 
         realized = max(realized, self.abs_floor)
+
+        if symbol.upper() in self.distrust:
+            if symbol not in self._warned:
+                self._warned.add(symbol)
+                logger.info(
+                    f"[{symbol}] 已列入 distrust_symbols，直接採用實現波動率 "
+                    f"{realized * 100:.3f}% (GARCH 權重需重新訓練)。"
+                )
+            return VolatilityEstimate(
+                realized,
+                "realized",
+                realized,
+                model_vol_per_bar,
+                None,
+                "標的在 distrust_symbols 清單中",
+            )
 
         if not self.trust_model or model_vol_per_bar is None:
             return VolatilityEstimate(
@@ -214,7 +218,6 @@ class VolatilityEstimator:
                 f"模型值在合理帶內 (×{ratio:.2f})",
             )
 
-        # 超出合理帶 —— 幾乎都是尺度錯誤，不是市場異常。
         if symbol not in self._warned:
             self._warned.add(symbol)
             logger.error(
@@ -242,4 +245,5 @@ def build_volatility_estimator(config) -> VolatilityEstimator:
         band_hi=float(s.get("model_band_hi", _BAND_HI)),
         abs_floor=float(s.get("abs_floor_per_bar", _ABS_FLOOR_PER_BAR)),
         trust_model=bool(s.get("trust_model", True)),
+        distrust_symbols=s.get("distrust_symbols") or [],
     )

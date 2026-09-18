@@ -42,7 +42,6 @@ class ExternalDataFetcher:
             return pd.Series(dtype=float)
 
         try:
-            # fredapi 本身是同步的，使用 to_thread 避免阻塞
             series = await asyncio.to_thread(self.fred.get_series, series_id)
             series.index = pd.to_datetime(series.index)
             return series

@@ -45,16 +45,12 @@ def bar_seconds(bar_size: str) -> int:
 class IBKRDataManager:
     """統一處理所有與 IBKR 互動的數據請求 (具備機構級 API 頻率防護)"""
 
-    # IBKR 官方 pacing 規則：
-    #   - 10 分鐘內不得超過 60 次歷史請求
-    #   - 15 秒內不得送出「完全相同」的歷史請求
-    #   - 2 秒內同一 Contract+Exchange+TickType 不得超過 6 次
     HIST_WINDOW_SECONDS = 600
-    HIST_MAX_IN_WINDOW = 50  # 對 60 留 10 次緩衝給臨時補資料
-    IDENTICAL_COOLDOWN = 16.0  # 官方 15s，取 16s 留餘裕
+    HIST_MAX_IN_WINDOW = 50
+    IDENTICAL_COOLDOWN = 16.0
     SAME_CONTRACT_WINDOW = 2.0
-    SAME_CONTRACT_MAX = 4  # 官方 6 次，取 4 次
-    MIN_REQUEST_GAP = 0.25  # 全域最小間隔，避免觸發「軟節流」
+    SAME_CONTRACT_MAX = 4
+    MIN_REQUEST_GAP = 0.25
 
     def __init__(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1):
         self.ib = IB()
@@ -62,31 +58,24 @@ class IBKRDataManager:
         self.port = port
         self.client_id = client_id
 
-        # 實時訂閱水位監控
         self._active_subscriptions: Dict[str, Dict[str, Any]] = {}
         self.max_subscriptions = 55
 
-        # ---- 歷史數據速率控制 ----
-        self._hist_req_timestamps: list = []  # 全域 10 分鐘窗
-        self._identical_last: Dict[str, float] = {}  # 請求簽章 -> 上次送出時間
-        self._contract_hits: Dict[str, list] = {}  # 合約鍵 -> 近 2 秒的送出時間
+        self._hist_req_timestamps: list = []
+        self._identical_last: Dict[str, float] = {}
+        self._contract_hits: Dict[str, list] = {}
         self._last_request_at = 0.0
         self._hist_req_lock = asyncio.Lock()
 
-        # ---- 結果快取 (請求簽章 -> (取得時間, DataFrame)) ----
         self._hist_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._cache_hits = 0
         self._cache_misses = 0
 
-        # ---- 合約快取：qualify 過的完整合約，絕不重建 ----
         self._contracts: Dict[str, Contract] = {}
         self._unresolvable: set = set()
 
         self._error_hook_installed = False
 
-    # ------------------------------------------------------------------
-    # 連線
-    # ------------------------------------------------------------------
 
     async def connect(self):
         if self.ib.isConnected():
@@ -134,7 +123,6 @@ class IBKRDataManager:
         return f"conId={con_id}"
 
     def _on_ib_error(self, reqId, errorCode, errorString, contract=None):
-        # 2104/2106/2158 是連線正常的通知，2107/2119 是資料農場休眠，皆非錯誤
         if errorCode in (2104, 2106, 2107, 2108, 2119, 2158, 2100, 2150):
             logger.debug(f"[IBKR] ({errorCode}) {errorString}")
             return
@@ -176,9 +164,6 @@ class IBKRDataManager:
 
         logger.warning(f"[IBKR][{sym}] ({errorCode}) {errorString}")
 
-    # ------------------------------------------------------------------
-    # 合約解析 (Error 162 的核心修正)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _normalise_symbol(symbol: str) -> str:
@@ -212,7 +197,6 @@ class IBKRDataManager:
             logger.error(f"[{key}] 合約解析請求失敗: {e}")
             return None
 
-        # qualifyContractsAsync 解析失敗時回傳空 list，且「不會」拋例外。
         if not resolved:
             details = []
             try:
@@ -229,7 +213,6 @@ class IBKRDataManager:
                 self._unresolvable.add(key)
                 return None
 
-            # 有多筆結果時，取美國主要上市所的那一筆
             preferred = ("NASDAQ", "NYSE", "ARCA", "AMEX", "BATS", "ISLAND")
             picked = None
             for d in details:
@@ -259,9 +242,6 @@ class IBKRDataManager:
     def get_cached_contract(self, symbol: str) -> Optional[Contract]:
         return self._contracts.get(self._normalise_symbol(symbol))
 
-    # ------------------------------------------------------------------
-    # 帳戶
-    # ------------------------------------------------------------------
 
     async def get_net_liquidation(self, currency: str = "USD") -> float:
         if not await self._ensure_connected():
@@ -275,9 +255,6 @@ class IBKRDataManager:
             logger.warning(f"獲取帳戶淨值失敗: {e}")
         return 0.0
 
-    # ------------------------------------------------------------------
-    # 速率控制
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _signature(
@@ -322,14 +299,12 @@ class IBKRDataManager:
             now = time.time()
             wait = 0.0
 
-            # 規則 1：15 秒內不得重送相同請求
             last_same = self._identical_last.get(signature)
             if last_same is not None:
                 gap = now - last_same
                 if gap < self.IDENTICAL_COOLDOWN:
                     wait = max(wait, self.IDENTICAL_COOLDOWN - gap)
 
-            # 規則 2：2 秒內同合約不得超過 N 次
             hits = [
                 t
                 for t in self._contract_hits.get(contract_key, [])
@@ -339,7 +314,6 @@ class IBKRDataManager:
             if len(hits) >= self.SAME_CONTRACT_MAX:
                 wait = max(wait, self.SAME_CONTRACT_WINDOW - (now - hits[0]) + 0.05)
 
-            # 規則 3：10 分鐘內不得超過 N 次
             self._hist_req_timestamps = [
                 t
                 for t in self._hist_req_timestamps
@@ -354,7 +328,6 @@ class IBKRDataManager:
                     f"（快取命中率 {self.cache_hit_rate():.0%}，持續觸發代表輪詢頻率仍高於資料更新頻率）"
                 )
 
-            # 全域最小間隔
             gap_since_last = now - self._last_request_at
             if gap_since_last < self.MIN_REQUEST_GAP:
                 wait = max(wait, self.MIN_REQUEST_GAP - gap_since_last)
@@ -384,9 +357,6 @@ class IBKRDataManager:
             "subscriptions": len(self._active_subscriptions),
         }
 
-    # ------------------------------------------------------------------
-    # 歷史資料
-    # ------------------------------------------------------------------
 
     async def fetch_historical_data(
         self,
@@ -452,8 +422,6 @@ class IBKRDataManager:
             )
             return pd.DataFrame()
 
-        # ib_insync 在 Error 162 時回傳空 list 而非拋例外 —— 這裡明確記錄請求參數，
-        # 讓日誌能直接對上 errorEvent 印出的那筆錯誤。
         if not bars:
             logger.warning(
                 f"[{contract.symbol}] 歷史請求無資料返回 "
@@ -497,9 +465,6 @@ class IBKRDataManager:
             return pd.DataFrame()
         return await self.fetch_historical_data(contract, **kwargs)
 
-    # ------------------------------------------------------------------
-    # 實時訂閱
-    # ------------------------------------------------------------------
 
     async def subscribe_realtime_bars(
         self, contract: Contract, bar_size: int = 5, callback: Callable = None

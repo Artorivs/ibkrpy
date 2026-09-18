@@ -25,7 +25,6 @@ class AssetClassification:
         return not self.sector and not self.industry
 
 
-# 埠 (Ports) —— 抽象依賴，具體實作在下方的 Adapters 區
 
 
 class ClassificationProvider(ABC):
@@ -312,7 +311,6 @@ class ChainedBenchmarkResolver(BenchmarkResolver):
             try:
                 result = resolver.resolve(symbol)
             except Exception as e:
-                # 契約規定不得拋例外，但仍防禦性處理，避免單一 resolver 拖垮整條鏈
                 logger.error(f"[{symbol}] {resolver.name} 違反契約拋出例外: {e}")
                 continue
             if result:
@@ -350,7 +348,6 @@ class CachingBenchmarkResolver(BenchmarkResolver):
         return f"Caching({self._inner.name})"
 
 
-# Adapters —— 把既有的具體元件接到上面的埠上
 
 
 class StaticClassificationProvider(ClassificationProvider):
@@ -509,7 +506,13 @@ class DatabaseReturnsProvider(ReturnsProvider):
 
 class ManifestBenchmarkReader(BenchmarkReader):
     """
-    讀出訓練時實際使用的 benchmark。
+    從 DataPipeline 的特徵清單 (weights/training_artifacts.json 內的 manifest)
+    讀出訓練時
+    實際使用的 benchmark。
+
+    這是最高權威的來源：模型權重就是配著那一檔 benchmark 訓練出來的。
+    比 benchmark_map.json 更可信 —— 對應表可能在重訓之間被改動，
+    但 manifest 是與 .keras 權重同時寫出的。
     """
 
     def __init__(self, data_pipeline):
@@ -585,7 +588,6 @@ class NullBenchmarkStore(BenchmarkReader, BenchmarkWriter):
         return None
 
 
-# 組裝 (Composition Root 使用)
 
 DEFAULT_CANDIDATE_POOL = [
     "SPY",
@@ -628,7 +630,7 @@ def build_benchmark_resolver(
 
     優先順序：
       1. 訓練時寫進特徵清單的選擇 (最高權威：權重就是配著它訓練的)
-      2. _benchmark_map.json 的紀錄
+      2. benchmark_map.json 的紀錄
       3. config 明確指定
       4. 產業 / 板塊 ETF 對應
       5. 歷史報酬相關性

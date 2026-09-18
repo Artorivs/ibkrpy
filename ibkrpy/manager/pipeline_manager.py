@@ -54,7 +54,6 @@ class PipelineManager:
             "general_settings.benchmark_symbol", "SPY"
         )
 
-        # 如果有指定單一標的，則直接覆蓋 self.symbols
         if target_symbol:
             self.symbols = [target_symbol]
         else:
@@ -71,13 +70,12 @@ class PipelineManager:
         self.benchmark_resolver = benchmark_resolver
         self.benchmark_store = benchmark_store
 
-        # 每檔標的的 benchmark。訓練與資料下載都以這張表為準。
         self._benchmark_for: Dict[str, str] = {}
         self._tradable = list(self.symbols)
         self._refresh_benchmark_map()
 
         self.symbol_terms = {}
-        param_path = os.path.join(WEIGHTS_DIR, "_global_best_params.json")
+        param_path = os.path.join(WEIGHTS_DIR, "global_best_params.json")
         if os.path.exists(param_path):
             try:
                 with open(param_path, "r", encoding="utf-8") as f:
@@ -95,6 +93,11 @@ class PipelineManager:
     def _refresh_benchmark_map(self):
         """
         解析每檔標的的 benchmark，並把所有用到的 benchmark 併進下載清單。
+
+        [修正] 舊版只把單一 general_settings.benchmark_symbol 加進 _reference_only。
+        改成 per-symbol 之後，可能同時用到 SMH / XLF / XLV 等多檔 ETF，
+        每一檔都必須先有歷史資料，否則 engineer_advanced_features 拿到空的
+        benchmark_df，bench_return / bench_correlation 兩欄就整個消失。
         """
         self._benchmark_for = {}
         for symbol in self._tradable:
@@ -104,7 +107,6 @@ class PipelineManager:
         needed = sorted(set(self._benchmark_for.values()))
         self._reference_only = {b for b in needed if b not in self._tradable}
 
-        # benchmark 必須排在前面先下載：相關性法要靠它們的歷史資料才能運作
         self.symbols = sorted(self._reference_only) + list(self._tradable)
 
         pairs = ", ".join(f"{s}→{b}" for s, b in list(self._benchmark_for.items())[:8])
@@ -123,6 +125,11 @@ class PipelineManager:
     def _correlation_candidates(self) -> list:
         """
         相關性法要比較的候選池。
+
+        [雞生蛋問題] CorrelationBenchmarkResolver 需要候選池的歷史資料才能運作，
+        但候選 ETF 只有在「被選中」之後才會進下載清單 —— 沒資料就選不中，
+        選不中就沒資料。因此候選池必須獨立下載，不能等它被選中。
+        只抓相關性計算用的那一個週期 (預設日 K)，把 API 成本壓到最低。
         """
         settings = self.config.get("benchmark_settings") or {}
         if not settings.get("enable_correlation", True):
@@ -223,7 +230,6 @@ class PipelineManager:
         while remaining_days > 0:
             fetch_days = min(remaining_days, chunk_days)
 
-            # 針對大跨度轉換為 Y (年) 或 M (月) 的格式，提升 IBKR 接受度
             if fetch_days >= 365:
                 duration_str = f"{fetch_days // 365} Y"
             elif fetch_days >= 30 and bar_size != "1 day":
@@ -378,7 +384,7 @@ class PipelineManager:
                 verbose=0,
                 callbacks=callbacks,
                 validation_split=0.2,
-                shuffle=False,  # 時序資料不可打亂
+                shuffle=False,
             )
 
             logger.info(f"	-> 🚀 擬合 LSTM 模型 (Batch Size: {dynamic_batch_size})...")
@@ -454,15 +460,13 @@ class PipelineManager:
         except Exception as e:
             logger.warning(f"	⚠️ GARCH 訓練失敗: {e}")
 
+
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
 
         if os.path.exists(bundle_path):
             logger.info(f"	✅ [{symbol}] 統計模型整合包 (Classical Bundle) 寫入完成。")
 
-    # ------------------------------------------------------------------
-    # Walk-forward 尋優
-    # ------------------------------------------------------------------
 
     def _vectorised_regimes(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -536,13 +540,12 @@ class PipelineManager:
             try:
                 from statsmodels.tsa.arima.model import ARIMA
 
-                # 只在 in-sample 擬合一次，取得參數
                 base = ARIMA(close[:split], order=(5, 1, 0)).fit()
 
                 for k in range(len(oos)):
-                    t = split + k  # 要預測 close[t]
+                    t = split + k
                     lo = max(0, t - max_hist)
-                    hist = close[lo:t]  # 只用 t 之前的資料，無前視
+                    hist = close[lo:t]
                     if len(hist) < 20:
                         continue
                     try:
@@ -552,7 +555,6 @@ class PipelineManager:
             except Exception as e:
                 logger.warning(f"	⚠️ ARIMA walk-forward 失敗: {e}")
 
-        # 需要神經網路參與時，只在 in-sample 訓練一次，再對 OOS 逐窗推論
         dl_wanted = [m for m in wf_models if m in ("LSTM", "Transformer")]
         if dl_wanted:
             dl_preds = self._walk_forward_dl(symbol, df, split, dl_wanted)
@@ -624,7 +626,6 @@ class PipelineManager:
             if len(X) < 100:
                 return None
 
-            # 序列 i 的目標落在 df_adv 的第 i+look_back 根
             seq_pos = np.arange(len(X)) + look_back
             in_mask = seq_pos < adv_split
 
@@ -682,7 +683,6 @@ class PipelineManager:
 
         tuner = ModelTuner(model_orchestrator=None, data_manager=None)
         try:
-            # 回測區間必須與預測區間一致，否則權益曲線會混入沒有訊號的 in-sample 段
             return tuner.optimize_strategy_params(
                 symbol, df.loc[oos.index], oos, n_trials=20, term=term
             )
@@ -696,10 +696,8 @@ class PipelineManager:
 
         all_terms = ["long_term", "mid_term", "short_term"]
 
-        # 1. 先補齊相關性候選池的日 K，讓 benchmark 解析有資料可用
         await self._ingest_benchmark_candidates()
 
-        # 2. 候選池就緒後重新解析一次，相關性法此時才真正生效
         if hasattr(self.benchmark_resolver, "invalidate"):
             self.benchmark_resolver.invalidate()
             self._refresh_benchmark_map()
@@ -710,7 +708,6 @@ class PipelineManager:
 
             contract = await self.ib_data.qualify(symbol)
             if contract is None:
-                # qualify 已經印出可行動的錯誤訊息，這裡只記錄跳過
                 skipped.append(symbol)
                 continue
 
@@ -747,7 +744,6 @@ class PipelineManager:
         all_terms = ["long_term", "mid_term", "short_term"]
         os.makedirs(DATA_DIR, exist_ok=True)
 
-        # 1. 永久儲存 FRED 數據至 data/
         global_vix_series = None
         fred_cache_path = os.path.join(DATA_DIR, "fred_vix_cache.csv")
         need_fetch_fred = True
@@ -780,7 +776,6 @@ class PipelineManager:
                         fred_cache_path, index_col=0, parse_dates=True
                     ).squeeze("columns")
 
-        # 2. 讀取 FMP 基本面本地快取
         fmp_cache_path = os.path.join(WEIGHTS_DIR, "fmp_cache.json")
         fmp_cache = {}
         if os.path.exists(fmp_cache_path):
@@ -794,8 +789,8 @@ class PipelineManager:
         for symbol in self.symbols:
             if symbol in getattr(self, "_reference_only", set()):
                 logger.info(
-                    f"⏭️ 跳過 {symbol}：它只是為了提供 benchmark 參考資料而被加入，"
-                    f"並不在資產池中。若要交易，請加進 config.yaml 的 assets。"
+                    f"⏭️ 跳過 {symbol}：屬 benchmark 參考資料。"
+                    f"若要交易，請加入 config.yaml 的 assets。"
                 )
                 continue
 
@@ -944,7 +939,6 @@ class PipelineManager:
             )
             self._train_safe_models(symbol, best_df)
 
-            # 把決定寫進對應表，讓實盤端能沿用完全相同的 benchmark
             if self.benchmark_store is not None:
                 try:
                     self.benchmark_store.set(symbol, chosen_benchmark)
@@ -954,7 +948,7 @@ class PipelineManager:
             weights_dir = WEIGHTS_DIR
             os.makedirs(weights_dir, exist_ok=True)
 
-            param_path = os.path.join(weights_dir, "_global_best_params.json")
+            param_path = os.path.join(weights_dir, "global_best_params.json")
             global_params = {}
             if os.path.exists(param_path):
                 try:

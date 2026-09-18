@@ -3,21 +3,28 @@
 
 import asyncio
 import math
+from datetime import datetime, timezone
 import time
 from typing import Dict, Any
 from ib_insync import Order, LimitOrder, Stock, TagValue
 from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
 from ibkrpy.shared.session_clock import Session, build_session_clock
+from ibkrpy.strategy.execution_costs import build_execution_cost_model
+from ibkrpy.data.prediction_ledger import (
+    TERM_BARS,
+    PredictionRecord,
+    build_prediction_ledger,
+    weight_fingerprint,
+)
 import pandas as pd
 import numpy as np
 import logging
 
-# 掛在 "ibkrpy" 樹下，確保 system_log 的 QueueHandler 會收到本模組的日誌
 logger = logging.getLogger("ibkrpy.trading_engine")
 _TERM_POLL_SECONDS = {
-    "short_term": 300,  # 5 分 K -> 每 5 分鐘
-    "mid_term": 900,  # 1 小時 K -> 每 15 分鐘 (盤中提早看到未收完的當根)
-    "long_term": 3600,  # 日 K -> 每小時
+    "short_term": 300,
+    "mid_term": 900,
+    "long_term": 3600,
 }
 
 
@@ -71,10 +78,21 @@ class TradingEngine:
         self.benchmark_resolver = benchmark_resolver
         self._benchmark_logged = set()
 
-        # σ 的唯一來源。模型輸出僅作為候選值，必須通過實現波動率的驗證。
         self.vol_estimator = build_volatility_estimator(self.config)
 
         self.session_clock = build_session_clock(self.config)
+
+        self.cost_model = build_execution_cost_model(self.config)
+        self._term_lifted: set = set()
+
+        self.ledger = build_prediction_ledger(
+            getattr(self.db, "db_path", None) or "trading_data.db", self.config
+        )
+        self._ledger_buffer: list = []
+        from ibkrpy.data.data_pipeline import WEIGHTS_DIR
+
+        self._model_generation = weight_fingerprint(WEIGHTS_DIR)
+        logger.info(f"🔖 模型世代指紋: {self._model_generation}")
 
         self.global_context = {}
         self.cached_funds = 0.0
@@ -134,12 +152,131 @@ class TradingEngine:
             liveness[name] = 1.0 if s is None else max(min(s / peak, 1.0), 0.0)
         return liveness
 
+    _TERM_ORDER = ("short_term", "mid_term", "long_term")
+
+    def _effective_term(self, symbol: str) -> str:
+        """
+        套用 min_term 下限之後的實際 term。
+
+        為什麼需要下限
+        --------------
+        成本是「每次來回付一次」的固定支出，而預測優勢大致隨持有時間的
+        平方根成長。5 分 K 的一根波動約是日 K 的 1/8.8，但價差與佣金一分
+        都不會少 —— 2026-09-04 的 IBM 空單就是這個結構的極端案例:
+        停利 0.030%，而光是價差加滑價就要 0.043%，零佣金也賺不到。
+
+        調整部位大小改變不了這個比值 (佣金項會攤薄，價差項不會)，
+        只有拉長持有時間才會。因此這裡設一個硬性下限，
+        walk-forward 選出的短週期一律被抬升。
+        """
+        term = self.symbol_terms.get(symbol, "long_term")
+        floor = str(self.config.get("general_settings.min_term", "long_term"))
+        try:
+            if self._TERM_ORDER.index(term) < self._TERM_ORDER.index(floor):
+                if symbol not in self._term_lifted:
+                    self._term_lifted.add(symbol)
+                    logger.info(
+                        f"[{symbol}] ⏫ 週期由 {term} 抬升為 {floor} "
+                        f"(general_settings.min_term)。原因: 短週期的預測優勢"
+                        f"不足以覆蓋固定成交成本。"
+                    )
+                return floor
+        except ValueError:
+            logger.error(
+                f"未知的 term 設定: {term!r} 或 min_term {floor!r}，維持原值。"
+            )
+        return term
+
+    def _cost_floor_pct(self, price: float, net_liquidation: float) -> float:
+        """
+        以「本輪打算下的名目」推算的來回成本比例。
+
+        門檻階段還不知道會下幾股，所以用 base_position_pct × 淨值 當作
+        預估名目。這只是粗篩 —— 真正的把關在下單前 (見 _execute_signal)，
+        那時股數已經確定。但把這個值餵回 min_edge_pct 很重要:
+        出場幾何用它當停利的下限，否則停利會被設在成本帶以內，
+        變成「達標也虧錢」的單子。
+        """
+        try:
+            base_pct = float(
+                self.config.get("strategy_settings.base_position_pct", 0.08)
+            )
+            notional = max(float(net_liquidation) * base_pct, float(price))
+            shares = max(notional / float(price), 1.0)
+            cost = self.cost_model.estimate(price, shares)
+            safety = float(
+                self.config.get("execution_cost_settings.safety_multiple", 1.5)
+            )
+            return cost.pct * safety
+        except Exception as e:
+            logger.warning(f"成本地板估算失敗，沿用設定值: {e}")
+            return float(self.config.get("strategy_settings.min_edge_pct", 0.0010))
+
+    def _record_to_ledger(
+        self, symbol, term, context, ensemble_preds, vol, decision, reversal_risk
+    ):
+        """
+        把這一次掃描的完整快照放進緩衝區。實際寫入在 log_cycle_summary()
+        時批次執行 —— 每輪 39 檔逐筆開連線太浪費，累積一輪再寫。
+
+        永不拋例外: 帳本壞掉不該讓交易停止。
+        """
+        try:
+            timeframe, _ = TERM_BARS.get(term, ("1 day", 1))
+            price = float(context.get("current_price") or 0.0)
+            if price <= 0:
+                return
+
+            preds = {
+                str(k): float(v)
+                for k, v in (ensemble_preds or {}).items()
+                if isinstance(v, (int, float)) and math.isfinite(float(v))
+            }
+            ensemble = decision.get("expected_move")
+            if ensemble is None and preds:
+                ensemble = sum(preds.values()) / len(preds)
+
+            self._ledger_buffer.append(
+                PredictionRecord(
+                    symbol=symbol,
+                    timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    term=term,
+                    timeframe=timeframe,
+                    horizon_bars=1,
+                    price_at_prediction=price,
+                    predicted_return=float(ensemble or 0.0),
+                    model_predictions=preds,
+                    sigma=getattr(vol, "value", None),
+                    sigma_source=getattr(vol, "source", None),
+                    sigma_realized=getattr(vol, "realized", None),
+                    regime=str(context.get("regime")),
+                    threshold=decision.get("threshold"),
+                    threshold_source=decision.get("threshold_source"),
+                    reason_code=decision.get("reason_code"),
+                    action=decision.get("action", "HOLD"),
+                    benchmark=context.get("benchmark"),
+                    reversal_risk=reversal_risk,
+                    model_generation=self._model_generation,
+                )
+            )
+        except Exception as e:
+            logger.debug(f"[{symbol}] 帳本快照建立失敗 (不影響交易): {e}")
+
+    def flush_ledger(self):
+        """把本輪累積的預測一次寫入。由 log_cycle_summary 呼叫。"""
+        if not self._ledger_buffer:
+            return
+        try:
+            self.ledger.record_many(self._ledger_buffer)
+        finally:
+            self._ledger_buffer = []
+
     @property
     def _extended_poll_multiplier(self) -> float:
         return float(self.config.get("session_settings.extended_poll_multiplier", 3.0))
 
     def _poll_interval(self, symbol: str) -> int:
-        term = self.symbol_terms.get(symbol, "long_term")
+        term = self._effective_term(symbol)
         default = _TERM_POLL_SECONDS.get(term, 3600)
         return int(self.config.get(f"general_settings.poll_seconds_{term}", default))
 
@@ -394,7 +531,10 @@ class TradingEngine:
         """
         每輪掃描結束時印一行總結。這是「系統到底有沒有在思考」最直接的證據 ——
         就算一整天都沒下單，也看得出每一輪各有幾檔卡在哪一道關卡。
+
+        同時把本輪累積的預測快照批次寫入帳本。
         """
+        self.flush_ledger()
         if not self._cycle_decisions:
             logger.info("📊 [本輪總結] 沒有任何標的通過輪詢節流 (皆在冷卻期內)。")
             return
@@ -462,7 +602,7 @@ class TradingEngine:
 
     async def update_system_state(self):
         """每一輪大迴圈開始前統一調用，更新帳戶快取與全局市場上下文"""
-        self.cached_benchmarks.clear()  # 每一輪迴圈開始前清空大盤快取
+        self.cached_benchmarks.clear()
         try:
             positions = await self.data.ib.reqPositionsAsync()
             account_summary = await self.data.ib.accountSummaryAsync()
@@ -528,7 +668,6 @@ class TradingEngine:
             if pos_qty == 0:
                 continue
 
-            # 檢查該標的是否有反向的未決訂單 (SELL單若持倉為正，BUY單若持倉為負)
             protect_action = "SELL" if pos_qty > 0 else "BUY"
             protected_qty = 0.0
             for t in open_trades:
@@ -569,7 +708,6 @@ class TradingEngine:
     async def _attach_oca_protection(self, symbol: str, pos_qty: float):
         contract = await self._get_qualified_contract(symbol)
         try:
-            # 優先從 DB 讀取日 K 計算真實波動率，避免每 5 分鐘因未平倉而狂刷 60 天歷史請求
             df = pd.DataFrame()
             if self.db:
                 df = self.db.get_market_data_sync(symbol, timeframe="1 day")
@@ -615,16 +753,15 @@ class TradingEngine:
             returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
             annual_vol = returns.std() * np.sqrt(252) if len(returns) > 10 else 0.20
 
-            term = self.symbol_terms.get(symbol, "long_term")
+            term = self._effective_term(symbol)
             if term == "short_term":
-                periods_per_year = 252 * 78  # 5 分 K
+                periods_per_year = 252 * 78
             elif term == "mid_term":
-                periods_per_year = 252 * 6.5  # 1 小時 K
+                periods_per_year = 252 * 6.5
             else:
-                periods_per_year = 252  # 日 K
+                periods_per_year = 252
             daily_vol = annual_vol / math.sqrt(periods_per_year)
 
-            # 從策略抓取乘數設定，若無則預設停損 2.0 倍 / 停利 3.0 倍波動
             strategy = self.strategies.get(symbol)
             sl_mult = strategy.sl_multiplier if strategy else 2.0
             tp_mult = strategy.tp_multiplier if strategy else 3.0
@@ -652,10 +789,8 @@ class TradingEngine:
                 )
                 return
 
-            # 建立 OCA 群組標籤 (加上時間戳確保唯一性)
             oca_group = f"OCA_PROTECT_{symbol}_{int(time.time())}"
 
-            # 建立獨立的 STP 與 LMT 單，並透過 ocaGroup 綁定。ocaType=1 代表觸發其一即取消另一
             sl_order = Order(
                 action=action,
                 totalQuantity=abs(pos_qty),
@@ -699,7 +834,6 @@ class TradingEngine:
             logger.info(
                 f"[{symbol}] 🧹 已清除 {canceled_count} 筆歷史未決訂單 (防範孤兒單衝突)。"
             )
-            # 稍微等待 IBKR 系統同步取消狀態
             await asyncio.sleep(0.5)
 
     async def run_tick(self, symbol: str, session=None):
@@ -714,7 +848,7 @@ class TradingEngine:
             self._record_decision("CONTRACT_UNRESOLVED")
             return
 
-        term = self.symbol_terms.get(symbol, "long_term")
+        term = self._effective_term(symbol)
 
         if term == "short_term":
             bar_size_str = self.config.get(
@@ -731,7 +865,6 @@ class TradingEngine:
 
         is_short_term = term == "short_term"
 
-        # 實盤模式下，只向 IBKR 請求最近「3 天」的輕量數據
         live_duration = "3 D"
         df_recent = await self.data.fetch_historical_data(
             contract=contract,
@@ -740,7 +873,6 @@ class TradingEngine:
             what_to_show="TRADES",
         )
 
-        # 取得資料庫中的歷史長線資料，並與剛抓到的最新輕量資料合併 (Stitching)
         df_db = pd.DataFrame()
         if self.db:
             df_db = self.db.get_market_data_sync(symbol, timeframe=bar_size_str)
@@ -764,7 +896,6 @@ class TradingEngine:
                 float
             )
 
-            # 順手將這 3 天的新資料寫入 DB，讓資料庫保持最新
             if self.db:
                 self.db.save_bulk_market_data(symbol, df_recent, timeframe=bar_size_str)
 
@@ -777,7 +908,6 @@ class TradingEngine:
         else:
             df = df_db
 
-        # 確保型態正確 (防護 TA-Lib / Pandas TA 報錯)
         cols_to_keep = ["Open", "High", "Low", "Close", "Volume"]
         for col in cols_to_keep:
             if col in df.columns:
@@ -818,7 +948,6 @@ class TradingEngine:
                 except Exception as e:
                     logger.warning(f"⚠️ 獲取 FRED 數據失敗，將維持使用本地快取: {e}")
 
-            # 直接使用快取的數據進行特徵對齊
             if self.cached_vix_series is not None and not self.cached_vix_series.empty:
                 vix_daily = self.cached_vix_series.copy()
                 vix_daily.index = vix_daily.index.normalize()
@@ -848,8 +977,6 @@ class TradingEngine:
             df_adv = df.ffill().bfill().fillna(0)
             df_scaled = df_adv
 
-        # 情境偵測。新版 detector 回傳完整評估 (含反轉風險)；
-        # 舊版只有 detect()，因此保留降級路徑。
         from ibkrpy.strategy.strategy_components import MarketRegime
 
         regime = MarketRegime.SIDEWAYS_QUIET
@@ -903,7 +1030,6 @@ class TradingEngine:
             )
             return
 
-        # 依各模型的實際離散度調整 Ensemble 話語權，並在偵測到塌陷時示警
         preds_pct = {k: (v / current_price - 1) for k, v in ensemble_preds.items()}
         liveness = self._update_model_liveness(symbol, preds_pct)
 
@@ -936,8 +1062,6 @@ class TradingEngine:
         except (TypeError, ValueError):
             model_vol_per_bar = None
 
-        # df_adv 就是策略本輪使用的 K 線，實現波動率與它同尺度，
-        # 不需要任何去年化，因此沒有慣例可以搞錯。
         vol = self.vol_estimator.estimate(symbol, df_adv, model_vol_per_bar)
         adjusted_volatility = vol.value
 
@@ -957,6 +1081,12 @@ class TradingEngine:
         if hasattr(strategy, "set_model_liveness"):
             strategy.set_model_liveness(liveness)
 
+        dynamic_floor = self._cost_floor_pct(
+            context["current_price"], getattr(self, "cached_net_liq", 0.0) or 0.0
+        )
+        configured = float(self.config.get("strategy_settings.min_edge_pct", 0.0010))
+        strategy.min_edge_pct = max(dynamic_floor, configured)
+
         signal = strategy.generate_signal(
             current_price=context["current_price"],
             volatility=adjusted_volatility,
@@ -966,9 +1096,11 @@ class TradingEngine:
             reversal_risk=reversal_risk,
         )
 
-        # 不論成交與否，都把策略的判斷依據寫進日誌。
         decision = getattr(strategy, "last_decision", {}) or {}
         self._record_decision(decision.get("reason_code", "UNKNOWN"))
+        self._record_to_ledger(
+            symbol, term, context, ensemble_preds, vol, decision, reversal_risk
+        )
         describe = getattr(strategy, "describe_last_decision", None)
         trace = describe() if callable(describe) else str(decision)
 
@@ -978,7 +1110,6 @@ class TradingEngine:
             logger.info(f"[{symbol}] ⏸️ 策略決策: {trace}")
             return
 
-        # 風險閘門關閉時，只放行減碼與平倉。
         is_reducing = (current_pos > 0 and signal["action"] == "SELL") or (
             current_pos < 0 and signal["action"] == "BUY"
         )
@@ -1106,11 +1237,37 @@ class TradingEngine:
             )
             return
 
-        # 預設最低建倉門檻
         min_trade_usd = self.config.get("strategy_settings.min_trade_usd", 500.0)
         trade_value = trade_quantity * current_price
 
-        # 注意：若是「平倉單 (is_closing_only)」，就算僅剩 1 股也必須無條件出清，因此排除在此檢查外。
+        if not is_closing_only:
+            try:
+                gross_edge = abs(float(tp_price) - current_price) / current_price
+            except (TypeError, ValueError, ZeroDivisionError):
+                gross_edge = 0.0
+
+            try:
+                session_now = self.session_clock.classify()
+                is_ext = bool(session_now.is_extended)
+            except Exception:
+                is_ext = False
+
+            viable, cost, why = self.cost_model.is_viable(
+                edge_pct=gross_edge,
+                price=current_price,
+                shares=trade_quantity,
+                extended_session=is_ext,
+                safety_multiple=float(
+                    self.config.get("execution_cost_settings.safety_multiple", 1.5)
+                ),
+            )
+            if not viable:
+                self._record_decision("COST_NOT_VIABLE")
+                logger.info(
+                    f"[{symbol}] ⏸️ 有 {action} 訊號但成本吃掉優勢，已取消。{why}"
+                )
+                return
+
         if not is_closing_only and trade_value < min_trade_usd:
             self._record_decision("BELOW_MIN_TRADE")
             logger.info(
@@ -1134,7 +1291,6 @@ class TradingEngine:
 
         self._record_decision(f"ORDER_{action}")
         try:
-            # 1. 下單前強制清理歷史孤兒單
             await self._cancel_open_orders(symbol)
 
             if not is_closing_only:
@@ -1145,7 +1301,6 @@ class TradingEngine:
             else:
                 algo_params = [TagValue("adaptivePriority", "Normal")]
 
-                # 2. 定義最大容忍滑價 (0.2%)
                 slippage_buffer = 0.002
                 limit_entry_price = (
                     current_price * (1 + slippage_buffer)
@@ -1154,7 +1309,6 @@ class TradingEngine:
                 )
 
                 if is_closing_only:
-                    # 提早平倉
                     order = LimitOrder(
                         action, trade_quantity, round(limit_entry_price, 2)
                     )
@@ -1163,7 +1317,6 @@ class TradingEngine:
                     order.tif = "DAY"
                     self.data.ib.placeOrder(contract, order)
                 else:
-                    # 全新開倉
                     parent_id = self.data.ib.client.getReqId()
                     parent = LimitOrder(
                         action, trade_quantity, round(limit_entry_price, 2)

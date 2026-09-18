@@ -11,7 +11,6 @@ from keras.models import Sequential, load_model
 from keras.layers import LSTM, Dense, Dropout, LayerNormalization
 import warnings
 
-# 抑制 TF 的繁雜日誌
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 warnings.filterwarnings("ignore")
 

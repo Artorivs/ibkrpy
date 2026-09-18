@@ -42,9 +42,9 @@ class SystemDaemon:
         self.logger = global_logger
         self.tick_interval_minutes = 5
 
-        # 重訓以獨立行程執行，必須使用不同的 client_id，否則會與 daemon 的連線衝突
         self.retrain_client_id = retrain_client_id
         self._retrain_task = None
+        self._freeze_logged = None
 
         self._scan_offset = 0
         self._reconnect_failures = 0
@@ -61,9 +61,6 @@ class SystemDaemon:
                 " 休市日與提早收市日將無法辨識，建議執行 poetry install 補齊相依。"
             )
 
-    # ------------------------------------------------------------------
-    # 狀態持久化
-    # ------------------------------------------------------------------
 
     def _load_state(self) -> dict:
         try:
@@ -80,9 +77,6 @@ class SystemDaemon:
         except Exception as e:
             self.logger.error(f"寫入 daemon 狀態失敗: {e}")
 
-    # ------------------------------------------------------------------
-    # 交易日曆
-    # ------------------------------------------------------------------
 
     def _get_session(self, day: datetime.date):
         """
@@ -104,7 +98,6 @@ class SystemDaemon:
             except Exception as e:
                 self.logger.error(f"查詢交易日曆失敗 ({day}): {e}")
 
-        # 快取只保留近期日期，避免長期運行時無限成長
         if len(self._session_cache) > 10:
             self._session_cache.clear()
         self._session_cache[day] = session
@@ -115,20 +108,16 @@ class SystemDaemon:
 
         if self._calendar is not None:
             if session is None:
-                return False  # 週末或假日
+                return False
             market_open, market_close = session
             return market_open <= now_ny <= market_close
 
-        # 沒有日曆套件時的降級判斷 (無法辨識假日與早收)
         if now_ny.weekday() >= 5:
             return False
         market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
         return market_open <= now_ny <= market_close
 
-    # ------------------------------------------------------------------
-    # 連線維護
-    # ------------------------------------------------------------------
 
     async def _handle_reconnect(self):
         """處理 IBKR API 在 24 小時運行中可能出現的斷線問題"""
@@ -154,9 +143,6 @@ class SystemDaemon:
             else:
                 self.logger.warning(msg)
 
-    # ------------------------------------------------------------------
-    # 重訓 (獨立行程)
-    # ------------------------------------------------------------------
 
     async def _run_retrain_subprocess(self):
         """
@@ -189,7 +175,6 @@ class SystemDaemon:
                 stderr=asyncio.subprocess.STDOUT,
             )
 
-            # 逐行轉發子行程輸出，避免 PIPE 緩衝區填滿造成死鎖
             async for raw in proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
@@ -225,18 +210,43 @@ class SystemDaemon:
         if self._retrain_task is not None:
             return False
 
+        frozen_until = self._freeze_until()
+        if frozen_until is not None and now_ny.date() <= frozen_until:
+            if self._freeze_logged != frozen_until:
+                self._freeze_logged = frozen_until
+                remaining = (frozen_until - now_ny.date()).days
+                self.logger.info(
+                    f"❄️ 模型凍結中，跳過本週重訓 (至 {frozen_until}，尚餘 {remaining} 天)。"
+                    f" 解除方式: 清空 training_settings.freeze_until。"
+                )
+            return False
+
         year, week, _ = now_ny.isocalendar()
         current_week = f"{year}-W{week:02d}"
         return self.last_retrain_date != current_week
+
+    def _freeze_until(self):
+        """讀取凍結到期日。格式錯誤時「不」凍結，但明確報錯 —— 靜默凍結更危險。"""
+        try:
+            raw = self.engine.config.get("training_settings.freeze_until")
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            return datetime.date.fromisoformat(str(raw).strip())
+        except (ValueError, TypeError):
+            self.logger.error(
+                f"training_settings.freeze_until 格式錯誤 ({raw!r})，"
+                f"應為 YYYY-MM-DD。本次不套用凍結。"
+            )
+            return None
 
     def _mark_retrained(self, now_ny: datetime.datetime):
         year, week, _ = now_ny.isocalendar()
         self.last_retrain_date = f"{year}-W{week:02d}"
         self._save_state()
 
-    # ------------------------------------------------------------------
-    # 主迴圈
-    # ------------------------------------------------------------------
 
     def _scan_order(self):
         """
@@ -264,7 +274,6 @@ class SystemDaemon:
                 now_ny = datetime.datetime.now(ny_tz)
                 is_open = self._is_market_open(now_ny)
 
-                # 先回收已完成的重訓 task，主迴圈不會停下來等它
                 if self._retrain_task is not None and self._retrain_task.done():
                     try:
                         if self._retrain_task.result():
@@ -275,7 +284,6 @@ class SystemDaemon:
                         self._retrain_task = None
 
                 if is_open:
-                    # ===== 盤中：執行高頻實盤交易 =====
                     if self._retrain_task is not None:
                         self.logger.warning(
                             "⚠️ 重訓仍在進行中，本輪僅維持連線，不進行交易決策。"
@@ -293,7 +301,7 @@ class SystemDaemon:
                         await self.engine.update_system_state()
                         for symbol in self._scan_order():
                             await self.engine.run_tick(symbol)
-                            await asyncio.sleep(2)  # 避免 API 風險
+                            await asyncio.sleep(2)
 
                     self.logger.info(
                         f"✅ 掃描完成。等待下一個 {self.tick_interval_minutes} 分鐘 K 線..."
@@ -301,7 +309,6 @@ class SystemDaemon:
                     await asyncio.sleep(self.tick_interval_minutes * 60)
 
                 else:
-                    # ===== 盤後/週末：維護與模型重訓 =====
                     self.logger.info(
                         f"🌙 盤後時間 (NY: {now_ny.strftime('%H:%M')}) - 系統進入休眠/維護模式。"
                     )
@@ -314,7 +321,6 @@ class SystemDaemon:
                             self._run_retrain_subprocess()
                         )
 
-                    # 盤後每 5 分鐘檢查一次，隔天開盤最多延遲數分鐘就會甦醒
                     await asyncio.sleep(300)
 
         except asyncio.CancelledError:

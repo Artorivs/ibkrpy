@@ -13,7 +13,6 @@ PROJECT_ROOT = os.path.dirname(
 try:
     from dotenv import load_dotenv
 
-    # 精確載入根目錄下的 .env 檔案
     load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 except ImportError:
     pass
@@ -34,7 +33,6 @@ class ConfigManager:
     """輕量級配置管理器，負責載入 YAML、環境變數與分發參數"""
 
     def __init__(self, config_path: str = None):
-        # 若未指定，則強制使用根目錄的 config.yaml
         self.config_path = config_path or os.path.join(PROJECT_ROOT, "config.yaml")
         self._config_data: Dict[str, Any] = {}
         self.asset_profiles: List[AssetProfile] = []

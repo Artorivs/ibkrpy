@@ -7,7 +7,6 @@ import pandas as pd
 import joblib
 import warnings
 
-# 抑制 hmmlearn 在計算過程中的收斂警告，保持日誌乾淨
 warnings.filterwarnings("ignore")
 
 try:
@@ -62,16 +61,12 @@ class HMMModel:
         """
         df_features = pd.DataFrame(index=df.index)
 
-        # 1. 計算對數收益率 (Log Returns)
         df_features["log_return"] = np.log(df["Close"] / df["Close"].shift(1)) * 100.0
 
-        # 2. 計算短期波動率 (例如 5 日標準差)
         df_features["volatility"] = df_features["log_return"].rolling(window=5).std()
 
-        # 移除 NaN 值，因為 HMM 無法處理包含 NaN 的數據
         df_features = df_features.dropna()
 
-        # hmmlearn 預期輸入形狀為 (n_samples, n_features)
         return df_features[["log_return", "volatility"]].values
 
     def predict_state(self, df: pd.DataFrame) -> int:
@@ -85,7 +80,6 @@ class HMMModel:
             print("警告: HMM 模型未載入，回退至預設狀態 -1")
             return -1
 
-        # 提取特徵
         features = self._prepare_features(df)
 
         if len(features) == 0:
@@ -93,10 +87,8 @@ class HMMModel:
             return -1
 
         try:
-            # 預測這段時間序列所有的隱藏狀態
             hidden_states = self.model.predict(features)
 
-            # 我們只需要最新一根 K 線所處的狀態
             current_state = int(hidden_states[-1])
             return current_state
 

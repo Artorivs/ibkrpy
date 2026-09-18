@@ -53,7 +53,6 @@ class PositionalEmbedding(keras.layers.Layer):
         super().build(input_shape)
 
     def call(self, x):
-        # (look_back, d_model) 廣播加到 (batch, look_back, d_model)
         return x + self.pos_emb
 
     def compute_output_shape(self, input_shape):
@@ -81,8 +80,6 @@ class TransformerModel:
         weights_dir: str = "weights",
     ):
         self.look_back = look_back
-        # 預設對齊 OHLCV 5 特徵。若訓練時使用了更多特徵，
-        # 務必在此傳入同一份清單，否則會 shape mismatch。
         self.feature_cols = feature_cols or ["Open", "High", "Low", "Close", "Volume"]
         self.features = len(self.feature_cols)
 
@@ -101,14 +98,11 @@ class TransformerModel:
         """構建具備位置編碼的 Transformer Encoder 架構"""
         inputs = Input(shape=(self.look_back, self.features), name="ohlcv_window")
 
-        # --- 輸入投影：把 5 維特徵升到 d_model，讓殘差流有足夠寬度 ---
         x = Dense(self.d_model, name="input_projection")(inputs)
 
-        # --- 位置編碼 ---
         x = PositionalEmbedding(self.look_back, self.d_model, name="positional")(x)
         x = Dropout(self.dropout_rate)(x)
 
-        # --- Transformer Blocks (Post-LN) ---
         for i in range(self.num_blocks):
             attn = MultiHeadAttention(
                 key_dim=self.head_size,
@@ -123,8 +117,6 @@ class TransformerModel:
             ff = Dense(self.d_model, name=f"ff_out_{i}")(ff)
             x = LayerNormalization(epsilon=1e-6, name=f"ln_ff_{i}")(x + ff)
 
-        # --- 取最後一個時間步 ---
-        # 用 Cropping1D + Flatten 而非 Lambda，確保 .keras 序列化不需要 custom_objects。
         x = Cropping1D(cropping=(self.look_back - 1, 0), name="take_last_step")(x)
         x = Flatten(name="flatten_last")(x)
 
@@ -134,7 +126,6 @@ class TransformerModel:
 
         model = Model(inputs, outputs, name="ibkrpy_transformer")
 
-        # 使用 Huber Loss 對抗極端值 (黑天鵝防護)
         optimizer = keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0)
         model.compile(optimizer=optimizer, loss=tf.keras.losses.Huber(delta=1.0))
 
@@ -171,7 +162,6 @@ class TransformerModel:
         if missing_cols:
             raise ValueError(f"數據缺失必要特徵欄位: {missing_cols}")
 
-        # 嚴格過濾欄位，避免 df 的指標無限膨脹導致 keras shape 報錯
         data = df[self.feature_cols].iloc[-self.look_back :].values
         return np.expand_dims(data, axis=0)
 

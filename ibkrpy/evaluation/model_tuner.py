@@ -32,27 +32,22 @@ class ModelTuner:
         sortino = perf.get("sortino_ratio", 0.0)
         n_trades = perf.get("total_trades", 0)
 
-        # 虧損策略：仍依虧損程度排序，讓 TPE 知道往哪個方向走
         if sortino <= 0:
             mdd = perf.get("max_drawdown_pct", 100.0)
             return sortino - 1.0 - (mdd / 100.0)
 
-        # 樣本數不足：線性遞減而非硬切，避免與虧損策略混為一談
         sample_penalty = 1.0
         if n_trades < 5:
             sample_penalty = max(0.05, n_trades / 5.0)
 
-        # 2. 獲利因子 (Profit Factor)
         pf = perf.get("profit_factor", 0.0)
         pf_multiplier = (
             np.log(pf) if (1.0 < pf < 100) else (pf - 1.0 if pf <= 1.0 else 4.6)
         )
 
-        # 3. 最大回撤懲罰
         mdd = perf.get("max_drawdown_pct", 100.0)
         mdd_penalty = max(0.1, 1.0 - (mdd / 100.0))
 
-        # 4. 交易頻率懲罰
         trade_penalty = 1.0
         if n_trades > 40:
             trade_penalty = 40.0 / n_trades
@@ -82,7 +77,6 @@ class ModelTuner:
                 "min_prediction_threshold_pct", 0.001, 0.020
             )
 
-            # 止損與停利的探索區間，產生買賣跨度
             sl_mult = trial.suggest_float("volatility_stop_loss_multiplier", 0.5, 2.0)
             tp_mult = trial.suggest_float("volatility_take_profit_multiplier", 1.0, 3.0)
 
@@ -90,7 +84,7 @@ class ModelTuner:
                 "min_prediction_threshold_pct": min_pred_pct,
                 "volatility_stop_loss_multiplier": sl_mult,
                 "volatility_take_profit_multiplier": tp_mult,
-                "term": term,  # 動態使用外部傳入的競技週期
+                "term": term,
             }
             strategy = CoreStrategy(symbol, config)
             signals = []

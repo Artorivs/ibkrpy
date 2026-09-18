@@ -56,7 +56,6 @@ class TradingDashboard:
         self._update_data()
 
     def _build_ui(self):
-        # --- 頂部狀態列 ---
         top_frame = ttk.Frame(self.root, padding=10)
         top_frame.pack(side=tk.TOP, fill=tk.X)
         title_lbl = ttk.Label(
@@ -67,7 +66,6 @@ class TradingDashboard:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # --- 左側：AI 交易紀錄 ---
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         ttk.Label(left_frame, text="📝 實盤 交易紀錄", style="Header.TLabel").pack(
@@ -87,11 +85,9 @@ class TradingDashboard:
         self.tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # --- 右側：資金與圖表 ---
         right_frame = ttk.Frame(main_frame, width=480)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # --- 右上：帳戶狀態 ---
         ttk.Label(
             right_frame, text="💼 帳戶資金與實盤庫存", style="Header.TLabel"
         ).pack(anchor=tk.W, pady=(0, 5))
@@ -108,7 +104,6 @@ class TradingDashboard:
         )
         self.account_info_text.pack(fill=tk.X, pady=(0, 15))
 
-        # 圖表控制區
         chart_ctrl_frame = ttk.Frame(right_frame)
         chart_ctrl_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(
@@ -124,15 +119,13 @@ class TradingDashboard:
         self.chart_selector.pack(side=tk.LEFT, padx=5)
         self.chart_selector.set("💰 帳戶收益曲線 (Equity)")
 
-        # --- 右下：圖表繪製區 (只建立一次 ax 以防止記憶體洩漏) ---
         self.figure = plt.Figure(figsize=(5, 3.5), dpi=100, facecolor="#1E1E1E")
         self.ax = self.figure.add_subplot(111)
-        self.ax2 = None  # 預留副座標軸參考
+        self.ax2 = None
 
         self.canvas = FigureCanvasTkAgg(self.figure, right_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # --- 底部：實時終端機 ---
         bottom_frame = ttk.Frame(self.root, padding=10)
         bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Label(
@@ -174,7 +167,6 @@ class TradingDashboard:
     def _update_data(self):
         """每 5 秒自動讀取資料庫刷新畫面"""
         try:
-            # 1. 更新交易紀錄
             df_trades = self.db._fetch_sync(
                 "SELECT * FROM trade_logs ORDER BY timestamp DESC LIMIT 20"
             )
@@ -198,7 +190,6 @@ class TradingDashboard:
             self.tree.tag_configure("buy", foreground="#00FF7F")
             self.tree.tag_configure("sell", foreground="#FF3366")
 
-            # 2. 更新帳戶狀態 (加入差異對比)
             account_data = self.db._fetch_sync("SELECT * FROM account_state WHERE id=1")
             position_data = self.db._fetch_sync(
                 "SELECT * FROM portfolio_positions ORDER BY symbol"
@@ -227,7 +218,6 @@ class TradingDashboard:
                 self.account_info_text.delete(1.0, tk.END)
                 self.account_info_text.insert(tk.END, new_acc_text)
 
-            # 3. 動態更新下拉選單選項
             symbols_data = self.db._fetch_sync(
                 "SELECT DISTINCT symbol FROM market_data"
             )
@@ -241,10 +231,8 @@ class TradingDashboard:
             if current_selection not in options and options:
                 self.chart_selector.set(options[0])
 
-            # 4. 根據選單繪製指定的圖表 (安全清除 Axes，防範洩漏)
             selection = self.chart_selector.get()
 
-            # 清除副座標軸
             if self.ax2 is not None:
                 self.ax2.remove()
                 self.ax2 = None
@@ -341,7 +329,6 @@ class TradingDashboard:
             self.figure.autofmt_xdate(rotation=45)
             self.canvas.draw()
 
-            # 5. 更新實時終端機日誌
             self._tail_system_logs()
 
         except Exception as e:

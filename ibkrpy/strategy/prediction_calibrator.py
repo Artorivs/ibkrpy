@@ -16,7 +16,6 @@ import numpy as np
 logger = logging.getLogger("ibkrpy.calibrator")
 
 
-# 值物件
 
 
 @dataclass(frozen=True)
@@ -24,9 +23,9 @@ class ThresholdContext:
     """計算門檻所需的全部輸入。新增欄位不會破壞既有 policy 的簽章。"""
 
     symbol: str
-    sigma: float  # 每根 K 線的價格波動率 (小數)
-    history: Sequence[float]  # 該標的過往的預測幅度 (小數, 有正負)
-    min_edge_pct: float = 0.0005  # 交易成本地板
+    sigma: float
+    history: Sequence[float]
+    min_edge_pct: float = 0.0005
     term: str = "long_term"
 
 
@@ -43,12 +42,11 @@ class CollapseReport:
 
     collapsed: bool
     samples: int
-    dispersion: float  # 預測值的標準差
-    unique_ratio: float  # 相異值 / 樣本數
+    dispersion: float
+    unique_ratio: float
     detail: str = ""
 
 
-# 預測歷史 (Port + Adapters)
 
 
 class PredictionHistoryStore(ABC):
@@ -127,7 +125,6 @@ class JsonPredictionHistory(InMemoryPredictionHistory):
             logger.warning(f"預測歷史寫入失敗: {e}")
 
 
-# 門檻政策 (Strategy Pattern)
 
 
 class ThresholdPolicy(ABC):
@@ -206,7 +203,7 @@ class CostFloorThresholdPolicy(ThresholdPolicy):
     是把資金餵給價差。
     """
 
-    def __init__(self, inner: ThresholdPolicy, absolute_floor: float = 0.0005):
+    def __init__(self, inner: ThresholdPolicy, absolute_floor: float):
         self._inner = inner
         self._floor = float(absolute_floor)
 
@@ -255,7 +252,6 @@ class FallbackThresholdPolicy(ThresholdPolicy):
         return "Fallback(" + ", ".join(p.name for p in self._policies) + ")"
 
 
-# 塌陷偵測
 
 
 class CollapseDetector:
@@ -274,7 +270,7 @@ class CollapseDetector:
     def __init__(
         self,
         min_samples: int = 20,
-        dispersion_floor: float = 1e-5,  # 預測標準差低於此值視為常數
+        dispersion_floor: float = 1e-5,
         unique_ratio_floor: float = 0.05,
     ):
         self._min_samples = int(min_samples)
@@ -315,7 +311,6 @@ class CollapseDetector:
         return CollapseReport(False, n, dispersion, unique_ratio, "輸出具備變異")
 
 
-# 組裝
 
 
 def build_threshold_policy(config) -> ThresholdPolicy:
@@ -351,12 +346,12 @@ def build_threshold_policy(config) -> ThresholdPolicy:
         )
         cold_start = str(s.get("cold_start", "sigma")).lower()
         if cold_start == "block":
-            inner = quantile_policy  # 樣本不足時門檻為 inf -> 不交易
+            inner = quantile_policy
         else:
             inner = FallbackThresholdPolicy([quantile_policy, sigma_policy])
 
     return CostFloorThresholdPolicy(
-        inner, absolute_floor=float(s.get("cost_floor_pct", 0.0005))
+        inner, absolute_floor=float(s.get("cost_floor_pct"))
     )
 
 

@@ -21,9 +21,6 @@ class BacktestEngine:
         self.slippage_pct = slippage_pct
         self.use_bracket_exits = use_bracket_exits
 
-    # ------------------------------------------------------------------
-    # 工具
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _infer_periods_per_year(index: pd.Index) -> float:
@@ -42,11 +39,9 @@ class BacktestEngine:
             if not np.isfinite(median_sec) or median_sec <= 0:
                 return 252.0
 
-            # 間隔 >= 20 小時視為日線 (跨週末的 gap 會被中位數濾掉)
             if median_sec >= 20 * 3600:
                 return 252.0
 
-            # 盤中資料：一個交易日 6.5 小時 = 23400 秒
             bars_per_day = 23400.0 / median_sec
             return 252.0 * max(bars_per_day, 1.0)
         except Exception:
@@ -60,9 +55,6 @@ class BacktestEngine:
             else price * (1 - self.slippage_pct)
         )
 
-    # ------------------------------------------------------------------
-    # 主迴圈
-    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -89,8 +81,8 @@ class BacktestEngine:
         active_tp: Optional[float] = None
 
         equity_curve = []
-        trades = []  # 每次部位變動
-        round_trips = 0  # 完整的進出場來回次數
+        trades = []
+        round_trips = 0
 
         signal_dict = {sig["timestamp"]: sig for sig in signals}
 
@@ -102,8 +94,6 @@ class BacktestEngine:
                 )
                 continue
 
-            # ========== 1. 先檢查既有部位是否觸發 bracket 出場 ==========
-            # 必須在處理新訊號之前，因為停損停利在盤中隨時可能成交。
             if (
                 simulate_bracket
                 and position != 0
@@ -121,8 +111,6 @@ class BacktestEngine:
                     hit_sl = active_sl is not None and high >= active_sl
                     hit_tp = active_tp is not None and low <= active_tp
 
-                # 同一根 K 線同時觸及兩者時，保守假設先觸發停損。
-                # 沒有 tick 資料就無法判定先後，樂觀假設會系統性高估績效。
                 if hit_sl:
                     exit_price, exit_kind = active_sl, "STOP_LOSS"
                 elif hit_tp:
@@ -148,13 +136,11 @@ class BacktestEngine:
                     active_sl = None
                     active_tp = None
 
-            # ========== 2. 處理新訊號 ==========
             sig = signal_dict.get(ts)
             if sig:
                 action = sig.get("action")
                 target_position = 0
 
-                # 留 5% 資金作為保證金與滑價緩衝
                 if action == "BUY":
                     target_position = int((capital * 0.95) / price)
                 elif action == "SELL":
@@ -167,7 +153,6 @@ class BacktestEngine:
                     capital -= trade_size * fill
                     capital -= abs(trade_size) * self.commission
 
-                    # 反手 (多翻空或空翻多) 同時包含一次出場與一次進場
                     if position != 0 and np.sign(target_position) != np.sign(position):
                         round_trips += 1
 
@@ -191,7 +176,6 @@ class BacktestEngine:
 
             equity_curve.append({"timestamp": ts, "equity": capital + position * price})
 
-        # ========== 3. 回測結束強制平倉結算 ==========
         if position != 0:
             last_price = float(df["Close"].iloc[-1])
             closing_qty = -position
@@ -205,9 +189,6 @@ class BacktestEngine:
 
         return self._evaluate_performance(equity_curve, round_trips, benchmark_df)
 
-    # ------------------------------------------------------------------
-    # 績效結算
-    # ------------------------------------------------------------------
 
     def _evaluate_performance(
         self,
@@ -230,7 +211,6 @@ class BacktestEngine:
         std = bar_returns.std()
         sharpe_ratio = (bar_returns.mean() / std * ann_factor) if std > 0 else 0.0
 
-        # 索提諾比率 —— 僅懲罰下行風險
         downside = bar_returns[bar_returns < 0]
         downside_std = downside.std() * ann_factor if len(downside) > 1 else 0.0
         sortino_ratio = (
@@ -239,17 +219,14 @@ class BacktestEngine:
             else 0.0
         )
 
-        # 獲利因子 (以每根 K 線的損益衡量，非逐筆交易的損益)
         gains = bar_returns[bar_returns > 0].sum()
         losses = abs(bar_returns[bar_returns < 0].sum())
         profit_factor = (gains / losses) if losses > 0 else float("inf")
 
-        # 最大回撤
         roll_max = df_eq["equity"].cummax()
         drawdown = df_eq["equity"] / roll_max - 1
         max_drawdown_pct = abs(drawdown.min()) * 100
 
-        # 資訊比率與追蹤誤差
         tracking_error = 0.0
         information_ratio = 0.0
 

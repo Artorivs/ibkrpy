@@ -16,7 +16,7 @@ NY = ZoneInfo("America/New_York")
 
 try:
     import pandas_market_calendars as mcal
-except ImportError:  # pragma: no cover
+except ImportError:
     mcal = None
 
 
@@ -28,11 +28,11 @@ class Session(str, Enum):
     且流動性與價差和日盤完全不同 —— 不可以套用同一組成本假設。
     """
 
-    CLOSED = "closed"  # 休市 (週末 / 假日 / 03:50-04:00 空檔)
-    PRE = "pre"  # 04:00 - 09:30  盤前
-    RTH = "rth"  # 09:30 - 16:00  常規時段
-    POST = "post"  # 16:00 - 20:00  盤後
-    OVERNIGHT = "overnight"  # 20:00 - 03:50 (次日)
+    CLOSED = "closed"
+    PRE = "pre"
+    RTH = "rth"
+    POST = "post"
+    OVERNIGHT = "overnight"
 
     @property
     def is_tradable(self) -> bool:
@@ -44,7 +44,6 @@ class Session(str, Enum):
         return self in (Session.PRE, Session.POST, Session.OVERNIGHT)
 
 
-# 各時段的邊界 (紐約時間)。RTH 的實際邊界改由日曆提供，以處理提早收市。
 _PRE_OPEN = dt.time(4, 0)
 _RTH_OPEN = dt.time(9, 30)
 _RTH_CLOSE = dt.time(16, 0)
@@ -55,8 +54,8 @@ _OVERNIGHT_CLOSE = dt.time(3, 50)
 @dataclass(frozen=True)
 class SessionState:
     session: Session
-    now: dt.datetime  # 紐約時間
-    next_change: dt.datetime  # 下一次時段轉換的時刻 (紐約時間)
+    now: dt.datetime
+    next_change: dt.datetime
     next_session: Session
 
     @property
@@ -88,9 +87,6 @@ class SessionClock:
                 " 休市日與提早收市日將無法辨識，建議執行 poetry install 補齊相依。"
             )
 
-    # ------------------------------------------------------------------
-    # 日曆
-    # ------------------------------------------------------------------
 
     def _rth_bounds(self, day: dt.date) -> Optional[Tuple[dt.datetime, dt.datetime]]:
         """該日的 (開盤, 收盤)，紐約時間。休市日回傳 None。"""
@@ -112,7 +108,7 @@ class SessionClock:
         else:
             bounds = self._crude_bounds(day)
 
-        if len(self._cache) > 400:  # 一年份，足夠且不會無限成長
+        if len(self._cache) > 400:
             self._cache.clear()
         self._cache[day] = bounds
         return bounds
@@ -137,25 +133,16 @@ class SessionClock:
                 return cand
         return None
 
-    # ------------------------------------------------------------------
-    # 時段判斷
-    # ------------------------------------------------------------------
 
     def classify(self, now: Optional[dt.datetime] = None) -> Session:
         now = self._to_ny(now)
         t = now.time()
 
-        # 夜盤跨日: 20:00 起算，到「次一交易日」的 03:50 為止。
         if self.enable_overnight:
-            # 夜盤「先於」交易日，不是「跟在」交易日之後:
-            # 週日 20:00 -> 週一 03:50 存在，週五 20:00 之後則沒有夜盤。
-            # 因此判斷依據是「次一『日曆日』是否為交易日」，不是次一交易日
-            # (用 _next_trading_day 會讓週五晚上跳到週一，錯誤地開盤)。
             if t >= _POST_CLOSE:
                 if self.is_trading_day(now.date() + dt.timedelta(days=1)):
                     return Session.OVERNIGHT
             elif t < _OVERNIGHT_CLOSE:
-                # 凌晨時段屬於「今天」這個交易日的夜盤
                 if self.is_trading_day(now.date()):
                     return Session.OVERNIGHT
 
@@ -170,9 +157,6 @@ class SessionClock:
             return Session.RTH
         return Session.POST if t < _POST_CLOSE else Session.CLOSED
 
-    # ------------------------------------------------------------------
-    # 下一次轉換 —— deepsleep 的核心
-    # ------------------------------------------------------------------
 
     def next_transition(
         self, now: Optional[dt.datetime] = None
@@ -194,7 +178,6 @@ class SessionClock:
             if nxt is not current:
                 return cand, nxt
 
-        # 理論上不會走到這裡 (掃描範圍涵蓋 10 天)。保守回退。
         fallback = now + dt.timedelta(hours=1)
         return fallback, self.classify(fallback)
 
@@ -207,11 +190,9 @@ class SessionClock:
             for tod in (_OVERNIGHT_CLOSE, _PRE_OPEN, _POST_CLOSE):
                 out.append(dt.datetime.combine(day, tod, tzinfo=NY))
             if bounds is not None:
-                out.extend(bounds)  # 真實開收盤，含提早收市
+                out.extend(bounds)
             else:
-                # 休市日也要有邊界，否則跨週末時會找不到轉換點
                 out.append(dt.datetime.combine(day, _RTH_OPEN, tzinfo=NY))
-        # 每分鐘上界，避免 classify 在同一秒來回抖動
         return sorted(c.replace(second=0, microsecond=0) for c in set(out))
 
     def state(self, now: Optional[dt.datetime] = None) -> SessionState:
@@ -220,7 +201,6 @@ class SessionClock:
         when, nxt = self.next_transition(now)
         return SessionState(current, now, when, nxt)
 
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _to_ny(now: Optional[dt.datetime]) -> dt.datetime:

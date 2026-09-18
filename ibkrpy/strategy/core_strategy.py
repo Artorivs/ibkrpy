@@ -30,7 +30,6 @@ class CoreStrategy:
         self.sl_noise_floor_mult = self.config.get("sl_noise_floor_multiplier", 0.5)
         self.min_reward_risk = self.config.get("min_reward_risk_ratio", 1.0)
 
-        # --- 進出場的非對稱設定 ---
         self.exit_threshold_ratio = self.config.get("exit_threshold_ratio", 0.5)
         self.reversal_caution_level = self.config.get("reversal_caution_level", 0.5)
         self.reversal_threshold_boost = self.config.get("reversal_threshold_boost", 1.0)
@@ -46,12 +45,8 @@ class CoreStrategy:
         self.prediction_history = prediction_history
         self.collapse_detector = collapse_detector
 
-        # 最近一次決策的完整說明。TradingEngine 每個 tick 都會讀它並寫進日誌。
         self.last_decision: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------------
-    # 決策紀錄
-    # ------------------------------------------------------------------
 
     def _reject(self, code: str, detail: str, **fields) -> None:
         self.last_decision = {
@@ -104,9 +99,6 @@ class CoreStrategy:
             parts.append("| " + " · ".join(nums))
         return " ".join(p for p in parts if p)
 
-    # ------------------------------------------------------------------
-    # Ensemble
-    # ------------------------------------------------------------------
 
     MAD_MIN_MODELS = 5
 
@@ -169,9 +161,6 @@ class CoreStrategy:
         """
         self._model_liveness = dict(liveness or {})
 
-    # ------------------------------------------------------------------
-    # 出場幾何
-    # ------------------------------------------------------------------
 
     def _build_exit_geometry(
         self, expected_move: float, volatility: float, regime: MarketRegime
@@ -196,7 +185,6 @@ class CoreStrategy:
             sl_mult *= 1.2
             tp_mult *= 0.8
 
-        # --- 停利：錨定預測，上下都有護欄 ---
         tp_dist = expected_move * self.tp_capture_ratio
         tp_ceiling = volatility * tp_mult
         capped_by_ceiling = tp_ceiling > 0 and tp_ceiling < tp_dist
@@ -204,7 +192,6 @@ class CoreStrategy:
             tp_dist = min(tp_dist, tp_ceiling)
         tp_dist = max(tp_dist, self.min_edge_pct)
 
-        # --- 停損：由目標風報比反推，再套雜訊下限與風險上限 ---
         target_rr = max(self.min_reward_risk, 1e-6)
         noise_floor = volatility * self.sl_noise_floor_mult
         risk_cap = max(volatility * sl_mult, noise_floor)
@@ -225,9 +212,6 @@ class CoreStrategy:
             "noise_bound": sl_dist > sl_ideal + 1e-12,
         }
 
-    # ------------------------------------------------------------------
-    # 主入口
-    # ------------------------------------------------------------------
 
     def generate_signal(
         self,
@@ -329,7 +313,6 @@ class CoreStrategy:
                 f"{decision.source}×{self.exit_threshold_ratio:g}(出場)"
             )
         elif reversal_risk >= self.reversal_caution_level:
-            # 盤頭跡象明顯時，新增曝險必須拿出更強的證據。
             inflation = 1.0 + reversal_risk * self.reversal_threshold_boost
             dynamic_threshold *= inflation
             common["threshold_pct"] = dynamic_threshold

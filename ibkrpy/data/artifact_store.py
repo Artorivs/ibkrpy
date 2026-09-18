@@ -1,19 +1,5 @@
 # ibkrpy/data/artifact_store.py
 # 訓練產物 (scaler + feature manifest) 的儲存層
-#
-# 檔案佈局
-# --------
-#   weights/_training_artifacts.json
-#   {
-#     "version": 1,
-#     "artifacts": {
-#       "AAPL": {
-#         "scaler":   {"Close": {"min": .., "max": ..}, ...},
-#         "manifest": {"features": [...], "price_relative": [...], ...},
-#         "updated":  "2026-08-31T12:00:00Z"
-#       }
-#     }
-#   }
 
 from __future__ import annotations
 
@@ -31,13 +17,11 @@ logger = logging.getLogger("ibkrpy.artifact_store")
 ScalerDict = Dict[str, Dict[str, float]]
 ManifestDict = Dict[str, object]
 
-# Walk-forward 產生的暫時標的。這些產物不落盤。
 WF_MARKER = "__wf"
 
 SCALER = "scaler"
 MANIFEST = "manifest"
 
-# 舊格式的檔名後綴 -> bundle 內的鍵
 _LEGACY_SUFFIX = {"_scaler.json": SCALER, "_features.json": MANIFEST}
 
 
@@ -139,7 +123,6 @@ class LegacyFileStore(ArtifactStore):
         self._write(symbol, MANIFEST, manifest)
 
     def save_bundle(self, symbol, scaler=None, manifest=None):
-        # 舊格式本質上做不到跨檔原子性，這正是要遷移的理由之一。
         if manifest is not None:
             self.save_manifest(symbol, manifest)
         if scaler is not None:
@@ -186,17 +169,17 @@ class LegacyScalersJsonStore(ArtifactStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"_scalers.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"scalers.json 讀取失敗 ({self.path}): {e}")
             return self._cache or {}
 
     def load_scaler(self, symbol):
         return self._read_all().get(symbol)
 
     def load_manifest(self, symbol):
-        return None  # 此格式不含 manifest
+        return None
 
     def save_scaler(self, symbol, scaler):
-        pass  # 唯讀
+        pass
 
     def save_manifest(self, symbol, manifest):
         pass
@@ -316,7 +299,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
         self._mtime: float = -1.0
         self._warned_unpaired: set = set()
 
-    # -- 檔案 I/O --
 
     def _read_all(self) -> Dict[str, dict]:
         if not os.path.exists(self.path):
@@ -331,13 +313,12 @@ class ConsolidatedArtifactStore(ArtifactStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"_training_artifacts.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"training_artifacts.json 讀取失敗 ({self.path}): {e}")
             return self._cache or {}
 
     def _write_all(self, data: Dict[str, dict]) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         blob = {"version": self.VERSION, "artifacts": data}
-        # 原子寫入: 先寫暫存檔再 rename。中途當機不會留下半個 JSON。
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path) or ".", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -354,7 +335,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
         self._cache = data
         self._mtime = os.path.getmtime(self.path)
 
-    # -- 讀取 --
 
     def _get(self, symbol: str, kind: str):
         entry = self._read_all().get(symbol)
@@ -397,7 +377,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
                 f"這代表上次訓練中途失敗，該標的的預測不可信，請重新執行 --mode train。"
             )
 
-    # -- 寫入 --
 
     def save_scaler(self, symbol: str, scaler: ScalerDict) -> None:
         self.save_bundle(symbol, scaler=scaler)
@@ -407,11 +386,11 @@ class ConsolidatedArtifactStore(ArtifactStore):
 
     def save_bundle(self, symbol, scaler=None, manifest=None) -> None:
         if WF_MARKER in symbol:
-            return  # walk-forward 不落盤
+            return
         if scaler is None and manifest is None:
             return
         with _FileLock(self.path):
-            self._mtime = -1.0  # 強制重讀，避免蓋掉其他行程剛寫入的內容
+            self._mtime = -1.0
             data = dict(self._read_all())
             entry = dict(data.get(symbol) or {})
             if scaler is not None:
@@ -437,7 +416,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
     def symbols(self) -> List[str]:
         return sorted(self._read_all().keys())
 
-    # -- 稽核與遷移 --
 
     def audit(self) -> Dict[str, List[str]]:
         """回傳 {"paired": [...], "scaler_only": [...], "manifest_only": [...]}"""
@@ -471,7 +449,7 @@ class ConsolidatedArtifactStore(ArtifactStore):
                     (MANIFEST, legacy.load_manifest),
                 ):
                     if entry.get(kind) is not None:
-                        continue  # 已遷移，不覆寫
+                        continue
                     blob = loader(sym)
                     if blob:
                         entry[kind] = blob
@@ -524,10 +502,10 @@ def build_artifact_store(weights_dir: str, config=None) -> ArtifactStore:
     if not _setting(config, "consolidated", True):
         return legacy_files
 
-    filename = _setting(config, "filename", "_training_artifacts.json")
+    filename = _setting(config, "filename", "training_artifacts.json")
     fallback = ChainedArtifactStore(
         [
-            LegacyScalersJsonStore(os.path.join(weights_dir, "_scalers.json")),
+            LegacyScalersJsonStore(os.path.join(weights_dir, "scalers.json")),
             legacy_files,
         ]
     )
