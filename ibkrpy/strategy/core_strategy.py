@@ -47,7 +47,6 @@ class CoreStrategy:
 
         self.last_decision: Dict[str, Any] = {}
 
-
     def _reject(self, code: str, detail: str, **fields) -> None:
         self.last_decision = {
             "symbol": self.symbol,
@@ -98,7 +97,6 @@ class CoreStrategy:
         if nums:
             parts.append("| " + " · ".join(nums))
         return " ".join(p for p in parts if p)
-
 
     MAD_MIN_MODELS = 5
 
@@ -161,7 +159,6 @@ class CoreStrategy:
         """
         self._model_liveness = dict(liveness or {})
 
-
     def _build_exit_geometry(
         self, expected_move: float, volatility: float, regime: MarketRegime
     ) -> Optional[Dict[str, float]]:
@@ -211,7 +208,6 @@ class CoreStrategy:
             "noise_floor": noise_floor,
             "noise_bound": sl_dist > sl_ideal + 1e-12,
         }
-
 
     def generate_signal(
         self,

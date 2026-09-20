@@ -39,7 +39,6 @@ class ModelOrchestrator:
         self._loaded_models: Dict[str, Any] = {}
         self._loaded_mtimes: Dict[str, float] = {}
 
-
     def _weight_path(self, symbol: str, model_type: str) -> Optional[str]:
         pattern = self._WEIGHT_FILE_PATTERNS.get(model_type)
         if not pattern:
@@ -179,7 +178,6 @@ class ModelOrchestrator:
                 f"{symbol} 的 manifest，且 ModelOrchestrator 有把 symbol 傳給工廠；"
                 f"否則請重新執行 --mode train。"
             )
-
 
     def predict(
         self, symbol: str, df: pd.DataFrame, model_type: str = "LSTM"

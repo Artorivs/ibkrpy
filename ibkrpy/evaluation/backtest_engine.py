@@ -21,7 +21,6 @@ class BacktestEngine:
         self.slippage_pct = slippage_pct
         self.use_bracket_exits = use_bracket_exits
 
-
     @staticmethod
     def _infer_periods_per_year(index: pd.Index) -> float:
         """
@@ -54,7 +53,6 @@ class BacktestEngine:
             if is_buy
             else price * (1 - self.slippage_pct)
         )
-
 
     def run(
         self,
@@ -188,7 +186,6 @@ class BacktestEngine:
                 equity_curve[-1]["equity"] = capital
 
         return self._evaluate_performance(equity_curve, round_trips, benchmark_df)
-
 
     def _evaluate_performance(
         self,

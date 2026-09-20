@@ -110,7 +110,6 @@ class ConsolidatedScalerStore(ScalerStore):
         self._cache: Dict[str, ScalerDict] = {}
         self._mtime: float = -1.0
 
-
     def _read_all(self) -> Dict[str, ScalerDict]:
         if not os.path.exists(self.path):
             return {}
@@ -145,7 +144,6 @@ class ConsolidatedScalerStore(ScalerStore):
             raise
         self._cache = data
         self._mtime = os.path.getmtime(self.path)
-
 
     def load(self, symbol: str) -> Optional[ScalerDict]:
         found = self._read_all().get(symbol)

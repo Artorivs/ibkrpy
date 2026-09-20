@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -12,8 +11,6 @@ logger = logging.getLogger("ibkrpy.execution_costs")
 _SEC_FEE_RATE = 0.0000278
 _FINRA_TAF_PER_SHARE = 0.000166
 _FINRA_TAF_CAP = 8.30
-
-
 
 
 class CommissionModel(ABC):
@@ -74,8 +71,6 @@ _COMMISSION_MODELS = {
     "ibkr_tiered": IBKRTieredCommission,
     "zero": ZeroCommission,
 }
-
-
 
 
 @dataclass(frozen=True)
@@ -157,7 +152,6 @@ class ExecutionCostModel:
             )
 
         return RoundTripCost(notional, commission, spread, slippage, regulatory)
-
 
     def min_notional_for_cost(
         self,

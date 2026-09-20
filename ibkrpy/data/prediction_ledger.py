@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import datetime as dt
@@ -120,7 +119,6 @@ class PredictionLedger:
             logger.error(f"預測帳本初始化失敗，已停用: {e}")
             self.enabled = False
 
-
     _INSERT = """
         INSERT OR IGNORE INTO prediction_ledger
         (symbol, timestamp, term, timeframe, horizon_bars,
@@ -182,7 +180,6 @@ class PredictionLedger:
                 conn.commit()
         except Exception as e:
             logger.warning(f"[{rec.symbol}] 預測帳本寫入失敗 (不影響交易): {e}")
-
 
     def resolve(self, max_rows: int = 20000) -> Dict[str, int]:
         """
@@ -264,7 +261,6 @@ class PredictionLedger:
         except Exception:
             return None
 
-
     def fetch_resolved(self, symbol: str = None, min_rows: int = 0) -> List[dict]:
         if not self.enabled:
             return []
@@ -284,8 +280,6 @@ class PredictionLedger:
         except Exception as e:
             logger.error(f"預測帳本讀取失敗: {e}")
             return []
-
-
 
 
 def measure(rows: List[dict], min_samples: int = 30) -> Optional[dict]:

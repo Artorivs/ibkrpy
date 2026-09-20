@@ -61,7 +61,6 @@ class SystemDaemon:
                 " 休市日與提早收市日將無法辨識，建議執行 poetry install 補齊相依。"
             )
 
-
     def _load_state(self) -> dict:
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
@@ -76,7 +75,6 @@ class SystemDaemon:
                 json.dump({"last_retrain_date": self.last_retrain_date}, f)
         except Exception as e:
             self.logger.error(f"寫入 daemon 狀態失敗: {e}")
-
 
     def _get_session(self, day: datetime.date):
         """
@@ -118,7 +116,6 @@ class SystemDaemon:
         market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
         return market_open <= now_ny <= market_close
 
-
     async def _handle_reconnect(self):
         """處理 IBKR API 在 24 小時運行中可能出現的斷線問題"""
         if self.ib_manager.ib.isConnected():
@@ -143,16 +140,9 @@ class SystemDaemon:
             else:
                 self.logger.warning(msg)
 
-
     async def _run_retrain_subprocess(self):
         """
-        以獨立 subprocess 執行完整重訓。
-
-        用獨立行程而非 asyncio.to_thread 的理由：
-          1. TensorFlow 會在行程層級固定執行緒池與記憶體，訓練結束後不會歸還；
-             獨立行程結束即完全釋放。
-          2. 訓練中的例外或 OOM 不會拖垮 24/7 的交易主行程。
-          3. GIL 完全隔離，主迴圈的心跳絕對不會被拖慢。
+        以獨立 subprocess 執行完整重訓
         """
         cmd = [
             sys.executable,
@@ -247,14 +237,9 @@ class SystemDaemon:
         self.last_retrain_date = f"{year}-W{week:02d}"
         self._save_state()
 
-
     def _scan_order(self):
         """
-        [修正] 輪替掃描起點。
-
-        資金有限時，固定順序會讓 config.yaml 中排在後面的標的長期拿不到資金
-        (前面的標的先把現金用完，後面的因低於 min_trade_usd 被跳過)。
-        每輪把起點往後移一格，長期下來機會均等。
+        輪替掃描起點
         """
         if not self.symbols:
             return []

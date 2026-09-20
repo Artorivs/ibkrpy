@@ -460,13 +460,11 @@ class PipelineManager:
         except Exception as e:
             logger.warning(f"	⚠️ GARCH 訓練失敗: {e}")
 
-
         bundle_path = os.path.join(weights_dir, f"{symbol}_classical.pkl")
         joblib.dump(classical_bundle, bundle_path)
 
         if os.path.exists(bundle_path):
             logger.info(f"	✅ [{symbol}] 統計模型整合包 (Classical Bundle) 寫入完成。")
-
 
     def _vectorised_regimes(self, df: pd.DataFrame) -> pd.Series:
         """

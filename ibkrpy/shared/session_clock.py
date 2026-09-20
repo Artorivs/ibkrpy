@@ -87,7 +87,6 @@ class SessionClock:
                 " 休市日與提早收市日將無法辨識，建議執行 poetry install 補齊相依。"
             )
 
-
     def _rth_bounds(self, day: dt.date) -> Optional[Tuple[dt.datetime, dt.datetime]]:
         """該日的 (開盤, 收盤)，紐約時間。休市日回傳 None。"""
         if day in self._cache:
@@ -133,7 +132,6 @@ class SessionClock:
                 return cand
         return None
 
-
     def classify(self, now: Optional[dt.datetime] = None) -> Session:
         now = self._to_ny(now)
         t = now.time()
@@ -156,7 +154,6 @@ class SessionClock:
         if now <= rth_close:
             return Session.RTH
         return Session.POST if t < _POST_CLOSE else Session.CLOSED
-
 
     def next_transition(
         self, now: Optional[dt.datetime] = None
@@ -200,7 +197,6 @@ class SessionClock:
         current = self.classify(now)
         when, nxt = self.next_transition(now)
         return SessionState(current, now, when, nxt)
-
 
     @staticmethod
     def _to_ny(now: Optional[dt.datetime]) -> dt.datetime:

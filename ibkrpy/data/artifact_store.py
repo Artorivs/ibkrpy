@@ -299,7 +299,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
         self._mtime: float = -1.0
         self._warned_unpaired: set = set()
 
-
     def _read_all(self) -> Dict[str, dict]:
         if not os.path.exists(self.path):
             return {}
@@ -334,7 +333,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
             raise
         self._cache = data
         self._mtime = os.path.getmtime(self.path)
-
 
     def _get(self, symbol: str, kind: str):
         entry = self._read_all().get(symbol)
@@ -377,7 +375,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
                 f"這代表上次訓練中途失敗，該標的的預測不可信，請重新執行 --mode train。"
             )
 
-
     def save_scaler(self, symbol: str, scaler: ScalerDict) -> None:
         self.save_bundle(symbol, scaler=scaler)
 
@@ -415,7 +412,6 @@ class ConsolidatedArtifactStore(ArtifactStore):
 
     def symbols(self) -> List[str]:
         return sorted(self._read_all().keys())
-
 
     def audit(self) -> Dict[str, List[str]]:
         """回傳 {"paired": [...], "scaler_only": [...], "manifest_only": [...]}"""

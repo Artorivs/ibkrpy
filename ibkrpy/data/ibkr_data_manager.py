@@ -76,7 +76,6 @@ class IBKRDataManager:
 
         self._error_hook_installed = False
 
-
     async def connect(self):
         if self.ib.isConnected():
             return
@@ -164,7 +163,6 @@ class IBKRDataManager:
 
         logger.warning(f"[IBKR][{sym}] ({errorCode}) {errorString}")
 
-
     @staticmethod
     def _normalise_symbol(symbol: str) -> str:
         """IBKR 的多股別代碼用空白分隔 (BRK B / BF B)，不是點或減號。"""
@@ -242,7 +240,6 @@ class IBKRDataManager:
     def get_cached_contract(self, symbol: str) -> Optional[Contract]:
         return self._contracts.get(self._normalise_symbol(symbol))
 
-
     async def get_net_liquidation(self, currency: str = "USD") -> float:
         if not await self._ensure_connected():
             return 0.0
@@ -254,7 +251,6 @@ class IBKRDataManager:
         except Exception as e:
             logger.warning(f"獲取帳戶淨值失敗: {e}")
         return 0.0
-
 
     @staticmethod
     def _signature(
@@ -356,7 +352,6 @@ class IBKRDataManager:
             "cache_hit_rate": self.cache_hit_rate(),
             "subscriptions": len(self._active_subscriptions),
         }
-
 
     async def fetch_historical_data(
         self,
@@ -464,7 +459,6 @@ class IBKRDataManager:
         if contract is None:
             return pd.DataFrame()
         return await self.fetch_historical_data(contract, **kwargs)
-
 
     async def subscribe_realtime_bars(
         self, contract: Contract, bar_size: int = 5, callback: Callable = None

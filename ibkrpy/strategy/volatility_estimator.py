@@ -38,8 +38,6 @@ class VolatilityEstimate:
         return self.value * math.sqrt(_TRADING_DAYS)
 
 
-
-
 def _close_to_close(
     close: pd.Series, lookback: int, halflife: Optional[float]
 ) -> float:
@@ -117,8 +115,6 @@ def realized_volatility(
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
     ctc = _close_to_close(close, lookback, halflife)
     return ctc if np.isfinite(ctc) and ctc > 0 else float("nan")
-
-
 
 
 class VolatilityEstimator:

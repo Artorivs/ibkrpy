@@ -80,7 +80,6 @@ class DataPipeline:
         self.artifacts = artifact_store
         self._manifests: Dict[str, List[str]] = {}
 
-
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """使用 pandas_ta 快速計算技術指標"""
         import pandas_ta as ta
@@ -118,7 +117,6 @@ class DataPipeline:
                     df_adv[name] = series.reindex(df_adv.index).ffill().bfill()
 
         return df_adv.dropna()
-
 
     def select_model_features(self, df: pd.DataFrame) -> List[str]:
         """
@@ -314,7 +312,6 @@ class DataPipeline:
             self.scalers.pop(symbol, None)
             self._manifests.pop(symbol, None)
 
-
     @staticmethod
     def _compute_scaler(
         df: pd.DataFrame, columns: List[str]
@@ -465,7 +462,6 @@ class DataPipeline:
             return float(current_price * np.exp(log_ret))
 
         return self.inverse_transform_scale(raw, "Close", symbol)
-
 
     def create_sequences(
         self,

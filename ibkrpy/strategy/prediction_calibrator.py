@@ -16,8 +16,6 @@ import numpy as np
 logger = logging.getLogger("ibkrpy.calibrator")
 
 
-
-
 @dataclass(frozen=True)
 class ThresholdContext:
     """計算門檻所需的全部輸入。新增欄位不會破壞既有 policy 的簽章。"""
@@ -45,8 +43,6 @@ class CollapseReport:
     dispersion: float
     unique_ratio: float
     detail: str = ""
-
-
 
 
 class PredictionHistoryStore(ABC):
@@ -123,8 +119,6 @@ class JsonPredictionHistory(InMemoryPredictionHistory):
             self._pending = 0
         except Exception as e:
             logger.warning(f"預測歷史寫入失敗: {e}")
-
-
 
 
 class ThresholdPolicy(ABC):
@@ -252,8 +246,6 @@ class FallbackThresholdPolicy(ThresholdPolicy):
         return "Fallback(" + ", ".join(p.name for p in self._policies) + ")"
 
 
-
-
 class CollapseDetector:
     """
     偵測「模型輸出已退化成常數」。
@@ -309,8 +301,6 @@ class CollapseDetector:
                 f"{n} 次預測僅 {int(unique_ratio * n)} 個相異值",
             )
         return CollapseReport(False, n, dispersion, unique_ratio, "輸出具備變異")
-
-
 
 
 def build_threshold_policy(config) -> ThresholdPolicy:

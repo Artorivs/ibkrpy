@@ -25,8 +25,6 @@ class AssetClassification:
         return not self.sector and not self.industry
 
 
-
-
 class ClassificationProvider(ABC):
     """提供標的的產業分類。單一方法，避免強迫實作者處理用不到的介面 (ISP)。"""
 
@@ -58,12 +56,6 @@ class BenchmarkWriter(ABC):
 
 
 class BenchmarkResolver(ABC):
-    """
-    契約：
-      - 回傳一個 benchmark 代碼，或回傳 None 表示「無法決定，請往下一位詢問」
-      - 絕不拋例外。任何內部錯誤都必須降級為 None 並記錄日誌。
-      - 絕不回傳 symbol 自己 (自我參照的 benchmark 沒有資訊量)
-    """
 
     @abstractmethod
     def resolve(self, symbol: str) -> Optional[str]: ...
@@ -74,14 +66,7 @@ class BenchmarkResolver(ABC):
 
 
 class PinnedBenchmarkResolver(BenchmarkResolver):
-    """
-    讀取訓練階段鎖定的選擇，優先級最高。
-
-    這一層是正確性的關鍵，不只是效能優化：模型吃的 bench_return /
-    bench_correlation 兩個特徵是相對於「訓練時那一檔 benchmark」算出來的。
-    實盤若換成另一檔 ETF，特徵分布就變了，而模型不會報錯，只會安靜地變差。
-    因此只要訓練時做過決定，實盤就必須沿用。
-    """
+    """讀取訓練階段鎖定的選擇"""
 
     def __init__(self, reader: BenchmarkReader):
         self._reader = reader
@@ -98,7 +83,7 @@ class PinnedBenchmarkResolver(BenchmarkResolver):
 
 
 class ExplicitMapResolver(BenchmarkResolver):
-    """使用者在 config.yaml 明確指定的對應，優先於任何自動推導。"""
+    """使用者在 config.yaml 明確指定的對應"""
 
     def __init__(self, mapping: Dict[str, str] = None):
         self._map = {str(k).upper(): str(v).upper() for k, v in (mapping or {}).items()}
@@ -109,12 +94,7 @@ class ExplicitMapResolver(BenchmarkResolver):
 
 
 class SectorEtfResolver(BenchmarkResolver):
-    """
-    依產業分類挑選對應的板塊 ETF。
-
-    先比對 industry 再比對 sector —— 半導體股跟著 SMH 走的程度遠高於
-    跟著整個 XLK 走，這個粒度差異在特徵上是有意義的。
-    """
+    """依產業分類挑選對應的板塊 ETF"""
 
     DEFAULT_SECTOR_MAP = {
         "TECHNOLOGY": "XLK",
@@ -196,16 +176,7 @@ class SectorEtfResolver(BenchmarkResolver):
 
 
 class CorrelationBenchmarkResolver(BenchmarkResolver):
-    """
-    從候選池中挑出與該標的歷史報酬相關性最高的一檔。
-
-    這是最貼近「benchmark 隨標的調整」原意的做法：不依賴任何人工分類，
-    直接讓資料說話。代價是需要候選池的歷史資料已經在資料庫裡，
-    因此它在 Chain 中排在分類法之後 —— 冷啟動時自然降級。
-
-    刻意加上 min_correlation 門檻：若最佳候選的相關性也只有 0.2，
-    那這個 benchmark 對模型是雜訊而非資訊，寧可回 None 交給下一位。
-    """
+    """從候選池中挑出與該標的歷史報酬相關性最高的一檔"""
 
     def __init__(
         self,
@@ -296,9 +267,6 @@ class StaticBenchmarkResolver(BenchmarkResolver):
 class ChainedBenchmarkResolver(BenchmarkResolver):
     """
     Composite / Chain of Responsibility。依序詢問，第一個給出答案的獲勝。
-
-    這是 OCP 的落腳處：要調整優先順序或加入新規則，只需要改組裝清單，
-    既有的 resolver 一行都不用動。
     """
 
     def __init__(self, resolvers: Sequence[BenchmarkResolver]):
@@ -346,8 +314,6 @@ class CachingBenchmarkResolver(BenchmarkResolver):
     @property
     def name(self) -> str:
         return f"Caching({self._inner.name})"
-
-
 
 
 class StaticClassificationProvider(ClassificationProvider):
@@ -402,12 +368,7 @@ class FmpCacheClassificationProvider(ClassificationProvider):
 
 
 class AssetProfileClassificationProvider(ClassificationProvider):
-    """
-    從 config.yaml 的 assets[].tags 推導分類。
-
-    ConfigManager.AssetProfile 一直保留著 tags 欄位，只是沒有消費者。
-    這一層讓舊的 tags 設計重新可用，而不必修改 ConfigManager。
-    """
+    """從 config.yaml 的 assets[].tags 推導分類。"""
 
     def __init__(
         self,
@@ -507,12 +468,7 @@ class DatabaseReturnsProvider(ReturnsProvider):
 class ManifestBenchmarkReader(BenchmarkReader):
     """
     從 DataPipeline 的特徵清單 (weights/training_artifacts.json 內的 manifest)
-    讀出訓練時
-    實際使用的 benchmark。
-
-    這是最高權威的來源：模型權重就是配著那一檔 benchmark 訓練出來的。
-    比 benchmark_map.json 更可信 —— 對應表可能在重訓之間被改動，
-    但 manifest 是與 .keras 權重同時寫出的。
+    讀出訓練時實際使用的 benchmark。
     """
 
     def __init__(self, data_pipeline):
@@ -586,7 +542,6 @@ class NullBenchmarkStore(BenchmarkReader, BenchmarkWriter):
 
     def set(self, symbol: str, benchmark: str) -> None:
         return None
-
 
 
 DEFAULT_CANDIDATE_POOL = [
