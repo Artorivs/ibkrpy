@@ -4,19 +4,13 @@
 import optuna
 import pandas as pd
 import numpy as np
-import os
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple
 from .backtest_engine import BacktestEngine
 import logging
 
 logger = logging.getLogger(__name__)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 
 class ModelTuner:
@@ -111,21 +105,20 @@ class ModelTuner:
             perf = self.engine.run(df, signals)
             return self._calculate_composite_score(perf)
 
+        # [修正] 舊版用 n_jobs=-1 讓每個 CPU 核心各開一條執行緒，同時寫入同一個
+        # SQLite 檔 (data/optuna_study.db)。SQLite 一次只容許一個寫入者，
+        # 寫入排隊超過 5 秒就拋 "database is locked"，整個週期被記為 -999 而淘汰。
+        # objective 是純 Python 迴圈，受 GIL 限制，多執行緒本來也快不了。
+        #
+        # 另外 load_if_exists=True 會把歷次重訓的 trial 累積在同一個 study，
+        # best_params 可能來自用舊資料評分的舊 trial。改為每次重訓一個全新的
+        # 記憶體內 study，只依本次資料選出參數。
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            db_path = os.path.join(DATA_DIR, "optuna_study.db")
-            storage_url = f"sqlite:///{db_path}"
-
-            study_name = f"strategy_{symbol}_{term}"
-
             study = optuna.create_study(
-                study_name=study_name,
-                storage=storage_url,
-                load_if_exists=True,
+                study_name=f"strategy_{symbol}_{term}",
                 direction="maximize",
             )
-
-            study.optimize(objective, n_trials=n_trials, n_jobs=-1)
+            study.optimize(objective, n_trials=n_trials, n_jobs=1)
 
             return study.best_params, study.best_value
         except Exception as e:

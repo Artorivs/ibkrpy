@@ -8,7 +8,8 @@ import time
 from typing import Dict, Any
 from ib_insync import Order, LimitOrder, Stock, TagValue
 from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
-from ibkrpy.shared.session_clock import Session, build_session_clock
+from ibkrpy.shared.session_clock import build_session_clock
+from ibkrpy.data.external_data import align_daily_series
 from ibkrpy.strategy.execution_costs import build_execution_cost_model
 from ibkrpy.data.prediction_ledger import (
     TERM_BARS,
@@ -65,7 +66,7 @@ class TradingEngine:
         if config_manager is None:
             from ibkrpy.shared.config_manager import ConfigManager
 
-            self.config = ConfigManager("config.yaml")
+            self.config = ConfigManager()
         else:
             self.config = config_manager
 
@@ -943,24 +944,13 @@ class TradingEngine:
                         self.cached_vix_series = vix_series
                         self.vix_last_fetch_time = current_time
                         logger.info(
-                            f"🌍 [系統] 成功從 FRED 更新宏觀數據 (VIXCLS)，已寫入本地快取 (有效期限 8 小時)。"
+                            "🌍 [系統] 成功從 FRED 更新宏觀數據 (VIXCLS)，已寫入本地快取 (有效期限 8 小時)。"
                         )
                 except Exception as e:
                     logger.warning(f"⚠️ 獲取 FRED 數據失敗，將維持使用本地快取: {e}")
 
             if self.cached_vix_series is not None and not self.cached_vix_series.empty:
-                vix_daily = self.cached_vix_series.copy()
-                vix_daily.index = vix_daily.index.normalize()
-
-                df_idx_naive = df.index
-                vix_aligned_values = df_idx_naive.normalize().map(vix_daily)
-                vix_aligned = (
-                    pd.Series(vix_aligned_values, index=df.index).ffill().bfill()
-                )
-
-                if vix_aligned.isna().all():
-                    vix_aligned = pd.Series(20.0, index=df.index)
-                macro_dict["VIX"] = vix_aligned
+                macro_dict["VIX"] = align_daily_series(self.cached_vix_series, df.index)
 
         if self.pipeline:
             bench_data = bench_df if not bench_df.empty else None

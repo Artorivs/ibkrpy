@@ -24,6 +24,8 @@ caffeine.on(display=False)
 
 logger = logging.getLogger("ibkrpy.main")
 
+MAX_DEEP_SLEEP_SECONDS = 6 * 3600
+
 core_dir_name = os.path.basename(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
@@ -52,6 +54,7 @@ from ibkrpy.strategy.strategy_components import (
 from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 from ibkrpy.strategy.market_analyzer import MarketAnalyzer
 from ibkrpy.core.system_daemon import SystemDaemon
+from ibkrpy.core.retrain_scheduler import RetrainScheduler
 
 from ibkrpy.models.lstm import LSTMModel
 from ibkrpy.models.transformer import TransformerModel
@@ -127,16 +130,8 @@ def _build_benchmark_stack(config, db_manager, data_pipeline):
     return resolver, store
 
 
-async def run_pipeline_mode(
-    mode: str, target_symbol: str = None, client_id: int = None
-):
-    config = ConfigManager()
-    db_manager = DatabaseManager()
-    data_pipeline = DataPipeline(config=config)
-    ext_fetcher = ExternalDataFetcher(
-        fred_api_key=config.get("api_keys_settings.fred_api_key")
-    )
-
+def _build_ib_manager(config, client_id: int = None) -> IBKRDataManager:
+    """命令列的 --client-id 優先於 config，讓重訓子行程不與主行程搶同一個連線。"""
     ib_manager = IBKRDataManager(
         host=config.get("ib_settings.host", "127.0.0.1"),
         port=config.get("ib_settings.port", 7497),
@@ -149,12 +144,29 @@ async def run_pipeline_mode(
     print(
         f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})..."
     )
+    return ib_manager
+
+
+async def run_pipeline_mode(
+    mode: str, target_symbol: str = None, client_id: int = None
+) -> bool:
+    """
+    回傳是否成功。
+    """
+    config = ConfigManager()
+    db_manager = DatabaseManager()
+    data_pipeline = DataPipeline(config=config)
+    ext_fetcher = ExternalDataFetcher(
+        fred_api_key=config.get("api_keys_settings.fred_api_key")
+    )
+
+    ib_manager = _build_ib_manager(config, client_id)
 
     try:
         await ib_manager.connect()
     except ConnectionError as e:
         logger.error(f"❌ 無法連線至 IBKR，中止本次作業: {e}")
-        return
+        return False
 
     benchmark_resolver, benchmark_store = _build_benchmark_stack(
         config, db_manager, data_pipeline
@@ -180,10 +192,11 @@ async def run_pipeline_mode(
     finally:
         if ib_manager.ib.isConnected():
             ib_manager.ib.disconnect()
+    return True
 
 
 async def live_trading_loop(
-    engine: TradingEngine, symbols: list, interval_minutes: int = 5
+    engine: TradingEngine, symbols: list, retrain: RetrainScheduler = None
 ):
     """
     由 engine.should_tick() 依 bar size 決定該不該問：日 K 標的每小時一次、
@@ -201,14 +214,26 @@ async def live_trading_loop(
     try:
         while True:
             state = clock.state()
+            if retrain is not None:
+                retrain.poll(state.now)
 
             if not state.session.is_tradable:
-                nap = min(state.seconds_until_change, 6 * 3600)
+                nap = min(state.seconds_until_change, MAX_DEEP_SLEEP_SECONDS)
+                if retrain is not None:
+                    retrain.maybe_start(state.now)
+                    nap = min(nap, retrain.seconds_until_recheck(state.now))
                 logger.info(
                     f"😴 {state.session.value} —— 深度休眠 {nap / 3600:.2f} 小時，"
                     f"{state.next_change:%m-%d %H:%M} 進入 {state.next_session.value}"
                 )
                 await asyncio.sleep(max(nap, 1.0))
+                continue
+
+            if retrain is not None and retrain.running:
+                logger.warning("⚠️ 重訓仍在進行中，本輪僅維持連線，不進行交易決策。")
+                await asyncio.sleep(
+                    min(loop_seconds, max(state.seconds_until_change, 1.0))
+                )
                 continue
 
             if state.session is not last_session:
@@ -233,7 +258,8 @@ async def live_trading_loop(
 
             await asyncio.sleep(min(loop_seconds, max(state.seconds_until_change, 1.0)))
     except asyncio.CancelledError:
-        pass
+        if retrain is not None:
+            await retrain.stop()
 
 
 async def run_live_mode(args):
@@ -246,18 +272,7 @@ async def run_live_mode(args):
     data_pipeline = DataPipeline(config=config)
     regime_detector = MarketRegimeDetector(config.get("regime_settings") or {})
 
-    ib_manager = IBKRDataManager(
-        host=config.get("ib_settings.host", "127.0.0.1"),
-        port=config.get("ib_settings.port", 7497),
-        client_id=(
-            args.client_id
-            if args.client_id is not None
-            else config.get("ib_settings.client_id", 1)
-        ),
-    )
-    print(
-        f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})..."
-    )
+    ib_manager = _build_ib_manager(config, args.client_id)
 
     try:
         await ib_manager.connect()
@@ -334,9 +349,7 @@ async def run_live_mode(args):
             collapse_detector=collapse_detector,
         )
 
-    benchmark_resolver, benchmark_store = _build_benchmark_stack(
-        config, db_manager, data_pipeline
-    )
+    benchmark_resolver, _ = _build_benchmark_stack(config, db_manager, data_pipeline)
 
     engine = TradingEngine(
         data_manager=ib_manager,
@@ -354,24 +367,18 @@ async def run_live_mode(args):
         benchmark_resolver=benchmark_resolver,
     )
 
+    def _on_retrained():
+        model_orchestrator.invalidate()
+        logger.info("已清除模型快取，下一輪將載入新權重。")
+
+    retrain = RetrainScheduler(config, on_success=_on_retrained)
+
     try:
         if args.mode == "live":
-            await live_trading_loop(engine, symbols, interval_minutes=5)
+            await live_trading_loop(engine, symbols, retrain=retrain)
         elif args.mode == "daemon":
             await SystemDaemon(
-                ib_manager,
-                engine,
-                PipelineManager(
-                    config,
-                    db_manager,
-                    data_pipeline,
-                    ib_manager,
-                    ext_fetcher,
-                    target_symbol=args.symbol,
-                    benchmark_resolver=benchmark_resolver,
-                    benchmark_store=benchmark_store,
-                ),
-                symbols,
+                ib_manager, engine, symbols, retrain_scheduler=retrain
             ).run_24_7()
     except KeyboardInterrupt:
         pass
@@ -420,15 +427,11 @@ def main():
             sys.exit(0)
 
     match args.mode:
-        case "download":
-            asyncio.run(run_pipeline_mode("download", args.symbol, args.client_id))
-        case "train":
-            asyncio.run(run_pipeline_mode("train", args.symbol, args.client_id))
-        case "autopilot":
-            asyncio.run(run_pipeline_mode("autopilot", args.symbol, args.client_id))
-        case "live":
-            asyncio.run(run_live_mode(args))
-        case "daemon":
+        case "download" | "train" | "autopilot":
+            ok = asyncio.run(run_pipeline_mode(args.mode, args.symbol, args.client_id))
+            if not ok:
+                sys.exit(1)
+        case "live" | "daemon":
             asyncio.run(run_live_mode(args))
 
 

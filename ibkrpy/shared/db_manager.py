@@ -5,7 +5,7 @@ import os
 import sqlite3
 import asyncio
 import pandas as pd
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from .system_log import global_logger
 
 PROJECT_ROOT = os.path.dirname(

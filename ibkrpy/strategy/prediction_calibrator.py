@@ -8,8 +8,8 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Sequence
 
 import numpy as np
 

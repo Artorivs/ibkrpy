@@ -1,7 +1,6 @@
 # ibkrpy/data/data_pipeline.py
 # 數據管線與緩存：負責特徵工程、特徵清單、特徵縮放、序列建構
 
-import json
 import os
 import logging
 import pandas as pd
@@ -82,7 +81,7 @@ class DataPipeline:
 
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """使用 pandas_ta 快速計算技術指標"""
-        import pandas_ta as ta
+        import pandas_ta  # noqa: F401  註冊 DataFrame.ta accessor
 
         df_copy = df.copy()
         df_copy.ta.sma(length=10, append=True)

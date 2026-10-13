@@ -3,9 +3,64 @@
 
 import aiohttp
 import asyncio
+import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Any
 from fredapi import Fred
+
+from ibkrpy.shared.session_clock import NY
+
+DEFAULT_VIX = 20.0
+
+
+def bar_trading_days(index) -> pd.DatetimeIndex:
+    """
+    K 線索引對應的交易日 (naive, 午夜)。
+
+    資料庫與 IBKR (formatDate=2) 的時間都是 UTC。日 K 存成「交易日的 UTC 午夜」，
+    直接取 UTC 日期即可；盤中 K 要換成紐約時間再取日期，否則 20:00 ET 之後的
+    K 線會被算到隔天。
+    """
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is None:
+        return idx.normalize()
+    utc = idx.tz_convert("UTC").tz_localize(None)
+    local = idx.tz_convert(NY).tz_localize(None)
+    is_daily_bar = utc == utc.normalize()
+    return pd.DatetimeIndex(np.where(is_daily_bar, utc, local)).normalize()
+
+
+def align_daily_series(
+    series: Optional[pd.Series], index, default: float = DEFAULT_VIX
+) -> pd.Series:
+    """
+    把日頻序列 (例如 FRED VIXCLS) 對齊到 K 線索引，每根 K 線取「前一個交易日」的值。
+
+    [修正] 舊版直接以帶時區的 K 線索引去 map 無時區的 FRED 日期，
+    永遠對不上，整欄 NaN 後退回常數 20.0 —— 訓練與實盤看到的 VIX 從來不是真的。
+
+    只取前一日的值有兩個理由: 當日收盤的 VIX 在盤中尚未產生 (避免前視偏差)，
+    而 FRED 也要隔日才公布，實盤本來就只拿得到前一日 —— 訓練與實盤因此一致。
+    """
+    if series is None or series.empty:
+        return pd.Series(default, index=index, dtype=float)
+
+    daily = series.dropna().copy()
+    daily.index = pd.DatetimeIndex(daily.index)
+    if daily.index.tz is not None:
+        daily.index = daily.index.tz_localize(None)
+    daily.index = daily.index.normalize()
+    daily = daily[~daily.index.duplicated(keep="last")].sort_index()
+    if daily.empty:
+        return pd.Series(default, index=index, dtype=float)
+
+    days = bar_trading_days(index)
+    pos = daily.index.searchsorted(days, side="left") - 1
+    values = np.where(
+        pos >= 0, daily.to_numpy(dtype=float)[np.clip(pos, 0, None)], np.nan
+    )
+    aligned = pd.Series(values, index=index, dtype=float).bfill()
+    return aligned.fillna(default)
 
 
 class ExternalDataFetcher:

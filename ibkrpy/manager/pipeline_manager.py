@@ -17,7 +17,7 @@ from ibkrpy.shared.config_manager import ConfigManager
 from ibkrpy.shared.db_manager import DatabaseManager
 from ibkrpy.data.data_pipeline import DataPipeline
 from ibkrpy.data.ibkr_data_manager import IBKRDataManager
-from ibkrpy.data.external_data import ExternalDataFetcher
+from ibkrpy.data.external_data import ExternalDataFetcher, align_daily_series
 from ibkrpy.evaluation.model_tuner import ModelTuner
 import logging
 
@@ -218,7 +218,7 @@ class PipelineManager:
             bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
 
             if bus_days_diff <= 0:
-                logger.debug(f"	✅ 資料已是最新狀態，無須同步。")
+                logger.debug("	✅ 資料已是最新狀態，無須同步。")
                 return
 
             days_to_fetch = min(bus_days_diff + 1, total_days)
@@ -399,7 +399,7 @@ class PipelineManager:
             if os.path.exists(lstm_path):
                 logger.info(f"	✅ [成功] LSTM 權重已實體寫入: {lstm_path}")
             else:
-                logger.error(f"	❌ [失敗] LSTM 寫入異常！")
+                logger.error("	❌ [失敗] LSTM 寫入異常！")
 
             logger.info(
                 f"	-> 🚀 擬合 Transformer 模型 (Batch Size: {dynamic_batch_size})..."
@@ -415,11 +415,11 @@ class PipelineManager:
             if os.path.exists(tf_path):
                 logger.info(f"	✅ [成功] Transformer 權重已實體寫入: {tf_path}")
             else:
-                logger.error(f"	❌ [失敗] Transformer 寫入異常！")
+                logger.error("	❌ [失敗] Transformer 寫入異常！")
 
             logger.info(f"✅ [{symbol}] 深度學習模型訓練完畢。\n")
         except ImportError:
-            logger.warning(f"⚠️ 尚未安裝 TensorFlow/Keras，跳過深度學習訓練。")
+            logger.warning("⚠️ 尚未安裝 TensorFlow/Keras，跳過深度學習訓練。")
         except Exception as e:
             logger.error(f"❌ [{symbol}] DL 模型訓練失敗: {e}")
 
@@ -435,7 +435,7 @@ class PipelineManager:
 
         classical_bundle = {}
 
-        logger.info(f"	-> 擬合 ARIMA 模型...")
+        logger.info("	-> 擬合 ARIMA 模型...")
         try:
             from statsmodels.tsa.arima.model import ARIMA
 
@@ -443,11 +443,11 @@ class PipelineManager:
             model_arima = ARIMA(series, order=(5, 1, 0))
             res_arima = model_arima.fit()
             classical_bundle["arima"] = res_arima
-            logger.info(f"	✅ ARIMA 模型訓練完成")
+            logger.info("	✅ ARIMA 模型訓練完成")
         except Exception as e:
             logger.warning(f"	⚠️ ARIMA 訓練失敗: {e}")
 
-        logger.info(f"	-> 擬合 GARCH 模型...")
+        logger.info("	-> 擬合 GARCH 模型...")
         try:
             from arch import arch_model
 
@@ -456,7 +456,7 @@ class PipelineManager:
                 am = arch_model(returns, vol="Garch", p=1, q=1, dist="normal")
                 res_garch = am.fit(disp="off")
                 classical_bundle["garch"] = res_garch.params
-                logger.info(f"	✅ GARCH 模型訓練完成")
+                logger.info("	✅ GARCH 模型訓練完成")
         except Exception as e:
             logger.warning(f"	⚠️ GARCH 訓練失敗: {e}")
 
@@ -798,10 +798,10 @@ class PipelineManager:
             fmp_data = {}
             if self.ext and self.ext.fmp_api_key:
                 if symbol in fmp_cache:
-                    logger.info(f"	-> 🏢 從本地快取讀取 FMP 公司基本面數據...")
+                    logger.info("	-> 🏢 從本地快取讀取 FMP 公司基本面數據...")
                     fmp_data = fmp_cache[symbol]
                 else:
-                    logger.info(f"	-> 🏢 正在向 FMP 請求公司基本面數據...")
+                    logger.info("	-> 🏢 正在向 FMP 請求公司基本面數據...")
                     try:
                         fmp_profile = await self.ext.fetch_fmp_profile(symbol)
                         if fmp_profile:
@@ -868,23 +868,7 @@ class PipelineManager:
 
                 macro_data = {}
                 if global_vix_series is not None and not global_vix_series.empty:
-                    if getattr(global_vix_series.index, "tz", None) is not None:
-                        global_vix_series.index = global_vix_series.index
-                    vix_daily = global_vix_series.copy()
-                    vix_daily.index = vix_daily.index.normalize()
-
-                    df_idx_naive = (
-                        df.index
-                        if getattr(df.index, "tz", None) is not None
-                        else df.index
-                    )
-                    vix_aligned_values = df_idx_naive.normalize().map(vix_daily)
-                    vix_aligned = (
-                        pd.Series(vix_aligned_values, index=df.index).ffill().bfill()
-                    )
-                    if vix_aligned.isna().all():
-                        vix_aligned = pd.Series(20.0, index=df.index)
-                    macro_data["VIX"] = vix_aligned
+                    macro_data["VIX"] = align_daily_series(global_vix_series, df.index)
 
                 logger.info(f"	-> ⏳ 正在評估 {term} 策略潛力...")
                 params, score = self._run_optuna_optimization(
