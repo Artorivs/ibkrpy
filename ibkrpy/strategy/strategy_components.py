@@ -79,6 +79,135 @@ class ReversalRiskRule(IRiskRule):
         return True, f"反轉風險 {float(risk):.0%} 可接受"
 
 
+class EquityWatermark:
+    """Day-start and peak NLV, persisted so a restart doesn't reset them.
+
+    Deposits and withdrawals distort both values; delete the state file after one.
+    """
+
+    def __init__(self, path: str = None):
+        self.path = path
+        self.day: str = None
+        self.day_start: float = None
+        self.peak: float = None
+        self.halted_day: str = None
+        self._load()
+
+    def _load(self):
+        if not self.path:
+            return
+        try:
+            import json
+            import os
+
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.day = data.get("day")
+                self.day_start = data.get("day_start")
+                self.peak = data.get("peak")
+                self.halted_day = data.get("halted_day")
+        except Exception as exc:
+            logger.error(
+                f"Could not read risk state {self.path}: {exc}; starting fresh."
+            )
+
+    def _save(self):
+        if not self.path:
+            return
+        try:
+            import json
+            import os
+
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "day": self.day,
+                        "day_start": self.day_start,
+                        "peak": self.peak,
+                        "halted_day": self.halted_day,
+                    },
+                    f,
+                    indent=2,
+                )
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            logger.error(f"Could not write risk state {self.path}: {exc}")
+
+    def update(self, nlv: float, day: str) -> None:
+        """Call once per loop with the latest NLV and the New York date (YYYY-MM-DD)."""
+        if nlv is None or not math.isfinite(nlv) or nlv <= 0:
+            return
+        changed = False
+        if self.day != day:
+            self.day, self.day_start = day, float(nlv)
+            changed = True
+        if self.peak is None or nlv > self.peak:
+            self.peak = float(nlv)
+            changed = True
+        if changed:
+            self._save()
+
+    def latch_halt(self) -> None:
+        if self.halted_day != self.day:
+            self.halted_day = self.day
+            self._save()
+
+    def snapshot(self, nlv: float) -> Dict[str, Any]:
+        return {
+            "net_liquidation": nlv,
+            "nlv_day_start": self.day_start,
+            "nlv_peak": self.peak,
+            "halted_today": self.halted_day is not None and self.halted_day == self.day,
+            "watermark": self,
+        }
+
+
+class DrawdownHaltRule(IRiskRule):
+    """Blocks new entries on a daily loss (latched for the day) or a drawdown from peak."""
+
+    def __init__(
+        self, max_daily_loss_pct: float = 0.02, max_drawdown_pct: float = 0.10
+    ):
+        self.max_daily_loss_pct = float(max_daily_loss_pct)
+        self.max_drawdown_pct = float(max_drawdown_pct)
+
+    def assess(self, context: Dict[str, Any]) -> Tuple[bool, str]:
+        nlv = context.get("net_liquidation")
+        if not nlv or nlv <= 0:
+            return True, "No NLV data; not blocking"
+
+        if context.get("halted_today"):
+            return False, "Daily loss limit hit earlier today; no new entries."
+
+        day_start = context.get("nlv_day_start")
+        if day_start and day_start > 0 and self.max_daily_loss_pct > 0:
+            day_loss = 1.0 - nlv / day_start
+            if day_loss >= self.max_daily_loss_pct:
+                watermark = context.get("watermark")
+                if watermark is not None:
+                    watermark.latch_halt()
+                return (
+                    False,
+                    f"Daily loss {day_loss:.2%} reached the "
+                    f"{self.max_daily_loss_pct:.2%} limit; no new entries today.",
+                )
+
+        peak = context.get("nlv_peak")
+        if peak and peak > 0 and self.max_drawdown_pct > 0:
+            drawdown = 1.0 - nlv / peak
+            if drawdown >= self.max_drawdown_pct:
+                return (
+                    False,
+                    f"Drawdown {drawdown:.2%} from peak {peak:,.0f} reached the "
+                    f"{self.max_drawdown_pct:.2%} limit; no new entries.",
+                )
+
+        return True, "Drawdown within limits"
+
+
 class RiskController:
     """依序套用所有風險規則。任一規則否決即停止新增曝險。"""
 

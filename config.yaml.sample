@@ -190,6 +190,15 @@ strategy_settings:
   close_fill_timeout_sec: 60
 
 # ============================================================
+# Portfolio kill switch (DrawdownHaltRule). Blocks new entries only; exits are never blocked.
+#   max_daily_loss_pct: loss vs. the day's first NLV (New York date); latched for the rest of the day
+#   max_drawdown_pct:   drawdown from the all-time NLV peak; lifts once equity recovers
+# State lives in data/risk_state.json. Delete it after a deposit or withdrawal. 0 disables a check.
+risk_settings:
+  max_daily_loss_pct: 0.02
+  max_drawdown_pct: 0.10
+
+# ============================================================
 # 訓練排程
 # live 與 daemon 模式都會在休市時段以獨立行程自動重訓 (RetrainScheduler)。
 #   live:   休市 = 20:00-04:00 (未開夜盤時) 與整個週末
