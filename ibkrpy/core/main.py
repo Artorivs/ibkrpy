@@ -50,6 +50,7 @@ from ibkrpy.strategy.strategy_components import (
     RiskController,
     VIXHaltRule,
     ReversalRiskRule,
+    DrawdownHaltRule,
 )
 from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 from ibkrpy.strategy.market_analyzer import MarketAnalyzer
@@ -295,6 +296,14 @@ async def run_live_mode(args):
                 threshold=float(
                     config.get("strategy_settings.reversal_block_level", 0.75)
                 )
+            ),
+            DrawdownHaltRule(
+                max_daily_loss_pct=float(
+                    config.get("risk_settings.max_daily_loss_pct", 0.02)
+                ),
+                max_drawdown_pct=float(
+                    config.get("risk_settings.max_drawdown_pct", 0.10)
+                ),
             ),
         ]
     )
