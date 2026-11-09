@@ -208,7 +208,7 @@ class DatabaseManager:
             "close",
             "volume",
         ]
-        # 資料表欄位是小寫；DataFrame 端用的是 Open/High/... (與 v0.5.2 相同方向)
+        # Table columns are lowercase.
         df_db = df_db.rename(
             columns={
                 "Open": "open",
@@ -247,8 +247,6 @@ class DatabaseManager:
 
         df = (
             df.set_index("timestamp")
-            # 用 lambda 取「設好 timestamp 索引之後」的重複遮罩；
-            # 直接寫 ~df.index.duplicated() 會用到舊的 RangeIndex，永遠不去重
             .loc[lambda d: ~d.index.duplicated(keep="last")]
             .sort_index()
             .rename(

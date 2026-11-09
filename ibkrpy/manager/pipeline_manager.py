@@ -280,7 +280,6 @@ class PipelineManager:
             df_new.index = pd.to_datetime(df_new.index, utc=True)
             df_new = (
                 df_new.sort_index()
-                # 遮罩必須在排序後的 frame 上計算 (lambda)，否則位置錯亂
                 .loc[lambda d: ~d.index.duplicated(keep="last")]
                 .rename(
                     columns={

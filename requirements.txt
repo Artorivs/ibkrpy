@@ -1,17 +1,13 @@
-# ibkrpy 執行環境 (macOS Apple Silicon，Python 3.12) 的完整鎖定版本
+# Pinned runtime environment for macOS Apple Silicon, Python 3.12.
+# Generated from pyproject.toml; keep both in sync.
 #
-# 安裝：
 #   python3.12 -m venv .venv && source .venv/bin/activate
-#   python -m pip install -U pip
 #   python -m pip install -r requirements.txt
 #
-# 版本限制的來由：
-#   - tensorflow-metal 1.2.0 (Apple 最新版) 只相容到 TensorFlow 2.19.x，且只有 cp312 wheel
-#   - TensorFlow 2.19 要求 numpy<2.2、protobuf<6；pandas 3.1 要求 numpy>=2.0.2 → numpy 2.1.3
-#   - 不要安裝 tensorflow-macos：TF 2.13 起官方 tensorflow 已內含 Apple Silicon wheel
-#   - pandas_ta 已移除：改用 ibkrpy/data/indicators.py (結果與 0.3.14b 相同)
-#
-# 由 pyproject.toml 解析產生；更新時請兩邊一起改。
+# Version constraints:
+#   - tensorflow-metal 1.2.0 supports TensorFlow up to 2.19.x and ships cp312 wheels only.
+#   - TensorFlow 2.19 requires numpy<2.2 and protobuf<6; pandas 3.1 requires numpy>=2.0.2.
+#   - Do not install tensorflow-macos; tensorflow ships Apple Silicon wheels.
 absl-py==2.5.1
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.5

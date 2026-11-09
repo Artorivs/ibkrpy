@@ -1,8 +1,5 @@
-# tests/test_indicators.py
-# 執行: python -m unittest discover -s tests
-#
-# 期望值取自 pandas_ta 0.3.14b (未裝 TA-Lib) 在同一組合成資料上的輸出，
-# 確保改用內建指標後，欄名與數值都和舊版一致，已訓練的模型可直接沿用。
+# Run: python -m unittest discover -s tests
+# Expected values are pandas_ta 0.3.14b output (without TA-Lib) on the same data.
 
 import unittest
 
@@ -19,7 +16,7 @@ def synthetic(seed=1, n=600):
     o = c * (1 + rng.normal(0, 0.005, n))
     h = np.maximum(o, c) * (1 + np.abs(rng.normal(0, 0.01, n)))
     lo = np.minimum(o, c) * (1 - np.abs(rng.normal(0, 0.01, n)))
-    # 幾根 High == Low 的平盤 K 線，走 pandas_ta 的 epsilon 分支
+    # Flat bars (High == Low) exercise the epsilon branch.
     h[100:105] = c[100:105]
     lo[100:105] = c[100:105]
     o[100:105] = c[100:105]
@@ -77,7 +74,6 @@ class IndicatorTests(unittest.TestCase):
         self.assertEqual(out["MACDs_12_26_9"].isna().sum(), 33)
 
     def test_short_history_does_not_raise(self):
-        # pandas_ta 0.3.14b 在 26~33 根時會在 MACD 拋 TypeError
         out = add_default_indicators(synthetic(n=30))
         self.assertTrue(out["MACDs_12_26_9"].isna().all())
         self.assertNotIn("SMA_10", add_default_indicators(synthetic(n=5)).columns)
@@ -85,8 +81,6 @@ class IndicatorTests(unittest.TestCase):
 
 class AddTechnicalIndicatorsTests(unittest.TestCase):
     def test_text_columns_are_kept_and_ignored(self):
-        # 回歸測試：資料庫讀出的 K 線帶有 symbol / timeframe 文字欄位，
-        # 舊版把整個 DataFrame 丟進 sma() 而觸發 "Cannot aggregate non-numeric type: str"
         from ibkrpy.data.data_pipeline import DataPipeline
 
         df = synthetic()
