@@ -81,16 +81,15 @@ class DataPipeline:
 
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """使用 pandas_ta 快速計算技術指標"""
-        import pandas_ta  # noqa: F401  註冊 DataFrame.ta accessor
+        from ibkrpy.shared import indicators as ta
 
         df_copy = df.copy()
-        df_copy.ta.sma(length=10, append=True)
-        df_copy.ta.ema(length=20, append=True)
-        df_copy.ta.rsi(length=14, append=True)
-        df_copy.ta.atr(length=14, append=True)
-
-        df_copy.ta.macd(fast=12, slow=26, signal=9, append=True)
-        df_copy.ta.bbands(length=20, std=2, append=True)
+        df_copy = ta.sma(df_copy, length=10)
+        df_copy = ta.ema(df_copy, length=20)
+        df_copy = ta.rsi(df_copy, length=14)
+        df_copy = ta.atr(df_copy, length=14)
+        df_copy = ta.macd(df_copy, fast=12, slow=26, signal=9)
+        df_copy = ta.bbands(df_copy, length=20, std=2)
         return df_copy.dropna()
 
     def engineer_advanced_features(

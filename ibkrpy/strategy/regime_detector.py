@@ -66,10 +66,8 @@ def _clamp01(value: float) -> float:
 
 
 def wilder_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    """Wilder 平均真實區間。
-
-    自行實作而非依賴 pandas_ta：情境判定是決策路徑上的必經之處，
-    不該因為一個選用套件缺席就整個退化成「盤整」。
+    """
+    Wilder 平均真實區間。
     """
     high = pd.to_numeric(df["High"], errors="coerce")
     low = pd.to_numeric(df["Low"], errors="coerce")

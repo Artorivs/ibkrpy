@@ -430,16 +430,15 @@ class IBKRDataManager:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        df.set_index("date", inplace=True)
-        df.rename(
+        df = df.set_index("date").rename(
             columns={
                 "open": "Open",
                 "high": "High",
                 "low": "Low",
                 "close": "Close",
                 "volume": "Volume",
+                "average": "Average",
             },
-            inplace=True,
         )
 
         if allow_cache:

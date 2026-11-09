@@ -194,21 +194,10 @@ class DatabaseManager:
         if df_db.index.name != "timestamp":
             df_db.index.name = "timestamp"
         df_db = df_db.reset_index()
-
         df_db["timestamp"] = pd.to_datetime(df_db["timestamp"], utc=True).dt.strftime(
             "%Y-%m-%d %H:%M:%S"
         )
 
-        df_db.rename(
-            columns={
-                "Open": "open",
-                "High": "high",
-                "Low": "low",
-                "Close": "close",
-                "Volume": "volume",
-            },
-            inplace=True,
-        )
         cols = [
             "timestamp",
             "symbol",
@@ -219,7 +208,15 @@ class DatabaseManager:
             "close",
             "volume",
         ]
-        df_db = df_db[cols]
+        df_db = df_db.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            }
+        ).loc[:, [c for c in cols if c in df_db.columns]]
 
         data_tuples = list(df_db.itertuples(index=False, name=None))
 
@@ -247,18 +244,18 @@ class DatabaseManager:
 
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
 
-        df.set_index("timestamp", inplace=True)
-        df = df[~df.index.duplicated(keep="last")]
-        df.sort_index(inplace=True)
-
-        df.rename(
-            columns={
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
-            },
-            inplace=True,
+        df = (
+            df.set_index("timestamp")
+            .loc[~df.index.duplicated(keep="last")]
+            .sort_index()
+            .rename(
+                columns={
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                }
+            )
         )
         return df
