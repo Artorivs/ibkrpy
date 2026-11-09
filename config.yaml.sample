@@ -183,6 +183,9 @@ strategy_settings:
   allow_shorting: true
   max_gross_exposure: 1.0
   min_trade_usd: 120
+  # Seconds to wait for a closing order to fill before cancelling it and
+  # re-protecting the remaining shares.
+  close_fill_timeout_sec: 60
 
 # ============================================================
 # 訓練排程

@@ -6,7 +6,7 @@ import math
 from datetime import datetime, timezone
 import time
 from typing import Dict, Any
-from ib_insync import Order, LimitOrder, Stock, TagValue
+from ib_insync import Order, LimitOrder, MarketOrder, Stock, TagValue
 from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
 from ibkrpy.shared.session_clock import build_session_clock
 from ibkrpy.data.external_data import align_daily_series
@@ -684,6 +684,13 @@ class TradingEngine:
                 logger.warning(
                     f"[守護] 🛡️ 偵測到 {symbol} 存在無保護持倉 ({pos_qty} 股)，準備自動掛載 OCA 停損停利單..."
                 )
+                # Clear leftover exit orders first so they can't fill alongside the new OCA.
+                if not await self._cancel_open_orders(symbol):
+                    logger.critical(
+                        f"❌ [{symbol}] Could not confirm cancellation of existing orders; "
+                        "not attaching protection to avoid duplicate exits. Check manually."
+                    )
+                    continue
                 await self._attach_oca_protection(symbol, pos_qty)
 
     def _live_market_price(self, symbol: str):
@@ -818,23 +825,146 @@ class TradingEngine:
         except Exception as e:
             logger.critical(f"❌ [{symbol}] 掛載保護傘失敗: {e}")
 
-    async def _cancel_open_orders(self, symbol: str):
-        """[關鍵防護] 取消該標的目前所有未成交的委託單，防範舊的停損/停利單變成「孤兒單」導致裸空"""
+    CANCEL_CONFIRM_SECONDS = 5.0
+
+    async def _wait_done(self, trades, timeout: float) -> bool:
+        """Wait until every trade is Filled/Cancelled/Inactive; False on timeout."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if all(t.isDone() for t in trades):
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
+
+    async def _cancel_open_orders(self, symbol: str) -> bool:
+        """Cancel all open orders for the symbol and wait for confirmation.
+
+        Returns True only when nothing is left working for that symbol.
+        """
         if self.dry_run:
-            return
+            return True
 
-        open_trades = self.data.ib.openTrades()
-        canceled_count = 0
-        for trade in open_trades:
-            if trade.contract.symbol == symbol:
-                self.data.ib.cancelOrder(trade.order)
-                canceled_count += 1
+        targets = [
+            t
+            for t in self.data.ib.openTrades()
+            if t.contract.symbol == symbol and not t.isDone()
+        ]
+        if not targets:
+            return True
 
-        if canceled_count > 0:
-            logger.info(
-                f"[{symbol}] 🧹 已清除 {canceled_count} 筆歷史未決訂單 (防範孤兒單衝突)。"
+        for trade in targets:
+            self.data.ib.cancelOrder(trade.order)
+
+        confirmed = await self._wait_done(targets, self.CANCEL_CONFIRM_SECONDS)
+        if confirmed:
+            logger.info(f"[{symbol}] 🧹 Cancelled {len(targets)} open order(s).")
+        else:
+            pending = [t.order.orderId for t in targets if not t.isDone()]
+            logger.critical(
+                f"❌ [{symbol}] {len(pending)} order(s) not confirmed cancelled within "
+                f"{self.CANCEL_CONFIRM_SECONDS:g}s: {pending}"
             )
-            await asyncio.sleep(0.5)
+        return confirmed
+
+    async def _close_position(
+        self, contract, symbol: str, action: str, quantity: int, current_price: float
+    ) -> float:
+        """Close a position while keeping at most one exit order set working.
+
+        1. Cancel the existing stop/target and wait for confirmation; abort if it fails.
+        2. Adaptive market order in RTH, outsideRth limit in extended hours.
+        3. Wait up to close_fill_timeout_sec.
+        4. If not fully filled, cancel the rest and re-protect the remaining shares.
+
+        Returns the number of shares closed.
+        """
+        exits_before = [
+            t
+            for t in self.data.ib.openTrades()
+            if t.contract.symbol == symbol
+            and t.order.action == action
+            and not t.isDone()
+        ]
+        if not await self._cancel_open_orders(symbol):
+            logger.critical(
+                f"❌ [{symbol}] Existing stop/target not confirmed cancelled; "
+                "skipping the close so it can't fill alongside the stop."
+            )
+            return 0.0
+
+        # A stop can fill while we cancel it; don't close those shares twice.
+        already_out = sum(float(t.orderStatus.filled or 0.0) for t in exits_before)
+        if already_out > 0:
+            prev = float(self.cached_positions.get(symbol, 0.0) or 0.0)
+            self.cached_positions[symbol] = prev + (
+                already_out if action == "BUY" else -already_out
+            )
+            logger.warning(
+                f"[{symbol}] {already_out:g} shares exited while cancelling; reducing the close."
+            )
+            quantity = int(max(quantity - already_out, 0))
+            if quantity <= 0:
+                return already_out
+
+        try:
+            is_ext = bool(self.session_clock.classify().is_extended)
+        except Exception:
+            is_ext = False
+
+        if is_ext:
+            buffer = 0.002
+            limit_price = (
+                current_price * (1 + buffer)
+                if action == "BUY"
+                else current_price * (1 - buffer)
+            )
+            order = LimitOrder(action, quantity, round(limit_price, 2))
+            order.outsideRth = True
+        else:
+            order = MarketOrder(action, quantity)
+            order.algoStrategy = "Adaptive"
+            order.algoParams = [TagValue("adaptivePriority", "Normal")]
+        order.tif = "DAY"
+
+        trade = self.data.ib.placeOrder(contract, order)
+
+        timeout = float(
+            self.config.get("strategy_settings.close_fill_timeout_sec", 60) or 60
+        )
+        await self._wait_done([trade], timeout)
+
+        filled = float(trade.orderStatus.filled or 0.0)
+        remaining = quantity - filled
+
+        if remaining > 0:
+            if not trade.isDone():
+                self.data.ib.cancelOrder(trade.order)
+                cancelled = await self._wait_done([trade], self.CANCEL_CONFIRM_SECONDS)
+                filled = float(trade.orderStatus.filled or 0.0)
+                remaining = quantity - filled
+                if not cancelled:
+                    logger.critical(
+                        f"❌ [{symbol}] Close order {trade.order.orderId} neither filled nor cancelled; "
+                        f"{remaining:g} shares are unprotected. Check manually."
+                    )
+                    return filled
+
+            if remaining > 0:
+                still_held = remaining if action == "SELL" else -remaining
+                logger.critical(
+                    f"⚠️ [{symbol}] Close filled {filled:g}/{quantity}; "
+                    f"cancelled the rest and re-protecting {still_held:+g} shares."
+                )
+                await self._attach_oca_protection(symbol, still_held)
+
+        prev = float(self.cached_positions.get(symbol, 0.0) or 0.0)
+        signed_fill = filled if action == "BUY" else -filled
+        self.cached_positions[symbol] = prev + signed_fill
+        if filled > 0:
+            logger.info(f"[{symbol}] ✅ Closed {filled:g} shares.")
+        return filled
 
     async def run_tick(self, symbol: str, session=None):
         self._last_tick_at[symbol] = time.time()
@@ -1279,14 +1409,28 @@ class TradingEngine:
 
         self._record_decision(f"ORDER_{action}")
         try:
-            await self._cancel_open_orders(symbol)
+            if self.dry_run:
+                if not is_closing_only:
+                    self.cached_funds = max(0.0, self.cached_funds - trade_value)
+                logger.info(f"[{symbol}] 🛡️ [Dry-Run] 虛擬下單成功！")
+            elif is_closing_only:
+                filled = await self._close_position(
+                    contract, symbol, action, trade_quantity, current_price
+                )
+                if filled <= 0:
+                    self._record_decision("CLOSE_NOT_FILLED")
+                    return
+                trade_quantity = int(filled)
+            else:
+                if not await self._cancel_open_orders(symbol):
+                    self._record_decision("CANCEL_UNCONFIRMED")
+                    logger.critical(
+                        f"❌ [{symbol}] Old orders not confirmed cancelled; skipping entry."
+                    )
+                    return
 
-            if not is_closing_only:
                 self.cached_funds = max(0.0, self.cached_funds - trade_value)
 
-            if self.dry_run:
-                logger.info(f"[{symbol}] 🛡️ [Dry-Run] 虛擬下單成功！")
-            else:
                 algo_params = [TagValue("adaptivePriority", "Normal")]
 
                 slippage_buffer = 0.002
@@ -1296,47 +1440,36 @@ class TradingEngine:
                     else current_price * (1 - slippage_buffer)
                 )
 
-                if is_closing_only:
-                    order = LimitOrder(
-                        action, trade_quantity, round(limit_entry_price, 2)
-                    )
-                    order.algoStrategy = "Adaptive"
-                    order.algoParams = algo_params
-                    order.tif = "DAY"
-                    self.data.ib.placeOrder(contract, order)
-                else:
-                    parent_id = self.data.ib.client.getReqId()
-                    parent = LimitOrder(
-                        action, trade_quantity, round(limit_entry_price, 2)
-                    )
-                    parent.algoStrategy = "Adaptive"
-                    parent.algoParams = algo_params
-                    parent.orderId = parent_id
-                    parent.tif = "DAY"
-                    parent.transmit = False
+                parent_id = self.data.ib.client.getReqId()
+                parent = LimitOrder(action, trade_quantity, round(limit_entry_price, 2))
+                parent.algoStrategy = "Adaptive"
+                parent.algoParams = algo_params
+                parent.orderId = parent_id
+                parent.tif = "DAY"
+                parent.transmit = False
 
-                    rev_action = "SELL" if action == "BUY" else "BUY"
-                    sl_order = Order(
-                        action=rev_action,
-                        totalQuantity=trade_quantity,
-                        orderType="STP",
-                        auxPrice=round(sl_price, 2),
-                        parentId=parent_id,
-                        tif="GTC",
-                        transmit=False,
-                    )
-                    tp_order = LimitOrder(
-                        action=rev_action,
-                        totalQuantity=trade_quantity,
-                        lmtPrice=round(tp_price, 2),
-                        parentId=parent_id,
-                        tif="GTC",
-                        transmit=True,
-                    )
+                rev_action = "SELL" if action == "BUY" else "BUY"
+                sl_order = Order(
+                    action=rev_action,
+                    totalQuantity=trade_quantity,
+                    orderType="STP",
+                    auxPrice=round(sl_price, 2),
+                    parentId=parent_id,
+                    tif="GTC",
+                    transmit=False,
+                )
+                tp_order = LimitOrder(
+                    action=rev_action,
+                    totalQuantity=trade_quantity,
+                    lmtPrice=round(tp_price, 2),
+                    parentId=parent_id,
+                    tif="GTC",
+                    transmit=True,
+                )
 
-                    self.data.ib.placeOrder(contract, parent)
-                    self.data.ib.placeOrder(contract, sl_order)
-                    self.data.ib.placeOrder(contract, tp_order)
+                self.data.ib.placeOrder(contract, parent)
+                self.data.ib.placeOrder(contract, sl_order)
+                self.data.ib.placeOrder(contract, tp_order)
 
             if self.db:
                 reason = (
