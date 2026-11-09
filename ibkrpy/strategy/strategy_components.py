@@ -80,12 +80,9 @@ class ReversalRiskRule(IRiskRule):
 
 
 class EquityWatermark:
-    """
-    記錄「當日開盤淨值」與「歷史最高淨值」，供 DrawdownHaltRule 判斷。
+    """Day-start and peak NLV, persisted so a restart doesn't reset them.
 
-    狀態寫入 JSON，重啟後不會把今天虧掉的部分當成新的起點，峰值也不會歸零。
-    日期以紐約時間為準。出入金會讓兩個數字失真：入金後峰值會被墊高，
-    出金會被誤判為回撤 —— 出入金後請刪除狀態檔重新起算。
+    Deposits and withdrawals distort both values; delete the state file after one.
     """
 
     def __init__(self, path: str = None):
@@ -111,7 +108,9 @@ class EquityWatermark:
                 self.peak = data.get("peak")
                 self.halted_day = data.get("halted_day")
         except Exception as exc:
-            logger.error(f"風控狀態檔讀取失敗 ({self.path}): {exc}，從頭起算。")
+            logger.error(
+                f"Could not read risk state {self.path}: {exc}; starting fresh."
+            )
 
     def _save(self):
         if not self.path:
@@ -135,10 +134,10 @@ class EquityWatermark:
                 )
             os.replace(tmp, self.path)
         except Exception as exc:
-            logger.error(f"風控狀態檔寫入失敗 ({self.path}): {exc}")
+            logger.error(f"Could not write risk state {self.path}: {exc}")
 
     def update(self, nlv: float, day: str) -> None:
-        """每輪以最新淨值與紐約日期 (YYYY-MM-DD) 呼叫。"""
+        """Call once per loop with the latest NLV and the New York date (YYYY-MM-DD)."""
         if nlv is None or not math.isfinite(nlv) or nlv <= 0:
             return
         changed = False
@@ -167,13 +166,7 @@ class EquityWatermark:
 
 
 class DrawdownHaltRule(IRiskRule):
-    """
-    投資組合層級的熔斷：當日虧損或自峰值回撤超過門檻時，停止新增曝險。
-
-    - 當日虧損一旦觸發，當天剩餘時間都維持封鎖 (不因反彈而反覆開關)。
-    - 回撤以持久化的峰值計算，淨值回到門檻內即自動解除。
-    - 與其他規則相同，只擋新增曝險，不擋減碼與平倉。
-    """
+    """Blocks new entries on a daily loss (latched for the day) or a drawdown from peak."""
 
     def __init__(
         self, max_daily_loss_pct: float = 0.02, max_drawdown_pct: float = 0.10
@@ -184,10 +177,10 @@ class DrawdownHaltRule(IRiskRule):
     def assess(self, context: Dict[str, Any]) -> Tuple[bool, str]:
         nlv = context.get("net_liquidation")
         if not nlv or nlv <= 0:
-            return True, "淨值資料缺席，不阻擋"
+            return True, "No NLV data; not blocking"
 
         if context.get("halted_today"):
-            return False, "今日已觸發單日虧損熔斷，今日不再新增曝險。"
+            return False, "Daily loss limit hit earlier today; no new entries."
 
         day_start = context.get("nlv_day_start")
         if day_start and day_start > 0 and self.max_daily_loss_pct > 0:
@@ -198,8 +191,8 @@ class DrawdownHaltRule(IRiskRule):
                     watermark.latch_halt()
                 return (
                     False,
-                    f"單日虧損 {day_loss:.2%} 已達熔斷門檻 {self.max_daily_loss_pct:.2%}，"
-                    f"今日停止新增曝險。",
+                    f"Daily loss {day_loss:.2%} reached the "
+                    f"{self.max_daily_loss_pct:.2%} limit; no new entries today.",
                 )
 
         peak = context.get("nlv_peak")
@@ -208,11 +201,11 @@ class DrawdownHaltRule(IRiskRule):
             if drawdown >= self.max_drawdown_pct:
                 return (
                     False,
-                    f"自峰值 {peak:,.0f} 回撤 {drawdown:.2%}，已達門檻 "
-                    f"{self.max_drawdown_pct:.2%}，停止新增曝險。",
+                    f"Drawdown {drawdown:.2%} from peak {peak:,.0f} reached the "
+                    f"{self.max_drawdown_pct:.2%} limit; no new entries.",
                 )
 
-        return True, "淨值回撤在容許範圍內"
+        return True, "Drawdown within limits"
 
 
 class RiskController:

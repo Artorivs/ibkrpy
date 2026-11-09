@@ -185,12 +185,10 @@ strategy_settings:
   min_trade_usd: 120
 
 # ============================================================
-# 投資組合熔斷 (DrawdownHaltRule)
-# 只擋「新增曝險」，減碼與平倉不受影響。
-#   max_daily_loss_pct: 淨值較當日 (紐約日期) 第一筆淨值下跌達此比例 → 當天剩餘時間不再開新倉
-#   max_drawdown_pct:   淨值自歷史峰值回撤達此比例 → 停止開新倉，回到門檻內自動解除
-# 當日起點與峰值存在 data/risk_state.json。出入金後請刪除此檔重新起算，
-# 否則入金會墊高峰值、出金會被當成虧損。設為 0 可停用該項。
+# Portfolio kill switch (DrawdownHaltRule). Blocks new entries only; exits are never blocked.
+#   max_daily_loss_pct: loss vs. the day's first NLV (New York date); latched for the rest of the day
+#   max_drawdown_pct:   drawdown from the all-time NLV peak; lifts once equity recovers
+# State lives in data/risk_state.json. Delete it after a deposit or withdrawal. 0 disables a check.
 risk_settings:
   max_daily_loss_pct: 0.02
   max_drawdown_pct: 0.10

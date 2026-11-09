@@ -101,8 +101,7 @@ class TradingEngine:
         self.cached_net_liq = 0.0
         self.cached_positions = {}
         self._position_avg_cost: Dict[str, float] = {}
-        # 本輪已送出、尚未反映在 cached_positions 的新倉名目金額。
-        # 每輪 update_system_state 重抓持倉後歸零。
+        # Notional of entries sent since positions were last fetched.
         self._pending_gross = 0.0
 
         from ibkrpy.strategy.strategy_components import EquityWatermark
@@ -673,11 +672,9 @@ class TradingEngine:
         for sym, qty in (self.cached_positions or {}).items():
             if not qty:
                 continue
-            # 本輪沒掃到的標的沒有 _last_prices；舊版直接略過，等於把它的曝險算成 0。
             price = self._live_market_price(sym) or self._position_avg_cost.get(sym)
             if price:
                 total += abs(qty) * price
-        # 同一輪內已送出的新倉也要計入，否則多檔同時進場會各自通過上限檢查。
         return total + self._pending_gross
 
     async def _protect_unhedged_positions(self):
