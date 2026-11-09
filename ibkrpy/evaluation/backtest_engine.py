@@ -3,11 +3,21 @@
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+Decide = Callable[[Any, Any, int, float], Optional[Dict[str, Any]]]
 
 
 class BacktestEngine:
-    """Historical backtest that also computes performance metrics."""
+    """Historical backtest that follows the live order rules and computes metrics.
+
+    Live rules mirrored here:
+      - entries are sized at position_pct of current equity, not all-in;
+      - an opposite signal only closes the position; it never flips it;
+      - a signal in the direction already held does not add;
+      - shorts open only when allow_shorting is true;
+      - costs come from the live ExecutionCostModel when one is given.
+    """
 
     def __init__(
         self,
@@ -15,11 +25,17 @@ class BacktestEngine:
         commission_per_share: float = 0.005,
         slippage_pct: float = 0.0005,
         use_bracket_exits: bool = True,
+        position_pct: float = 0.08,
+        allow_shorting: bool = True,
+        cost_model=None,
     ):
         self.initial_capital = initial_capital
         self.commission = commission_per_share
         self.slippage_pct = slippage_pct
         self.use_bracket_exits = use_bracket_exits
+        self.position_pct = float(position_pct)
+        self.allow_shorting = bool(allow_shorting)
+        self.cost_model = cost_model
 
     @staticmethod
     def _infer_periods_per_year(index: pd.Index) -> float:
@@ -46,13 +62,14 @@ class BacktestEngine:
         except Exception:
             return 252.0
 
-    def _fill_price(self, price: float, is_buy: bool) -> float:
-        """Slippage makes buys cost more and sells receive less."""
-        return (
-            price * (1 + self.slippage_pct)
-            if is_buy
-            else price * (1 - self.slippage_pct)
-        )
+    def _fill_cost(self, price: float, shares: int) -> float:
+        """Cash cost of one fill (one side of a round trip)."""
+        shares = abs(int(shares))
+        if shares == 0:
+            return 0.0
+        if self.cost_model is not None:
+            return self.cost_model.estimate(price, shares).total / 2.0
+        return shares * (price * self.slippage_pct + self.commission)
 
     def run(
         self,
@@ -60,11 +77,26 @@ class BacktestEngine:
         signals: List[Dict[str, Any]],
         benchmark_df: pd.DataFrame = None,
     ) -> Dict[str, Any]:
+        """Backtest a precomputed signal list (signals keyed by "timestamp")."""
+        signal_dict = {sig["timestamp"]: sig for sig in signals}
+        return self.simulate(
+            df, lambda ts, row, position, equity: signal_dict.get(ts), benchmark_df
+        )
+
+    def simulate(
+        self,
+        df: pd.DataFrame,
+        decide: Decide,
+        benchmark_df: pd.DataFrame = None,
+    ) -> Dict[str, Any]:
         """
-        Run the backtest (long/short, mark-to-market per bar, simulated bracket exits).
+        Run bar by bar, asking decide(ts, row, position, equity) for a signal at each close.
+
+        The decision sees the current position, as the live strategy does. Brackets from
+        a fill on bar t are checked from bar t+1 on, against that bar's High/Low.
 
         :param df: OHLCV bars. Needs Close; High/Low enable bracket simulation.
-        :param signals: strategy signals (with stop_loss_price / take_profit_price)
+        :param decide: returns a signal dict (action, stop_loss_price, take_profit_price) or None
         :param benchmark_df: optional benchmark bars for alpha / information ratio
         """
         if df.empty or "Close" not in df.columns:
@@ -73,35 +105,32 @@ class BacktestEngine:
         has_hl = "High" in df.columns and "Low" in df.columns
         simulate_bracket = self.use_bracket_exits and has_hl
 
-        capital = self.initial_capital
+        cash = self.initial_capital
         position = 0
         active_sl: Optional[float] = None
         active_tp: Optional[float] = None
 
         equity_curve = []
-        trades = []
         round_trips = 0
 
-        signal_dict = {sig["timestamp"]: sig for sig in signals}
+        def close_at(fill_price: float) -> None:
+            nonlocal cash, position, active_sl, active_tp, round_trips
+            cash += position * fill_price
+            cash -= self._fill_cost(fill_price, position)
+            position = 0
+            active_sl = active_tp = None
+            round_trips += 1
 
         for ts, row in df.iterrows():
             price = float(row["Close"])
             if not np.isfinite(price) or price <= 0:
-                equity_curve.append(
-                    {"timestamp": ts, "equity": capital + position * price}
-                )
+                last = equity_curve[-1]["equity"] if equity_curve else cash
+                equity_curve.append({"timestamp": ts, "equity": last})
                 continue
 
-            if (
-                simulate_bracket
-                and position != 0
-                and (active_sl is not None or active_tp is not None)
-            ):
+            if simulate_bracket and position != 0:
                 high = float(row["High"])
                 low = float(row["Low"])
-                exit_price = None
-                exit_kind = None
-
                 if position > 0:
                     hit_sl = active_sl is not None and low <= active_sl
                     hit_tp = active_tp is not None and high >= active_tp
@@ -109,81 +138,44 @@ class BacktestEngine:
                     hit_sl = active_sl is not None and high >= active_sl
                     hit_tp = active_tp is not None and low <= active_tp
 
+                # A bar that opens beyond a level fills at the open, not at the level.
+                opened = float(row["Open"]) if "Open" in row.index else None
+                if opened is not None and not np.isfinite(opened):
+                    opened = None
                 if hit_sl:
-                    exit_price, exit_kind = active_sl, "STOP_LOSS"
+                    fill = active_sl
+                    if opened is not None:
+                        fill = min(fill, opened) if position > 0 else max(fill, opened)
+                    close_at(fill)
                 elif hit_tp:
-                    exit_price, exit_kind = active_tp, "TAKE_PROFIT"
+                    fill = active_tp
+                    if opened is not None:
+                        fill = max(fill, opened) if position > 0 else min(fill, opened)
+                    close_at(fill)
 
-                if exit_price is not None:
-                    closing_qty = -position
-                    fill = self._fill_price(exit_price, is_buy=closing_qty > 0)
-                    capital -= closing_qty * fill
-                    capital -= abs(closing_qty) * self.commission
+            equity = cash + position * price
+            sig = decide(ts, row, position, equity)
+            action = sig.get("action") if sig else None
 
-                    trades.append(
-                        {
-                            "type": exit_kind,
-                            "price": exit_price,
-                            "size": closing_qty,
-                            "timestamp": ts,
-                        }
-                    )
-                    round_trips += 1
-
-                    position = 0
-                    active_sl = None
-                    active_tp = None
-
-            sig = signal_dict.get(ts)
-            if sig:
-                action = sig.get("action")
-                target_position = 0
-
-                if action == "BUY":
-                    target_position = int((capital * 0.95) / price)
-                elif action == "SELL":
-                    target_position = -int((capital * 0.95) / price)
-
-                trade_size = target_position - position
-
-                if trade_size != 0:
-                    fill = self._fill_price(price, is_buy=trade_size > 0)
-                    capital -= trade_size * fill
-                    capital -= abs(trade_size) * self.commission
-
-                    if position != 0 and np.sign(target_position) != np.sign(position):
-                        round_trips += 1
-
-                    position = target_position
-
-                    trades.append(
-                        {
-                            "type": action,
-                            "price": price,
-                            "size": trade_size,
-                            "timestamp": ts,
-                        }
-                    )
-
-                    if position != 0:
+            if action in ("BUY", "SELL"):
+                direction = 1 if action == "BUY" else -1
+                if position != 0 and np.sign(position) != direction:
+                    close_at(price)
+                elif position == 0 and (direction > 0 or self.allow_shorting):
+                    qty = int(max(equity, 0.0) * self.position_pct / price)
+                    if qty > 0:
+                        position = direction * qty
+                        cash -= position * price
+                        cash -= self._fill_cost(price, qty)
                         active_sl = sig.get("stop_loss_price")
                         active_tp = sig.get("take_profit_price")
-                    else:
-                        active_sl = None
-                        active_tp = None
 
-            equity_curve.append({"timestamp": ts, "equity": capital + position * price})
+            equity_curve.append({"timestamp": ts, "equity": cash + position * price})
 
         if position != 0:
-            last_price = float(df["Close"].iloc[-1])
-            closing_qty = -position
-            fill = self._fill_price(last_price, is_buy=closing_qty > 0)
-            capital -= closing_qty * fill
-            capital -= abs(closing_qty) * self.commission
-            round_trips += 1
-            position = 0
+            close_at(float(df["Close"].iloc[-1]))
             if equity_curve:
-                equity_curve[-1]["equity"] = capital
+                equity_curve[-1]["equity"] = cash
 
         return self._evaluate_performance(equity_curve, round_trips, benchmark_df)
 

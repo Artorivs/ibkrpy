@@ -520,6 +520,8 @@ class PipelineManager:
 
           - First 70% is in-sample, last 30% out-of-sample
           - Models are fitted on in-sample only, then make true one-step predictions over OOS
+          - Row t holds the forecast made at bar t's close for bar t+1, as live does, so
+            prediction / Close[t] - 1 is the predicted move from the price live would see
           - Regimes come from MarketRegimeDetector
           - Volatility is the rolling std of log returns (same units as the live strategy input)
 
@@ -552,14 +554,14 @@ class PipelineManager:
 
                 for k in range(len(oos)):
                     t = split + k
-                    lo = max(0, t - max_hist)
-                    hist = close[lo:t]
+                    lo = max(0, t + 1 - max_hist)
+                    hist = close[lo : t + 1]
                     if len(hist) < 20:
                         continue
                     try:
                         preds[k] = float(base.apply(hist).forecast(steps=1)[0])
                     except Exception:
-                        preds[k] = close[t - 1]
+                        preds[k] = close[t]
             except Exception as e:
                 logger.warning(f"\t⚠️ ARIMA walk-forward failed: {e}")
 
@@ -663,7 +665,8 @@ class PipelineManager:
                 anchors = df_adv["Close"].values[seq_pos[~in_mask] - 1]
                 outputs.append(anchors * np.exp(raw / 100.0))
 
-            oos_idx = df_adv.index[seq_pos[~in_mask]]
+            # A sequence targeting bar seq_pos is the forecast made at bar seq_pos - 1.
+            oos_idx = df_adv.index[seq_pos[~in_mask] - 1]
             series = pd.Series(np.mean(outputs, axis=0), index=oos_idx)
             return series.reindex(df.index[split:]).values
         except Exception as e:
@@ -682,7 +685,6 @@ class PipelineManager:
     ) -> Tuple[dict, float]:
         """Tune parameters on genuine out-of-sample predictions; returns (best params, composite score)."""
         default_params = {
-            "min_prediction_threshold_pct": 0.005,
             "volatility_stop_loss_multiplier": 2.0,
             "volatility_take_profit_multiplier": 3.0,
         }
@@ -691,7 +693,7 @@ class PipelineManager:
         if oos.empty:
             return default_params, -999.0
 
-        tuner = ModelTuner(model_orchestrator=None, data_manager=None)
+        tuner = ModelTuner(config=self.config)
         try:
             return tuner.optimize_strategy_params(
                 symbol, df.loc[oos.index], oos, n_trials=20, term=term
