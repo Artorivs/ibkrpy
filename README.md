@@ -12,13 +12,28 @@ IBKR TWS 或 IB Gateway: 必須在本機運行並登入。
 
 取消勾選「只讀 API (Read-Only API)」，否則無法下單。
 
-Python 環境: 推薦使用 Python 3.10+；必須提前安裝 `Poetry` 以管理虛擬環境與依賴；推薦使用獨立虛擬環境。
+Python 環境: 必須使用 Python 3.12 (Apple 的 `tensorflow-metal` 只提供到 3.12 的版本)；推薦使用獨立虛擬環境。
 
-安裝依賴:
+安裝依賴 (二擇一):
 
 ```bash
+# 方式一：Poetry
+poetry env use python3.12
 poetry install
+
+# 方式二：venv + pip (requirements.txt 為完整鎖定版本)
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
 ```
+
+macOS (Apple Silicon) 注意事項:
+
+- 請使用原生 arm64 的 Python (`python -c "import platform; print(platform.machine())"` 應輸出 `arm64`，而非 Rosetta 的 `x86_64`)。
+- 只安裝 `tensorflow` + `tensorflow-metal`，**不要**再安裝 `tensorflow-macos`；`tensorflow-metal` 目前只相容到 TensorFlow 2.19.x，請勿單獨升級 TensorFlow。
+- 儀表板需要 Tk：Homebrew 的 Python 請另外執行 `brew install python-tk@3.12`。
+- 請勿對整個環境執行 `pip install -U`；升級套件請改 `pyproject.toml` / `requirements.txt` 後重建環境。
 
 ## 2. 系統啟動模式 (Operating Modes)
 

@@ -473,7 +473,7 @@ class PipelineManager:
         與 MarketRegimeDetector.detect() 的判定邏輯完全相同，只是把逐根呼叫
         (每次重算全序列指標) 改為向量化計算一次 —— 結果一致但快上數個量級。
         """
-        import pandas_ta as ta
+        from ibkrpy.data import indicators as ta
         from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 
         d = MarketRegimeDetector()
