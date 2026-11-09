@@ -43,16 +43,7 @@ class GARCHModel:
             )
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
-        """
-        預測下一根 K 線的波動率，單位是「每根 K 線」(不年化)。
-
-        [修正] 舊版一律乘上 √252 當成年化值，呼叫端再除以 √(該週期每年 K 線數)。
-        這只對日 K 成立：1 小時 K 會小 √6.5 ≈ 2.5 倍 (仍落在合理帶內而被採用)，
-        5 分 K 小 √78 ≈ 8.8 倍。GARCH 是在同一週期的 K 線上擬合的，
-        它的條件變異數本來就是「每根 K 線」的量，不需要任何換算。
-
-        資料不足或擬合失敗時回傳 NaN，讓 VolatilityEstimator 改用實現波動率。
-        """
+        """Next-bar volatility per bar (not annualized); NaN when there is too little data."""
         if df.empty or "Close" not in df.columns:
             return float("nan")
 

@@ -1036,7 +1036,7 @@ class TradingEngine:
                 else float("nan")
             )
 
-        # GARCH 在同一週期的 K 線上擬合，直接回傳「每根 K 線」的波動率，不需年化換算。
+        # GARCH already returns σ per bar of this term.
         try:
             model_vol_per_bar = float(model_volatility)
         except (TypeError, ValueError):
