@@ -33,6 +33,8 @@ _TERM_POLL_SECONDS = {
 class TradingEngine:
     """Main loop with one-way data flow, adaptive data fetching per term, driven by config."""
 
+    COLLAPSE_RATIO = 0.05
+
     def __init__(
         self,
         data_manager,
@@ -134,34 +136,32 @@ class TradingEngine:
         self, symbol: str, preds_pct: Dict[str, float]
     ) -> Dict[str, float]:
         """
-        Measure whether each model is still alive by relative dispersion.
+        Yes/no collapse check per model: 1.0 if alive, 0.0 if collapsed.
 
-        Prediction scales differ by orders of magnitude across terms, so the comparison is
-        relative: the most dispersed model scores 1.0 and a constant-output model tends to 0.
+        Prediction scales differ by orders of magnitude across terms, so the test is
+        relative: a model whose prediction std is below COLLAPSE_RATIO of the most
+        dispersed model's std counts as collapsed. Dispersion is not used as a weight,
+        since that would favour the noisiest model.
         """
-        import numpy as _np
-
         hist = self._model_pred_hist[symbol]
         for name, pct in preds_pct.items():
             hist[name].append(float(pct))
 
-        stds = {}
-        for name, values in hist.items():
-            stds[name] = float(_np.std(values)) if len(values) >= 8 else None
-
-        known = [v for v in stds.values() if v is not None]
-        if not known:
-            return {name: 1.0 for name in preds_pct}
-
-        peak = max(known)
+        stds = {
+            name: float(np.std(values))
+            for name, values in hist.items()
+            if len(values) >= 8
+        }
+        peak = max(stds.values(), default=0.0)
         if peak <= 1e-12:
             return {name: 1.0 for name in preds_pct}
 
-        liveness = {}
-        for name in preds_pct:
-            s = stds.get(name)
-            liveness[name] = 1.0 if s is None else max(min(s / peak, 1.0), 0.0)
-        return liveness
+        return {
+            name: (
+                0.0 if name in stds and stds[name] / peak < self.COLLAPSE_RATIO else 1.0
+            )
+            for name in preds_pct
+        }
 
     _TERM_ORDER = ("short_term", "mid_term", "long_term")
 
@@ -1171,12 +1171,12 @@ class TradingEngine:
         preds_pct = {k: (v / current_price - 1) for k, v in ensemble_preds.items()}
         liveness = self._update_model_liveness(symbol, preds_pct)
 
-        dead = [k for k, v in liveness.items() if v < 0.05]
+        dead = [k for k, v in liveness.items() if v <= 0]
         if dead and symbol not in self._collapse_warned:
             self._collapse_warned.add(symbol)
             logger.error(
                 f"🧟 [{symbol}] Model output collapsed to a constant: {', '.join(dead)}. "
-                f"Their ensemble weight has been reduced automatically. "
+                f"They are left out of the ensemble. "
                 f"Retrain to fix this."
             )
 
