@@ -251,7 +251,7 @@ class TradingDashboard:
                 )
                 if not df_eq.empty:
                     df_eq["timestamp"] = pd.to_datetime(df_eq["timestamp"])
-                    df_eq.sort_values("timestamp", inplace=True)
+                    df_eq = df_eq.sort_values("timestamp")
                     self.ax.plot(
                         df_eq["timestamp"],
                         df_eq["net_liquidation"],
@@ -277,7 +277,7 @@ class TradingDashboard:
                     df_market["timestamp"] = pd.to_datetime(
                         df_market["timestamp"], format="mixed", utc=True
                     )
-                    df_market.sort_values("timestamp", inplace=True)
+                    df_market = df_market.sort_values("timestamp")
 
                     df_market["SMA_20"] = df_market["close"].rolling(window=20).mean()
                     first_close = df_market["close"].iloc[0]

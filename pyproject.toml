@@ -10,11 +10,9 @@ authors = ["Your Name <you@example.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-# tensorflow-metal 1.2.0 只提供到 cp312 的 wheel；scipy 1.18 / numpy 2 需 >=3.12
 python = ">=3.12,<3.13"
 ib_insync = "^0.9.86"
 pandas = "^3.1.1"
-# pandas 3.1 需要 numpy>=2.0.2；TensorFlow 2.19 限制 numpy<2.2
 numpy = ">=2.0.2,<2.2"
 PyYAML = "^6.0.3"
 pandas-market-calendars = "^5.6.0"
@@ -34,12 +32,9 @@ aiohttp = "^3.14.5"
 fredapi = "^0.5.2"
 
 # --- 預測模型依賴 ---
-# tensorflow-metal 1.2.0 只相容到 TensorFlow 2.19.x (2.20 起載入 Metal 外掛會失敗)。
-# TensorFlow 2.13 起官方 tensorflow 套件已內含 Apple Silicon wheel，tensorflow-macos 已停止維護，勿再安裝。
 tensorflow = "~2.19.1"
 tensorflow-metal = { version = "1.2.0", markers = "sys_platform == 'darwin' and platform_machine == 'arm64'" }
 keras = "^3.15.1"
-# TensorFlow 2.19 是以 ml-dtypes 0.5 / h5py 3.14 建置的；TF 2.21 起也明確限制 h5py<3.15
 ml-dtypes = ">=0.5.1,<0.6"
 h5py = ">=3.11,<3.15"
 hmmlearn = "^0.3.3"

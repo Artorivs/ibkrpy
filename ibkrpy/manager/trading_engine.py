@@ -722,15 +722,14 @@ class TradingEngine:
                 return
 
             if "close" in df.columns:
-                df.rename(
+                df = df.rename(
                     columns={
                         "open": "Open",
                         "high": "High",
                         "low": "Low",
                         "close": "Close",
                         "volume": "Volume",
-                    },
-                    inplace=True,
+                    }
                 )
 
             live_price = self._live_market_price(symbol)
@@ -883,15 +882,14 @@ class TradingEngine:
 
         if not df_recent.empty:
             df_recent.index = pd.to_datetime(df_recent.index, utc=True)
-            df_recent.rename(
+            df_recent = df_recent.rename(
                 columns={
                     "open": "Open",
                     "high": "High",
                     "low": "Low",
                     "close": "Close",
                     "volume": "Volume",
-                },
-                inplace=True,
+                }
             )
             df_recent = df_recent[["Open", "High", "Low", "Close", "Volume"]].astype(
                 float

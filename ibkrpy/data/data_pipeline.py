@@ -80,8 +80,12 @@ class DataPipeline:
         self._manifests: Dict[str, List[str]] = {}
 
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """計算技術指標 (欄名與數值和舊版 pandas_ta 0.3.14b 相同)"""
-        from ibkrpy.data.indicators import add_default_indicators
+        """計算技術指標 (欄名與數值和舊版 pandas_ta 0.3.14b 相同)
+
+        indicators 的各函式吃的是單一價格序列，不是整個 DataFrame；
+        add_default_indicators 只取 High/Low/Close 計算，symbol 等文字欄位原樣保留。
+        """
+        from ibkrpy.shared.indicators import add_default_indicators
 
         return add_default_indicators(df).dropna()
 

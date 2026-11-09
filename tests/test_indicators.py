@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from ibkrpy.data.indicators import add_default_indicators, adx
+from ibkrpy.shared.indicators import add_default_indicators, adx
 
 
 def synthetic(seed=1, n=600):
@@ -81,6 +81,21 @@ class IndicatorTests(unittest.TestCase):
         out = add_default_indicators(synthetic(n=30))
         self.assertTrue(out["MACDs_12_26_9"].isna().all())
         self.assertNotIn("SMA_10", add_default_indicators(synthetic(n=5)).columns)
+
+
+class AddTechnicalIndicatorsTests(unittest.TestCase):
+    def test_text_columns_are_kept_and_ignored(self):
+        # 回歸測試：資料庫讀出的 K 線帶有 symbol / timeframe 文字欄位，
+        # 舊版把整個 DataFrame 丟進 sma() 而觸發 "Cannot aggregate non-numeric type: str"
+        from ibkrpy.data.data_pipeline import DataPipeline
+
+        df = synthetic()
+        df["symbol"] = "SPY"
+        df["timeframe"] = "1 day"
+        out = DataPipeline(artifact_store=object()).add_technical_indicators(df)
+        self.assertEqual(len(out), len(df) - 33)
+        self.assertTrue((out["symbol"] == "SPY").all())
+        self.assertIn("BBP_20_2.0", out.columns)
 
 
 if __name__ == "__main__":

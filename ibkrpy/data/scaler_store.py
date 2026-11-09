@@ -91,7 +91,7 @@ class _FileLock:
 
 class ConsolidatedScalerStore(ScalerStore):
     """
-    單一 weights/_training_artifacts.json
+    單一 weights/training_artifacts.json
 
         {
           "version": 1,
@@ -123,7 +123,7 @@ class ConsolidatedScalerStore(ScalerStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"_training_artifacts.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"training_artifacts.json 讀取失敗 ({self.path}): {e}")
             return self._cache or {}
 
     def _write_all(self, data: Dict[str, ScalerDict]) -> None:

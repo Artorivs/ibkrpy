@@ -1,13 +1,5 @@
 # ibkrpy/data/indicators.py
 # 技術指標：取代 pandas_ta 0.3.14b
-#
-# pandas_ta 0.3.14b 已從 PyPI 下架，只能從本機 tarball 安裝；它在 numpy 2 下
-# 無法匯入 (使用了已移除的 numpy.NaN)。PyPI 上僅剩的 0.4.x 又硬性要求
-# numpy>=2.2.6 與 numba==0.61.2，和 tensorflow-metal 能用的最高版 TensorFlow
-# 2.19 (numpy<2.2) 互相衝突。
-#
-# 這裡用純 pandas 逐行重現 0.3.14b 的演算法 (未安裝 TA-Lib 時的路徑) 與欄位
-# 名稱，因此既有的特徵清單、縮放器與已訓練的權重都不必重訓即可沿用。
 
 from typing import Optional
 

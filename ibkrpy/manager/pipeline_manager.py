@@ -275,26 +275,28 @@ class PipelineManager:
             await asyncio.sleep(1)
 
         if df_new_list:
+            cols_to_keep = ["Open", "High", "Low", "Close", "Volume"]
             df_new = pd.concat(df_new_list)
             df_new.index = pd.to_datetime(df_new.index, utc=True)
-            df_new.sort_index(inplace=True)
-            df_new = df_new[~df_new.index.duplicated(keep="last")]
-            df_new.rename(
-                columns={
-                    "open": "Open",
-                    "high": "High",
-                    "low": "Low",
-                    "close": "Close",
-                    "volume": "Volume",
-                },
-                inplace=True,
+            df_new = (
+                df_new.sort_index()
+                # 遮罩必須在排序後的 frame 上計算 (lambda)，否則位置錯亂
+                .loc[lambda d: ~d.index.duplicated(keep="last")]
+                .rename(
+                    columns={
+                        "open": "Open",
+                        "high": "High",
+                        "low": "Low",
+                        "close": "Close",
+                        "volume": "Volume",
+                    }
+                )
+                .loc[:, lambda d: [c for c in cols_to_keep if c in d.columns]]
             )
-            cols_to_keep = ["Open", "High", "Low", "Close", "Volume"]
-            df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
 
             if not df_existing.empty:
                 df_combined = df_new
-                df_combined.sort_index(inplace=True)
+                df_combined = df_combined.sort_index()
                 self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
             else:
                 self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
@@ -473,7 +475,7 @@ class PipelineManager:
         與 MarketRegimeDetector.detect() 的判定邏輯完全相同，只是把逐根呼叫
         (每次重算全序列指標) 改為向量化計算一次 —— 結果一致但快上數個量級。
         """
-        from ibkrpy.data import indicators as ta
+        from ibkrpy.shared import indicators as ta
         from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 
         d = MarketRegimeDetector()
