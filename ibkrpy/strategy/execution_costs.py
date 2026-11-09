@@ -14,7 +14,7 @@ _FINRA_TAF_CAP = 8.30
 
 
 class CommissionModel(ABC):
-    """單邊 (一次下單) 的佣金。"""
+    """Commission for one side (one order)."""
 
     @abstractmethod
     def per_order(self, shares: float, price: float) -> float: ...
@@ -25,7 +25,7 @@ class CommissionModel(ABC):
 
 
 class ZeroCommission(CommissionModel):
-    """IBKR Lite (僅限美國客戶的美股)。"""
+    """IBKR Lite (US clients, US stocks only)."""
 
     name = "zero"
 
@@ -35,7 +35,7 @@ class ZeroCommission(CommissionModel):
 
 class _PerShareWithMinimum(CommissionModel):
     """
-    每股計價 + 每筆最低 + 名目上限。IBKR 股票佣金的通用形狀。
+    Per share + per-order minimum + notional cap: the general shape of IBKR stock commissions.
     """
 
     def __init__(self, per_share: float, minimum: float, max_pct: float = 0.01):
@@ -75,7 +75,7 @@ _COMMISSION_MODELS = {
 
 @dataclass(frozen=True)
 class RoundTripCost:
-    """一次完整進出的成本拆解。金額單位為美元，比例為小數。"""
+    """Round-trip cost breakdown. Amounts in USD, ratios as decimals."""
 
     notional: float
     commission: float
@@ -89,19 +89,19 @@ class RoundTripCost:
 
     @property
     def pct(self) -> float:
-        """佔名目的比例 (小數)。這就是預測優勢必須超過的門檻。"""
+        """Cost as a fraction of notional: the edge has to exceed this."""
         return self.total / self.notional if self.notional > 0 else float("inf")
 
     def explain(self) -> str:
         if self.notional <= 0:
-            return "名目為零"
+            return "zero notional"
         p = lambda x: f"{x / self.notional * 100:.3f}%"
         return (
-            f"來回成本 ${self.total:.2f} ({p(self.total)}) = "
-            f"佣金 ${self.commission:.2f}({p(self.commission)}) + "
-            f"價差 ${self.spread:.2f}({p(self.spread)}) + "
-            f"滑價 ${self.slippage:.2f}({p(self.slippage)}) + "
-            f"規費 ${self.regulatory:.2f}"
+            f"round trip ${self.total:.2f} ({p(self.total)}) = "
+            f"commission ${self.commission:.2f}({p(self.commission)}) + "
+            f"spread ${self.spread:.2f}({p(self.spread)}) + "
+            f"slippage ${self.slippage:.2f}({p(self.slippage)}) + "
+            f"fees ${self.regulatory:.2f}"
         )
 
 
@@ -189,7 +189,7 @@ class ExecutionCostModel:
         spread_bps: Optional[float] = None,
         extended_session: bool = False,
     ) -> Optional[int]:
-        """給定預測優勢，至少要幾股才可能有淨利。回傳 None 表示無解。"""
+        """Minimum shares for this edge to be profitable, or None if no size works."""
         notional = self.min_notional_for_cost(
             edge_pct, price, spread_bps, extended_session
         )
@@ -207,16 +207,16 @@ class ExecutionCostModel:
         safety_multiple: float = 1.5,
     ) -> tuple:
         """
-        這筆單的預測優勢是否足以覆蓋成本?
+        Does this order's predicted edge cover its cost?
 
-        safety_multiple 要求優勢是成本的數倍而非勉強打平 —— 剛好打平的交易
-        期望值為零，扣掉預測誤差就是負的。預設 1.5 倍。
+        safety_multiple requires the edge to be a multiple of the cost: a break-even trade
+        has zero expected value, and negative after forecast error. Default 1.5.
 
-        回傳 (是否可行, RoundTripCost, 說明)
+        Returns (viable, RoundTripCost, explanation)
         """
         cost = self.estimate(price, shares, spread_bps, extended_session)
         if cost.notional <= 0:
-            return False, cost, "名目為零，無法評估"
+            return False, cost, "zero notional; cannot assess"
 
         required = cost.pct * safety_multiple
         edge = abs(float(edge_pct))
@@ -225,8 +225,8 @@ class ExecutionCostModel:
                 True,
                 cost,
                 (
-                    f"優勢 {edge * 100:.3f}% ≥ 需求 {required * 100:.3f}% "
-                    f"(成本 {cost.pct * 100:.3f}% × {safety_multiple:g})"
+                    f"edge {edge * 100:.3f}% ≥ required {required * 100:.3f}% "
+                    f"(cost {cost.pct * 100:.3f}% × {safety_multiple:g})"
                 ),
             )
 
@@ -234,22 +234,22 @@ class ExecutionCostModel:
             edge / safety_multiple, price, spread_bps, extended_session
         )
         hint = (
-            f"若要讓這個優勢划算，需 ≥ {need} 股 (約 ${need * price:,.0f})"
+            f"this edge needs ≥ {need} shares (about ${need * price:,.0f})"
             if need
-            else "在任何部位大小下都無法覆蓋成本"
+            else "no position size covers the cost"
         )
         return (
             False,
             cost,
             (
-                f"優勢 {edge * 100:.3f}% < 需求 {required * 100:.3f}%。"
-                f"{cost.explain()}。{hint}"
+                f"edge {edge * 100:.3f}% < required {required * 100:.3f}%. "
+                f"{cost.explain()}. {hint}"
             ),
         )
 
 
 def build_execution_cost_model(config=None) -> ExecutionCostModel:
-    """Composition Root 使用。"""
+    """Composition root."""
     s = {}
     if config is not None:
         try:
@@ -262,7 +262,9 @@ def build_execution_cost_model(config=None) -> ExecutionCostModel:
     name = str(s.get("commission_model", "ibkr_tiered")).lower()
     cls = _COMMISSION_MODELS.get(name)
     if cls is None:
-        logger.error(f"未知的佣金模型 {name!r}，退回 ibkr_tiered (較保守的較低估計)。")
+        logger.error(
+            f"Unknown commission model {name!r}; falling back to ibkr_tiered (the lower, more conservative estimate)."
+        )
         cls = IBKRTieredCommission
 
     if cls is ZeroCommission:

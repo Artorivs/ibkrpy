@@ -1,5 +1,5 @@
 # ibkrpy/strategy/volatility_estimator.py
-# 以「同一批 K 線」直接估計每根波動率，並用它驗證 / 取代模型輸出。
+# Per-bar realized volatility from the same bars, used to check or replace the model's σ.
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ _BAND_HI = 3.0
 
 @dataclass(frozen=True)
 class VolatilityEstimate:
-    """一次波動率估計的完整結果，含來源與診斷資訊。"""
+    """Full result of a volatility estimate, with source and diagnostics."""
 
     value: float
     source: str
@@ -34,14 +34,14 @@ class VolatilityEstimate:
 
     @property
     def annualized(self) -> float:
-        """僅供顯示。回推年化需要 bars_per_year，故由呼叫端另行提供。"""
+        """Display only; the caller supplies bars_per_year."""
         return self.value * math.sqrt(_TRADING_DAYS)
 
 
 def _close_to_close(
     close: pd.Series, lookback: int, halflife: Optional[float]
 ) -> float:
-    """對數報酬的標準差。halflife 有值時改用 EWMA (較貼近近期狀態)。"""
+    """Std of log returns; EWMA when halflife is set (weights recent bars more)."""
     rets = np.log(close / close.shift(1)).dropna()
     if len(rets) < 5:
         return float("nan")
@@ -57,10 +57,10 @@ def _close_to_close(
 
 def _yang_zhang(df: pd.DataFrame, lookback: int) -> float:
     """
-    Yang-Zhang 估計量。同時吸收隔夜跳空與盤中波動，對同樣的樣本數，
-    效率約為單純收盤對收盤的 5~7 倍 —— 在只有 60 根 K 線可用時差別很大。
+    Yang-Zhang estimator. Captures overnight gaps and intraday range, and is about 5-7x
+    as efficient as close-to-close for the same sample, which matters with 60 bars.
 
-    需要 Open/High/Low/Close 四欄; 缺欄或資料不足時回傳 nan 由呼叫端退回。
+    Needs Open/High/Low/Close; returns nan when columns or data are missing.
     """
     need = ("Open", "High", "Low", "Close")
     if not all(c in df.columns for c in need):
@@ -100,10 +100,10 @@ def realized_volatility(
     df: pd.DataFrame, lookback: int = 60, halflife: Optional[float] = 20.0
 ) -> float:
     """
-    每根 K 線的實現波動率 (小數)。與傳入的 K 線同尺度，不做任何年化或去年化。
+    Realized volatility per bar (decimal), in the units of the bars given; never annualized.
 
-    優先 Yang-Zhang; 缺 OHLC 或退化時退回 EWMA 收盤對收盤。
-    兩者皆失敗回傳 nan，由 VolatilityEstimator 決定如何處理。
+    Yang-Zhang first; EWMA close-to-close when OHLC is missing or degenerate.
+    Returns nan if both fail; VolatilityEstimator decides what to do.
     """
     if df is None or df.empty or "Close" not in df.columns:
         return float("nan")
@@ -119,11 +119,11 @@ def realized_volatility(
 
 class VolatilityEstimator:
     """
-    以實現波動率為基準，決定最終要交給策略的 σ。
+    Chooses the σ handed to the strategy, using realized volatility as the reference.
 
-    契約: estimate() 永遠回傳一個有限的正值，永不拋例外。
-    這一點很重要 —— σ 有四個下游消費者 (門檻政策、出場幾何的 noise_floor 與
-    risk_cap、情境判定、風險平價倉位縮放)，任何一個拿到 nan 都會靜默失效。
+    Contract: estimate() always returns a finite positive value and never raises.
+    σ feeds the threshold policy, the exit geometry's noise floor and risk cap, regime
+    detection and risk-parity sizing; a nan in any of them fails silently.
     """
 
     def __init__(
@@ -152,9 +152,9 @@ class VolatilityEstimator:
         model_vol_per_bar: Optional[float] = None,
     ) -> VolatilityEstimate:
         """
-        :param df:                策略本輪實際使用的 K 線 (與 σ 同尺度)
-        :param model_vol_per_bar: 模型給出的「每根 K 線」波動率。若手上只有年化值，
-                                  請先自行換算後傳入 —— 本方法不猜測慣例。
+        :param df:                the bars the strategy uses this tick (same units as σ)
+        :param model_vol_per_bar: the model's per-bar volatility. Convert annual values
+                                                            before passing; this method doesn't guess conventions.
         """
         realized = realized_volatility(df, self.lookback, self.halflife)
 
@@ -166,7 +166,7 @@ class VolatilityEstimator:
                 float("nan"),
                 model_vol_per_bar,
                 None,
-                "K 線不足以估計實現波動率，改用保守下限",
+                "Too few bars for realized volatility; using the conservative floor",
             )
 
         realized = max(realized, self.abs_floor)
@@ -175,8 +175,8 @@ class VolatilityEstimator:
             if symbol not in self._warned:
                 self._warned.add(symbol)
                 logger.info(
-                    f"[{symbol}] 已列入 distrust_symbols，直接採用實現波動率 "
-                    f"{realized * 100:.3f}% (GARCH 權重需重新訓練)。"
+                    f"[{symbol}] In distrust_symbols; using realized volatility "
+                    f"{realized * 100:.3f}%."
                 )
             return VolatilityEstimate(
                 realized,
@@ -184,7 +184,7 @@ class VolatilityEstimator:
                 realized,
                 model_vol_per_bar,
                 None,
-                "標的在 distrust_symbols 清單中",
+                "symbol is in distrust_symbols",
             )
 
         if not self.trust_model or model_vol_per_bar is None:
@@ -194,13 +194,18 @@ class VolatilityEstimator:
                 realized,
                 model_vol_per_bar,
                 None,
-                "直接採用實現波動率",
+                "using realized volatility",
             )
 
         model = float(model_vol_per_bar)
         if not np.isfinite(model) or model <= 0:
             return VolatilityEstimate(
-                realized, "realized", realized, model, None, "模型值非有限或非正"
+                realized,
+                "realized",
+                realized,
+                model,
+                None,
+                "model value not finite or not positive",
             )
 
         ratio = model / realized
@@ -211,15 +216,15 @@ class VolatilityEstimator:
                 realized,
                 model,
                 ratio,
-                f"模型值在合理帶內 (×{ratio:.2f})",
+                f"model value within band (×{ratio:.2f})",
             )
 
         if symbol not in self._warned:
             self._warned.add(symbol)
             logger.error(
-                f"🌡️ [{symbol}] 模型波動率 {model * 100:.3f}% 與實現波動率 "
-                f"{realized * 100:.3f}% 相差 {ratio:.2f} 倍，已改用實現值。"
-                f"這通常代表該標的的 GARCH 權重尺度錯誤，需要重新訓練。"
+                f"🌡️ [{symbol}] Model volatility {model * 100:.3f}% differs from realized "
+                f"{realized * 100:.3f}% by {ratio:.2f}x; using realized."
+                f"The GARCH weights for this symbol are probably mis-scaled; retrain."
             )
         return VolatilityEstimate(
             realized,
@@ -227,12 +232,12 @@ class VolatilityEstimator:
             realized,
             model,
             ratio,
-            f"模型值偏離 {ratio:.2f} 倍，超出 [{self.band_lo:.2f}, {self.band_hi:.2f}]",
+            f"model value off by {ratio:.2f}x, outside [{self.band_lo:.2f}, {self.band_hi:.2f}]",
         )
 
 
 def build_volatility_estimator(config) -> VolatilityEstimator:
-    """Composition Root 使用。"""
+    """Composition root."""
     s = (config.get("volatility_settings") or {}) if config else {}
     return VolatilityEstimator(
         lookback=int(s.get("lookback", 60)),

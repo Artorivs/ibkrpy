@@ -1,5 +1,5 @@
 # ibkrpy/data/data_pipeline.py
-# 數據管線與緩存：負責特徵工程、特徵清單、特徵縮放、序列建構
+# Data pipeline: feature engineering, feature manifest, scaling and sequence building
 
 import os
 import logging
@@ -66,7 +66,7 @@ _NEVER_PRICE_RELATIVE = (
 
 
 class DataPipeline:
-    """負責數據的本地快取存取，以及機器學習所需的預處理"""
+    """Local data cache access and ML preprocessing."""
 
     def __init__(self, artifact_store=None, config=None):
         self.scalers: Dict[str, Dict] = {}
@@ -91,7 +91,7 @@ class DataPipeline:
         benchmark_df: pd.DataFrame = None,
         macro_dict: Dict[str, pd.Series] = None,
     ) -> pd.DataFrame:
-        """進階特徵工程：融合技術指標、大盤相關性與宏觀經濟數據"""
+        """Feature engineering: technical indicators, benchmark correlation and macro data."""
         df_adv = self.add_technical_indicators(df)
 
         if benchmark_df is not None and not benchmark_df.empty:
@@ -111,11 +111,11 @@ class DataPipeline:
 
     def select_model_features(self, df: pd.DataFrame) -> List[str]:
         """
-        從 engineer_advanced_features 的輸出挑出要送進模型的欄位。
+        Choose the columns from engineer_advanced_features that go into the model.
 
-        規則：
-          - OHLCV 永遠納入且固定排在最前面 (保證欄位順序在訓練/推論間一致)
-          - 其餘取所有數值型、無 NaN/Inf、非全常數的欄位，按名稱排序
+        Rules:
+          - OHLCV is always included and always first (same column order in training and inference)
+          - then every numeric column with no NaN/Inf that is not constant, sorted by name
         """
         features = [c for c in _BASE_FEATURES if c in df.columns]
 
@@ -137,18 +137,18 @@ class DataPipeline:
     @staticmethod
     def classify_price_relative(df: pd.DataFrame, features: List[str]) -> List[str]:
         """
-        找出「隨價格等比例縮放」的欄位。
+        Find columns that scale proportionally with price.
 
-        這類欄位不能用 Min-Max —— 訓練窗的 min/max 一旦被突破 (趨勢股創新高
-        幾乎必然發生)，縮放值就會超出 [0,1]，模型進入訓練分布之外的外推區間。
-        改為在每個時間窗內除以該窗最後一根的收盤價，變成無量綱的相對值。
+        These cannot use Min-Max: once price breaks the training window's min/max (almost
+        certain for a trending stock), scaled values leave [0, 1] and the model extrapolates.
+        Instead each window is divided by its last close, giving a dimensionless value.
 
-        判斷方式：
-          1. 以名稱前綴為主。add_technical_indicators 產生哪些欄位是我們自己決定的，
-             明確列舉遠比數值猜測可靠。
-          2. 名稱不認得的欄位再走數值判準，且門檻刻意收得很嚴 ——
-             要求 col/Close 的變異係數 < 0.05 且比值落在 [0.5, 2.0]。
-             純用標準差會誤判：強趨勢下 RSI/Close 的絕對標準差同樣很小。
+        Detection:
+          1. Mainly by name prefix. We define which columns add_technical_indicators makes,
+             so listing them is more reliable than numeric guessing.
+          2. Unknown names fall back to a strict numeric test: col/Close coefficient of
+             variation < 0.05 and ratio within [0.5, 2.0]. Plain std misfires, since in a
+             strong trend RSI/Close also has a small absolute std.
         """
         if "Close" not in df.columns:
             return []
@@ -191,7 +191,7 @@ class DataPipeline:
         target_scale: float = 100.0,
         benchmark: str = None,
     ):
-        """[訓練階段專用] 保存特徵欄位、其縮放方式與預測目標的定義"""
+        """[Training only] Save feature columns, their scaling and the target definition."""
         manifest = {
             "features": list(features),
             "price_relative": list(price_relative or []),
@@ -202,13 +202,13 @@ class DataPipeline:
         self.artifacts.save_manifest(symbol, manifest)
         self._manifests[symbol] = manifest
         logger.debug(
-            f"[{symbol}] 特徵清單已保存 ({len(features)} 欄，"
-            f"其中 {len(manifest['price_relative'])} 欄為價格相對縮放；"
-            f"目標: {target_mode}；benchmark: {manifest['benchmark'] or '無'})。"
+            f"[{symbol}] Feature manifest saved ({len(features)} columns, "
+            f"{len(manifest['price_relative'])} price-relative; "
+            f"target: {target_mode}; benchmark: {manifest['benchmark'] or 'none'})."
         )
 
     def load_manifest(self, symbol: str) -> Optional[Dict]:
-        """讀回完整 manifest。回傳 None 代表該標的尚未訓練。"""
+        """Read back the full manifest. None means the symbol is not trained yet."""
         if symbol in self._manifests:
             return self._manifests[symbol]
 
@@ -223,11 +223,11 @@ class DataPipeline:
             self._manifests[symbol] = manifest
             return manifest
         except Exception as e:
-            logger.error(f"[{symbol}] 特徵清單載入失敗: {e}")
+            logger.error(f"[{symbol}] Failed to load feature manifest: {e}")
             return None
 
     def load_feature_manifest(self, symbol: str) -> Optional[List[str]]:
-        """只取特徵欄位清單 (供 AutomatedModelFactory 決定 feature_cols)"""
+        """Feature column list only (used by AutomatedModelFactory for feature_cols)."""
         m = self.load_manifest(symbol)
         return m["features"] if m else None
 
@@ -235,11 +235,11 @@ class DataPipeline:
         self, df: pd.DataFrame, symbol: str
     ) -> Tuple[pd.DataFrame, List[str]]:
         """
-        把推論用的 DataFrame 對齊到訓練時的特徵清單。
+        Align an inference DataFrame to the training feature manifest.
 
-        訓練時存在、推論時缺席的欄位 (例如 benchmark 抓取失敗導致
-        bench_correlation 消失) 會補 0 並記錄警告 —— 靜默補值會讓模型
-        在不知情的狀況下吃到錯誤的分布。
+        Columns present in training but missing at inference (e.g. bench_correlation when the
+        benchmark fetch failed) are filled with 0 and logged; silent filling would feed the
+        model the wrong distribution unnoticed.
         """
         features = self.load_feature_manifest(symbol)
         if features is None:
@@ -248,7 +248,7 @@ class DataPipeline:
         missing = [c for c in features if c not in df.columns]
         if missing:
             logger.warning(
-                f"[{symbol}] 推論資料缺少 {len(missing)} 個訓練特徵，已補 0: {missing}"
+                f"[{symbol}] Inference data is missing {len(missing)} training features, filled with 0: {missing}"
             )
             df = df.copy()
             for c in missing:
@@ -267,11 +267,10 @@ class DataPipeline:
         benchmark: str = None,
     ):
         """
-        [訓練階段專用] 一次原子寫入 scaler 與 manifest。
+        [Training only] Write scaler and manifest in one atomic step.
 
-        分開呼叫 save_feature_manifest() 與 fit_scale() 時，兩次寫入之間
-        若發生例外，磁碟上會留下「新 manifest 配舊 scaler」的狀態，而且
-        不會有任何錯誤 —— 模型只是安靜地吃到錯誤的分布。用這個方法就不會。
+        Calling save_feature_manifest() and fit_scale() separately can leave a new manifest
+        with an old scaler on disk if the second write fails, with no error raised.
         """
         manifest = {
             "features": list(features),
@@ -284,17 +283,16 @@ class DataPipeline:
         self.scalers[symbol] = scaler
         self._manifests[symbol] = manifest
         logger.debug(
-            f"[{symbol}] 訓練產物已原子寫入 ({len(features)} 個特徵，"
-            f"{len(scaler)} 個縮放欄位)。"
+            f"[{symbol}] Training artifacts written atomically ({len(features)} features, "
+            f"{len(scaler)} scaled columns)."
         )
 
     def invalidate(self, symbol: str = None):
         """
-        清除記憶體快取。重訓後必須呼叫，否則會用舊 scaler 配新模型。
+        Clear the in-memory cache. Must be called after retraining, or an old scaler meets a new model.
 
-        scaler 與 manifest 必須一起清 —— 它們是同一次訓練的兩半。只清一半
-        會在記憶體裡重建磁碟上已經消滅的錯配 (model_orchestrator 以前就是
-        只 pop scalers)。外部模組請一律呼叫本方法，不要直接動這兩個 dict。
+        Scaler and manifest are two halves of one training run and must be cleared together.
+        Other modules should call this method rather than touching the two dicts.
         """
         if symbol is None:
             self.scalers.clear()
@@ -307,7 +305,7 @@ class DataPipeline:
     def _compute_scaler(
         df: pd.DataFrame, columns: List[str]
     ) -> Dict[str, Dict[str, float]]:
-        """純計算，不產生任何副作用 (不寫檔、不改 self.scalers)"""
+        """Pure computation with no side effects (no file writes, self.scalers untouched)."""
         scaler_dict = {}
         for col in columns:
             if col in df.columns:
@@ -319,28 +317,28 @@ class DataPipeline:
 
     def fit_scale(self, df: pd.DataFrame, columns: List[str], symbol: str):
         """
-        [訓練階段專用] 僅在 Training Set 上呼叫。
+        [Training only] Call on the training set only.
 
-        此函式「會寫檔」，因此絕不可從 transform_scale 之類的讀取路徑呼叫。
-        寫到哪裡由 ScalerStore 決定 —— 本模組不再知道檔案佈局。
+        This writes to disk, so it must never be called from a read path such as
+        transform_scale. ScalerStore decides where it is written.
         """
         scaler_dict = self._compute_scaler(df, columns)
         self.scalers[symbol] = scaler_dict
         self.artifacts.save_scaler(symbol, scaler_dict)
 
         if "__wf" not in symbol:
-            logger.info(f"[{symbol}] 特徵縮放參數 (Scaler) 已適配並儲存。")
+            logger.info(f"[{symbol}] Feature scaler fitted and saved.")
         else:
-            logger.debug(f"[{symbol}] 特徵縮放參數 (Scaler) 已成適配並儲存。")
+            logger.debug(f"[{symbol}] Feature scaler fitted and saved.")
 
     def transform_scale(
         self, df: pd.DataFrame, columns: List[str], symbol: str
     ) -> pd.DataFrame:
         """
-        [回測與實盤專用] 載入訓練階段算好的 Min-Max 參數進行轉換。
+        [Backtest and live] Transform with the Min-Max parameters fitted in training.
 
-        找不到 scaler 時，只在記憶體中臨時計算，「不會」落盤。
-        這種情況代表該標的尚未訓練，預測結果不應被信任。
+        If no scaler exists, one is computed in memory only and not saved. That means the
+        symbol is untrained and its predictions should not be trusted.
         """
         df_scaled = df.copy()
 
@@ -350,8 +348,8 @@ class DataPipeline:
                 self.scalers[symbol] = stored
             else:
                 logger.error(
-                    f"[{symbol}] 找不到預訓練的 Scaler，僅在記憶體中臨時計算 (不落盤)。"
-                    f"該標的尚未訓練，預測結果不可信 —— 請執行 --mode train。"
+                    f"[{symbol}] No pretrained scaler; computing in memory only (not saved). "
+                    f"The symbol is untrained and its predictions are unreliable; run --mode train."
                 )
                 self.scalers[symbol] = self._compute_scaler(df, columns)
 
@@ -375,14 +373,14 @@ class DataPipeline:
         self, value: float, column: str, symbol: str
     ) -> Optional[float]:
         """
-        反向還原縮放值 (供預測價格還原時使用)。
+        Invert scaling (used to recover predicted prices).
 
-        [修正] 找不到 scaler 時回傳 None 而非原值。
-        舊版直接回傳原值，等於讓一個 0~1 的縮放值冒充真實價格，
-        只能靠下游的 10% 偏差過濾網攔截 —— 那是保險絲，不是正確行為。
+        Returns None when no scaler exists, rather than passing a 0-1 scaled value off as a price.
         """
         if symbol not in self.scalers or column not in self.scalers[symbol]:
-            logger.error(f"[{symbol}] 缺少 {column} 的 scaler，無法還原預測值。")
+            logger.error(
+                f"[{symbol}] No scaler for {column}; cannot invert the prediction."
+            )
             return None
 
         min_val = self.scalers[symbol][column]["min"]
@@ -396,12 +394,12 @@ class DataPipeline:
         self, df: pd.DataFrame, symbol: str
     ) -> Tuple[pd.DataFrame, List[str]]:
         """
-        [實盤/回測專用] 依 manifest 產生模型輸入。
+        [Live and backtest] Build model input from the manifest.
 
-        - price_relative 欄位：除以「整段 df 最後一根的收盤價」。
-          推論時只需要最後一個時間窗，其錨點就是最後一根收盤價，
-          因此與訓練時 create_sequences 的逐窗錨定在語意上完全一致。
-        - 其餘欄位：套用訓練時擬合的 Min-Max。
+        - price_relative columns: divided by the last close of the whole df. Inference only
+            needs the last window, whose anchor is that close, so this matches the per-window
+            anchoring in create_sequences during training.
+        - Other columns: Min-Max fitted in training.
         """
         manifest = self.load_manifest(symbol)
         if manifest is None:
@@ -415,7 +413,7 @@ class DataPipeline:
             float(df["Close"].iloc[-1]) if "Close" in df.columns and len(df) else 0.0
         )
         if anchor <= 0:
-            logger.error(f"[{symbol}] 錨定價格無效，無法產生模型輸入。")
+            logger.error(f"[{symbol}] Invalid anchor price; cannot build model input.")
             return df, features
 
         minmax_cols = [c for c in features if c not in price_rel]
@@ -431,10 +429,10 @@ class DataPipeline:
         self, raw: float, current_price: float, symbol: str
     ) -> Optional[float]:
         """
-        把模型原始輸出轉回「預測價格」。
+        Convert raw model output back to a predicted price.
 
-        target_mode = "log_return" 時，模型輸出的是下一根 K 線的對數報酬 x target_scale，
-        因此 price = current_price * exp(raw / target_scale)。
+        With target_mode = "log_return" the model outputs the next bar's log return x target_scale,
+        so price = current_price * exp(raw / target_scale).
         """
         if not np.isfinite(raw) or current_price <= 0:
             return None
@@ -447,7 +445,7 @@ class DataPipeline:
             log_ret = float(raw) / scale
             if abs(log_ret) > 0.5:
                 logger.warning(
-                    f"[{symbol}] 模型輸出的報酬率異常 ({log_ret:.3f})，已剔除。"
+                    f"[{symbol}] Abnormal model return output ({log_ret:.3f}); discarded."
                 )
                 return None
             return float(current_price * np.exp(log_ret))
@@ -465,23 +463,25 @@ class DataPipeline:
         target_scale: float = 100.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        建立 LSTM/Transformer 所需的滑動視窗時間序列數據。
+        Build sliding-window sequences for LSTM/Transformer.
 
-        :param df:            已對 minmax 欄位縮放、price_relative 欄位仍為原值的資料
-        :param raw_close:     未經任何縮放的原始收盤價 (逐窗錨定與計算目標報酬皆需要)
-        :param price_relative: 需要在每個窗內除以該窗最後收盤價的欄位
-        :param target_mode:   "log_return" (預設) 或 "level"
+        :param df:            data with minmax columns scaled and price_relative columns raw
+        :param raw_close:     unscaled close (needed for per-window anchors and target returns)
+        :param price_relative: columns divided by each window's last close
+        :param target_mode:   "log_return" (default) or "level"
 
-        逐窗錨定的因果性：第 i 個窗涵蓋 [i, i+look_back-1]，錨點取 i+look_back-1
-        的收盤價，目標則是 i+look_back-1 -> i+look_back 的報酬。錨點只用到窗內
-        已觀測到的資料，沒有前視。
+        Causality: window i covers [i, i+look_back-1], anchored on the close at i+look_back-1;
+        the target is the return from i+look_back-1 to i+look_back. The anchor only uses data
+        observed inside the window, so there is no lookahead.
         """
         if len(df) <= look_back:
             return np.array([]), np.array([])
 
         missing = [c for c in features if c not in df.columns]
         if missing:
-            raise ValueError(f"建立序列時缺少特徵欄位: {missing}")
+            raise ValueError(
+                f"Missing feature columns when building sequences: {missing}"
+            )
 
         data = df[features].values.astype("float64")
 

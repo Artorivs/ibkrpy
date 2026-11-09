@@ -1,5 +1,5 @@
 # ibkrpy/strategy/regime_detector.py
-# 市場情境偵測：具備遲滯、非對稱確認，以及頂部反轉風險評分。
+# Market regime detection with hysteresis, asymmetric confirmation and top-reversal risk.
 
 from __future__ import annotations
 
@@ -16,11 +16,10 @@ logger = logging.getLogger("ibkrpy.regime")
 
 @dataclass
 class RegimeAssessment:
-    """一次情境評估的完整結果。
+    """Full result of one regime assessment.
 
-    reversal_risk 是本類別存在的理由：它讓「多頭仍成立，但正在轉弱」
-    成為一個可以被表達、被記錄、被據以行動的狀態，而不必等到
-    均線交叉完成才發現趨勢已經結束。
+    reversal_risk lets "still a bull trend, but weakening" be expressed, logged and acted
+    on, instead of waiting for the moving-average cross to show the trend has ended.
     """
 
     regime: MarketRegime
@@ -36,21 +35,21 @@ class RegimeAssessment:
 
     @property
     def is_turning(self) -> bool:
-        """趨勢正在轉弱，但尚未翻轉成反向趨勢。"""
+        """The trend is weakening but hasn't flipped yet."""
         return self.reversal_risk >= 0.5
 
     def describe(self) -> str:
         parts = [self.regime.name]
         if self.regime is not self.raw_regime:
-            parts.append(f"(即時判定 {self.raw_regime.name}，遲滯中)")
-        parts.append(f"反轉風險 {self.reversal_risk:.0%}")
+            parts.append(f"(raw {self.raw_regime.name}, held by hysteresis)")
+        parts.append(f"reversal risk {self.reversal_risk:.0%}")
         if self.reasons:
             parts.append("| " + " · ".join(self.reasons))
         return " ".join(parts)
 
 
 def _safe_last(series: Optional[pd.Series], default: float = np.nan) -> float:
-    """取序列最後一個有限值。取不到就回傳 default，並讓呼叫端決定如何處理。"""
+    """Last finite value of the series, or default; the caller decides what to do."""
     if series is None or len(series) == 0:
         return default
     value = pd.to_numeric(series, errors="coerce").dropna()
@@ -67,7 +66,7 @@ def _clamp01(value: float) -> float:
 
 def wilder_atr(df: pd.DataFrame, period: int) -> pd.Series:
     """
-    Wilder 平均真實區間。
+    Wilder average true range.
     """
     high = pd.to_numeric(df["High"], errors="coerce")
     low = pd.to_numeric(df["Low"], errors="coerce")
@@ -81,7 +80,7 @@ def wilder_atr(df: pd.DataFrame, period: int) -> pd.Series:
 
 
 def wilder_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    """Wilder 平均趨向指數 (ADX)。回傳單一序列，與舊版取用第一欄的行為一致。"""
+    """Wilder ADX, as a single series (the first column, as before)."""
     high = pd.to_numeric(df["High"], errors="coerce")
     low = pd.to_numeric(df["Low"], errors="coerce")
 
@@ -106,10 +105,10 @@ def wilder_adx(df: pd.DataFrame, period: int) -> pd.Series:
 
 
 class ReversalRiskModel:
-    """把數個獨立訊號合成為 0~1 的反轉風險分數。
+    """Combines independent signals into a 0-1 reversal risk score.
 
-    每個訊號都是一個純函式：吃 DataFrame，吐 0~1。彼此不知道對方存在，
-    新增訊號只要多一個方法並登記權重即可 (Open/Closed)。
+    Each signal is a pure function from DataFrame to 0-1 and knows nothing of the others;
+    adding one means adding a method and registering its weight.
     """
 
     def __init__(self, weights: Dict[str, float] = None):
@@ -124,11 +123,11 @@ class ReversalRiskModel:
 
     @staticmethod
     def momentum_fade(df: pd.DataFrame, fast: int, slow: int) -> float:
-        """快線的斜率轉平或轉負 → 上升動能正在消失。
+        """Fast MA slope flattening or turning down: upward momentum fading.
 
-        衡量的是斜率而非乖離：盤頭期間快慢線的乖離可能還是正的，
-        但快線已經走平——那才是最早出現的訊號。斜率以自身近期的
-        正斜率常態做正規化，因此不受標的價位高低影響。
+        Uses slope, not distance: during a top the fast/slow gap can still be positive
+        while the fast MA has already flattened, which is the earliest sign. The slope is
+        normalized by its own recent positive slope, so price level doesn't matter.
         """
         close = df["Close"]
         if len(close) < slow + fast:
@@ -153,7 +152,7 @@ class ReversalRiskModel:
 
     @staticmethod
     def price_below_fast_ma(df: pd.DataFrame, fast: int) -> float:
-        """收盤跌破快線，且跌幅越深分數越高。多頭轉弱最直接的徵兆。"""
+        """Close below the fast MA, scored by depth. The most direct sign of a weakening trend."""
         close = df["Close"]
         if len(close) < fast + 2:
             return 0.0
@@ -166,7 +165,7 @@ class ReversalRiskModel:
 
     @staticmethod
     def trend_exhaustion(df: pd.DataFrame, adx: Optional[pd.Series]) -> float:
-        """ADX 從高點回落 → 趨勢正在耗盡。"""
+        """ADX falling from its high: the trend is exhausting."""
         if adx is None or len(adx.dropna()) < 6:
             return 0.0
         recent = adx.dropna().tail(8)
@@ -178,7 +177,7 @@ class ReversalRiskModel:
 
     @staticmethod
     def lower_highs(df: pd.DataFrame, lookback: int) -> float:
-        """距離區間高點的回落幅度 → 頭部特徵。"""
+        """Pullback from the range high: a topping pattern."""
         high = df["High"]
         close = df["Close"]
         if len(high) < lookback + 2:
@@ -192,7 +191,7 @@ class ReversalRiskModel:
 
     @staticmethod
     def volatility_expansion(df: pd.DataFrame, atr: Optional[pd.Series]) -> float:
-        """波動率相對自身基線放大 → 分歧加劇，多頭末端常見。"""
+        """Volatility expanding vs. its own baseline: disagreement, common late in a bull run."""
         if atr is None or len(atr.dropna()) < 25:
             return 0.0
         series = atr.dropna()
@@ -204,7 +203,7 @@ class ReversalRiskModel:
 
     @staticmethod
     def distribution_volume(df: pd.DataFrame, lookback: int) -> float:
-        """下跌K棒的成交量大於上漲K棒 → 派發 (出貨) 特徵。"""
+        """Down-bar volume exceeding up-bar volume: distribution."""
         if "Volume" not in df.columns or len(df) < lookback + 1:
             return 0.0
         recent = df.tail(lookback)
@@ -249,17 +248,17 @@ class ReversalRiskModel:
 
 
 class MarketRegimeDetector:
-    """以 ADX、均線與 ATR 判定情境，並附帶遲滯與反轉風險。
+    """Classifies the regime from ADX, moving averages and ATR, with hysteresis and reversal risk.
 
-    與舊版的三個關鍵差異：
+    Key choices:
 
-    1. 預設週期拉長 (5/10 → 20/50)。5/10 日均線在盤中會被未收盤的當根 K
-       反覆穿越，日誌顯示這造成每日多達 8 次的情境翻轉。
-    2. 遲滯 (hysteresis)：情境要連續數根 K 線維持同一判定才真正切換。
-       且**非對稱**——轉為空頭所需的確認根數少於轉為多頭。市場下跌
-       比上漲快，用同一組參數兩邊對稱處理，等於在出場時故意反應遲鈍。
-    3. 反轉風險評分：在 BEAR_TREND 被確認之前就開始上升，填補
-       「多頭已死但空頭未立」的那段空窗。
+    1. Longer default periods (20/50). 5/10-period MAs get crossed back and forth by the
+          unfinished current bar, which flipped the regime up to 8 times a day.
+    2. Hysteresis: a new regime must hold for several bars before it switches, and the
+          confirmation is asymmetric: turning bearish needs fewer bars than turning bullish,
+          since markets fall faster than they rise.
+    3. Reversal risk rises before BEAR_TREND is confirmed, covering the gap between
+          "bull is over" and "bear is confirmed".
     """
 
     def __init__(self, config: Dict[str, object] = None):
@@ -283,13 +282,15 @@ class MarketRegimeDetector:
         self._state: Dict[str, Dict[str, object]] = {}
 
     def _indicators(self, df: pd.DataFrame) -> Dict[str, object]:
-        """計算指標。失敗時記錄原因並回傳 None，由呼叫端明確處理。"""
+        """Compute indicators. On failure, log why and return None for the caller to handle."""
         result: Dict[str, object] = {"adx": None, "atr": None}
         try:
             result["adx"] = wilder_adx(df, self.adx_period)
             result["atr"] = wilder_atr(df, self.atr_period)
         except Exception as exc:
-            logger.warning(f"情境指標計算失敗，本次退回中性判定: {exc}")
+            logger.warning(
+                f"Regime indicator calculation failed; using a neutral regime: {exc}"
+            )
         return result
 
     def _classify(
@@ -318,7 +319,7 @@ class MarketRegimeDetector:
         )
 
     def _confirm_bars(self, candidate: MarketRegime) -> int:
-        """轉為空頭只需要較少的確認根數。"""
+        """Turning bearish needs fewer confirmation bars."""
         if candidate is MarketRegime.BEAR_TREND:
             return self.bear_confirm_bars
         if candidate is MarketRegime.BULL_TREND:
@@ -353,12 +354,14 @@ class MarketRegimeDetector:
         return state["regime"], int(state["bars"])
 
     def assess(self, df: pd.DataFrame, key: str = None) -> RegimeAssessment:
-        """完整評估。key 用來隔離不同標的的遲滯狀態。"""
+        """Full assessment. key keeps each symbol's hysteresis state separate."""
         minimum = max(self.ma_long, self.adx_period, self.atr_period) + 2
         if df is None or len(df) < minimum:
             return RegimeAssessment(
                 regime=MarketRegime.SIDEWAYS_QUIET,
-                reasons=[f"資料不足 ({0 if df is None else len(df)}/{minimum} 根)"],
+                reasons=[
+                    f"not enough data ({0 if df is None else len(df)}/{minimum} bars)"
+                ],
             )
 
         frame = df.iloc[:-1] if self.use_closed_bars_only and len(df) > minimum else df
@@ -403,5 +406,5 @@ class MarketRegimeDetector:
         )
 
     def detect(self, df: pd.DataFrame, key: str = None) -> MarketRegime:
-        """相容既有呼叫端的簡化介面。"""
+        """Simplified interface for existing callers."""
         return self.assess(df, key).regime

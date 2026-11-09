@@ -1,5 +1,5 @@
 # ibkrpy/strategy/core_strategy.py
-# 核心策略 (支援多模型 Ensemble 與動態進場閾值)
+# Core strategy: ensemble prediction with a dynamic entry threshold
 
 from typing import Dict, Any, Optional
 import numpy as np
@@ -7,7 +7,7 @@ from .strategy_components import MarketRegime
 
 
 class CoreStrategy:
-    """因市場情境而變，動靜皆合其宜的決策者。支援單一預測或多模型混合 (Ensemble)。"""
+    """Turns predictions into signals, adapting to the market regime. Accepts one prediction or an ensemble."""
 
     def __init__(
         self,
@@ -62,16 +62,16 @@ class CoreStrategy:
             "symbol": self.symbol,
             "outcome": signal["action"],
             "reason_code": "SIGNAL",
-            "detail": "通過全部進場條件",
+            "detail": "passed all entry checks",
             **fields,
         }
         return signal
 
     def describe_last_decision(self) -> str:
-        """把 last_decision 壓成一行可讀的日誌字串。"""
+        """Format last_decision as one readable log line."""
         d = self.last_decision
         if not d:
-            return "尚未做出任何決策"
+            return "no decision yet"
 
         parts = [
             f"{d.get('outcome', '?')}",
@@ -80,20 +80,24 @@ class CoreStrategy:
         ]
         nums = []
         if d.get("predicted_pct") is not None:
-            nums.append(f"預測 {d['predicted_pct'] * 100:+.2f}%")
+            nums.append(f"pred {d['predicted_pct'] * 100:+.2f}%")
         if d.get("threshold_pct") is not None:
             t = d["threshold_pct"]
             src = d.get("threshold_source")
-            label = f"門檻 ±{t * 100:.3f}%" if np.isfinite(t) else "門檻 校準中"
+            label = (
+                f"threshold ±{t * 100:.3f}%"
+                if np.isfinite(t)
+                else "threshold calibrating"
+            )
             nums.append(f"{label}{f'({src})' if src else ''}")
         if d.get("sigma") is not None:
             nums.append(f"σ {d['sigma'] * 100:.2f}%")
         if d.get("reward_risk") is not None:
             nums.append(f"R:R {d['reward_risk']:.2f}")
         if d.get("regime"):
-            nums.append(f"情境 {d['regime']}")
+            nums.append(f"regime {d['regime']}")
         if d.get("models"):
-            nums.append(f"模型 {d['models']}")
+            nums.append(f"models {d['models']}")
         if nums:
             parts.append("| " + " · ".join(nums))
         return " ".join(p for p in parts if p)
@@ -103,7 +107,7 @@ class CoreStrategy:
     def _calculate_ensemble_prediction(
         self, predictions: Dict[str, float], regime: MarketRegime
     ) -> float:
-        """動態權重 (Dynamic Weighting)，並依模型實際離散度調整話語權"""
+        """Regime-based weights, adjusted by each model's observed dispersion."""
         if not predictions:
             return 0.0
 
@@ -154,8 +158,8 @@ class CoreStrategy:
 
     def set_model_liveness(self, liveness: Dict[str, float]):
         """
-        由 TradingEngine 注入：每個模型的「存活度」(0~1)。
-        1.0 = 輸出具備正常變異；接近 0 = 已塌陷成常數。
+        Injected by TradingEngine: each model's liveness (0-1).
+        1.0 = normal output variation; near 0 = collapsed to a constant.
         """
         self._model_liveness = dict(liveness or {})
 
@@ -163,17 +167,17 @@ class CoreStrategy:
         self, expected_move: float, volatility: float, regime: MarketRegime
     ) -> Optional[Dict[str, float]]:
         """
-        由「預測幅度」與「波動率」共同決定停利／停損距離 (皆為正的百分比)
+        Take-profit and stop-loss distances (positive fractions) from the predicted move and volatility.
 
-        先由預測幅度決定停利，再由目標風報比反推停損，
-        最後才用波動率設「雜訊下限」與「風險上限」兩道護欄。
+        Take-profit comes from the predicted move, the stop from the target reward:risk,
+        and volatility only sets a noise floor and a risk cap:
 
-            tp_dist = clamp(預測幅度 × tp_capture, 成本地板, σ × tp_mult)
-            sl_dist = clamp(tp_dist / 目標風報比,  σ × noise_floor, σ × sl_mult)
+                tp_dist = clamp(predicted move × tp_capture, cost floor, σ × tp_mult)
+                sl_dist = clamp(tp_dist / target R:R,  σ × noise_floor, σ × sl_mult)
 
-        於是風報比在正常情況下「依構造成立」；只有當雜訊下限把停損頂開時才會不足，
-        而那正是應該拒絕的情形 —— 預測出來的優勢小於必須忍受的雜訊。
-        這種拒絕會帶著明確的原因碼 NOISE_EXCEEDS_EDGE 回報，而不是含糊的風報比不足。
+        So reward:risk holds by construction, and only falls short when the noise floor pushes
+        the stop out, i.e. the predicted edge is smaller than the noise to sit through. That case
+        is rejected with reason code NOISE_EXCEEDS_EDGE.
         """
         sl_mult = self.sl_multiplier
         tp_mult = self.tp_multiplier
@@ -219,28 +223,27 @@ class CoreStrategy:
         current_position: float = 0.0,
         reversal_risk: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
-        """純函數式信號生成
+        """Generate a signal (no side effects beyond last_decision).
 
-        current_position 讓策略能區分「平倉」與「開倉」——兩者的風險性質
-        相反，套用同一組過濾規則會在轉折點上鎖死出場 (見逆勢過濾處的說明)。
+        current_position separates closing from opening, which carry opposite risk; one set of
+        filters for both would lock exits at turning points (see the counter-trend filter).
 
-        reversal_risk 是 0~1 的頂部反轉風險。它不會阻擋出場，只會提高
-        新增曝險的門檻——「現在減碼」永遠比「現在加碼」安全。
+        reversal_risk (0-1) never blocks exits; it only raises the bar for new exposure.
 
-        注意：`volatility` 預期是「每根 K 線」的波動率 (已由 TradingEngine 去年化)
+        `volatility` is per bar.
         """
         regime_name = regime.name if hasattr(regime, "name") else str(regime)
         self._last_filtered_models = sorted((ensemble_predictions or {}).keys())
 
         if current_price <= 0:
             return self._reject(
-                "BAD_PRICE", f"現價無效 ({current_price})", regime=regime_name
+                "BAD_PRICE", f"invalid price ({current_price})", regime=regime_name
             )
 
         if not np.isfinite(volatility) or volatility <= 0:
             return self._reject(
                 "BAD_VOLATILITY",
-                f"波動率無效 ({volatility})，GARCH 可能未訓練",
+                f"invalid volatility ({volatility}); GARCH may be untrained",
                 regime=regime_name,
             )
 
@@ -257,7 +260,7 @@ class CoreStrategy:
         ):
             return self._reject(
                 "NO_PREDICTION",
-                "無有效的 Ensemble 預測值",
+                "no valid ensemble prediction",
                 regime=regime_name,
                 sigma=volatility,
                 models=self._last_filtered_models,
@@ -306,32 +309,36 @@ class CoreStrategy:
             dynamic_threshold *= self.exit_threshold_ratio
             common["threshold_pct"] = dynamic_threshold
             common["threshold_source"] = (
-                f"{decision.source}×{self.exit_threshold_ratio:g}(出場)"
+                f"{decision.source}×{self.exit_threshold_ratio:g}(exit)"
             )
         elif reversal_risk >= self.reversal_caution_level:
             inflation = 1.0 + reversal_risk * self.reversal_threshold_boost
             dynamic_threshold *= inflation
             common["threshold_pct"] = dynamic_threshold
-            common["threshold_source"] = f"{decision.source}×{inflation:.2f}(反轉風險)"
+            common["threshold_source"] = (
+                f"{decision.source}×{inflation:.2f}(reversal risk)"
+            )
 
         if self.collapse_detector is not None and history:
             report = self.collapse_detector.inspect(history)
             if report.collapsed:
                 return self._reject(
                     "MODEL_COLLAPSED",
-                    f"模型輸出已退化成常數 ({report.detail})，拒絕以此下單。請重新訓練。",
+                    f"model output collapsed to a constant ({report.detail}); not trading on it. Retrain.",
                     **common,
                 )
 
         if regime == MarketRegime.SIDEWAYS_QUIET and self.term == "short_term":
             return self._reject(
-                "REGIME_QUIET", "短線策略在低波動盤整期不進場", **common
+                "REGIME_QUIET",
+                "short-term strategy skips quiet sideways markets",
+                **common,
             )
 
         if not np.isfinite(dynamic_threshold):
             return self._reject(
                 "CALIBRATING",
-                f"門檻尚在校準中 ({decision.detail})，樣本累積足夠後才會開始交易",
+                f"threshold still calibrating ({decision.detail}); trading starts once enough samples accumulate",
                 **common,
             )
 
@@ -340,12 +347,12 @@ class CoreStrategy:
             if decision.source == "cost_floor":
                 return self._reject(
                     "EDGE_BELOW_COST",
-                    f"預測優勢不足以覆蓋交易成本 ({decision.detail})",
+                    f"predicted edge doesn't cover trading costs ({decision.detail})",
                     **common,
                 )
             return self._reject(
                 "BELOW_THRESHOLD",
-                f"預測幅度未達進場門檻 (差 {gap:.3f} 個百分點, 門檻來源: {decision.source})",
+                f"prediction below entry threshold (short by {gap:.3f} pp, source: {decision.source})",
                 **common,
             )
 
@@ -359,20 +366,20 @@ class CoreStrategy:
             if reversal_risk >= self.reversal_block_level:
                 return self._reject(
                     "REVERSAL_IMMINENT",
-                    f"頂部反轉風險 {reversal_risk:.0%} 已達封鎖水位 "
-                    f"{self.reversal_block_level:.0%}，暫停新增曝險 (出場不受此限)",
+                    f"top-reversal risk {reversal_risk:.0%} reached the block level "
+                    f"{self.reversal_block_level:.0%}; no new exposure (exits unaffected)",
                     **common,
                 )
             if regime == MarketRegime.BEAR_TREND and action == "BUY":
                 return self._reject(
                     "COUNTER_TREND",
-                    f"{action} 為新增曝險且與 {regime_name} 相反，已過濾",
+                    f"{action} adds exposure against {regime_name}; filtered",
                     **common,
                 )
             if regime == MarketRegime.BULL_TREND and action == "SELL":
                 return self._reject(
                     "COUNTER_TREND",
-                    f"{action} 為新增曝險且與 {regime_name} 相反，已過濾",
+                    f"{action} adds exposure against {regime_name}; filtered",
                     **common,
                 )
 
@@ -382,22 +389,26 @@ class CoreStrategy:
             regime=regime,
         )
         if geometry is None:
-            return self._reject("BAD_GEOMETRY", "停損／停利距離計算失敗", **common)
+            return self._reject(
+                "BAD_GEOMETRY", "stop/target distance calculation failed", **common
+            )
 
         if geometry["reward_risk"] < self.min_reward_risk:
             if geometry.get("noise_bound"):
                 return self._reject(
                     "NOISE_EXCEEDS_EDGE",
-                    f"停損被雜訊下限頂到 {geometry['noise_floor'] * 100:.2f}% "
-                    f"(σ×{self.sl_noise_floor_mult:g})，而停利只有 {geometry['tp_dist'] * 100:.2f}% —— "
-                    f"預測優勢小於必須忍受的雜訊",
+                    f"stop pushed out to the noise floor {geometry['noise_floor'] * 100:.2f}% "
+                    f"(σ×{self.sl_noise_floor_mult:g}) while the target is only {geometry['tp_dist'] * 100:.2f}%: "
+                    f"predicted edge is smaller than the noise",
                     reward_risk=geometry["reward_risk"],
                     **common,
                 )
-            note = "（停利被 σ 上限壓住）" if geometry["capped_by_ceiling"] else ""
+            note = (
+                " (target capped by σ ceiling)" if geometry["capped_by_ceiling"] else ""
+            )
             return self._reject(
                 "POOR_REWARD_RISK",
-                f"風報比 {geometry['reward_risk']:.2f} 低於門檻 {self.min_reward_risk:.2f}{note}",
+                f"reward:risk {geometry['reward_risk']:.2f} below {self.min_reward_risk:.2f}{note}",
                 reward_risk=geometry["reward_risk"],
                 **common,
             )
@@ -421,14 +432,14 @@ class CoreStrategy:
         ):
             return self._reject(
                 "PRICE_COLLAPSE",
-                "停損／停利四捨五入後與現價同檔，無法執行",
+                "stop/target round to the current price tick; cannot execute",
                 reward_risk=geometry["reward_risk"],
                 **common,
             )
         if stop_loss <= 0 or take_profit <= 0:
             return self._reject(
                 "NON_POSITIVE_EXIT",
-                "停損／停利價位非正數",
+                "stop/target price not positive",
                 reward_risk=geometry["reward_risk"],
                 **common,
             )

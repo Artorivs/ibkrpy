@@ -1,5 +1,5 @@
 # ibkrpy/strategy/market_analyzer.py
-# 負責跨資產的相關性分析、產業板塊動能、大盤宏觀狀態評估與投資組合權重最佳化
+# Cross-asset correlation, beta, macro trend and risk-parity weights
 
 import logging
 import pandas as pd
@@ -13,8 +13,8 @@ logger = logging.getLogger("ibkrpy")
 
 class MarketAnalyzer:
     """
-    機構級市場全局分析器 (Global Market Context)
-    提取股票間的相關性矩陣、Beta 值、產業板塊資金流向、宏觀趨勢，並計算最佳化投資組合權重。
+    Global market context:
+    correlation matrix, betas, macro trend and risk-parity position weights.
     """
 
     def __init__(self, db_manager: DatabaseManager, config_manager: ConfigManager):
@@ -39,8 +39,8 @@ class MarketAnalyzer:
 
     def get_global_context(self) -> Dict[str, Any]:
         """
-        計算並回傳全局市場狀態
-        (建議在 trading_engine 的每一輪迴圈開頭呼叫一次，然後傳給各個標的)
+        Compute the global market context.
+        (Call once at the start of each trading loop and pass it to every symbol.)
         """
         context = {
             "correlation_matrix": {},
@@ -71,8 +71,8 @@ class MarketAnalyzer:
         prices_df = pd.DataFrame(price_dict).ffill().dropna()
         if len(prices_df) < 10:
             logger.warning(
-                f"全局分析資料不足 (對齊後僅 {len(prices_df)} 列，需 >= 10)，"
-                f"本輪相關性 / Beta / 風險平價全部退回預設值。"
+                f"Not enough data for global analysis ({len(prices_df)} aligned rows, need >= 10); "
+                f"correlation / beta / risk parity fall back to defaults this loop."
             )
             return context
 
@@ -125,7 +125,7 @@ class MarketAnalyzer:
         current_positions: Dict[str, float] = None,
     ) -> Dict[str, Any]:
         """
-        針對單一股票，結合全局上下文進行橫截面分析 (Cross-Sectional Analysis)
+        Cross-sectional analysis of one symbol against the global context.
         """
         analysis = {
             "macro_alignment": "NEUTRAL",
@@ -154,20 +154,24 @@ class MarketAnalyzer:
             analysis["conviction_multiplier"] += 0.15
         elif macro_trend == "BULLISH" and action == "SELL":
             analysis["conviction_multiplier"] -= 0.15
-            analysis["warnings"].append("逆勢警告: 大盤處於上升趨勢，做空風險較高。")
+            analysis["warnings"].append(
+                "Counter-trend: market is rising; shorting is riskier."
+            )
         elif macro_trend == "BEARISH" and action == "BUY":
             analysis["conviction_multiplier"] -= 0.15
-            analysis["warnings"].append("逆勢警告: 大盤處於下降趨勢，做多勝率較低。")
+            analysis["warnings"].append(
+                "Counter-trend: market is falling; longs win less often."
+            )
 
             if beta > 1.3:
                 analysis["conviction_multiplier"] -= 0.1
                 analysis["warnings"].append(
-                    f"高 Beta 警告: 大盤偏空且該標的 Beta 極高 ({beta:.2f})，跌幅可能超越大盤。"
+                    f"High beta: bearish market and this symbol's beta is {beta:.2f}; it may fall more than the market."
                 )
             elif beta < 0.8:
                 analysis["conviction_multiplier"] += 0.1
                 analysis["warnings"].append(
-                    f"防禦屬性: 該標的 Beta 較低 ({beta:.2f})，具備一定的抗跌能力。"
+                    f"Defensive: low beta ({beta:.2f}), likely to fall less than the market."
                 )
 
         corr_matrix = context.get("correlation_matrix", {})
@@ -195,7 +199,7 @@ class MarketAnalyzer:
             if highly_correlated_peers:
                 analysis["conviction_multiplier"] -= 0.20
                 analysis["warnings"].append(
-                    f"集中度風險: 與當前持倉 {highly_correlated_peers} 高度正相關 (Max R={max_corr_with_holdings:.2f})，將縮減倉位分散風險。"
+                    f"Concentration: highly correlated with {highly_correlated_peers} (max r={max_corr_with_holdings:.2f}); reducing size."
                 )
 
         analysis["conviction_multiplier"] = max(

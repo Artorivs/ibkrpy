@@ -1,5 +1,5 @@
 # ibkrpy/strategy/strategy_components.py
-# 將原本分散的組件集中，降低複雜度，提高內聚性
+# Shared strategy types: market regime, risk rules and position sizing
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = logging.getLogger("ibkrpy.strategy")
 
 
 class MarketRegime(Enum):
-    """市場情境。四種狀態，全系統唯一定義處。"""
+    """Market regime. The single definition used across the system."""
 
     BULL_TREND = auto()
     BEAR_TREND = auto()
@@ -22,13 +22,12 @@ class MarketRegime(Enum):
 
 
 class IRiskRule(ABC):
-    """風險規則。
+    """Risk rule.
 
-    契約：assess 回傳 (是否允許「新增曝險」, 理由)。
+    Contract: assess returns (are new entries allowed, reason).
 
-    請注意「新增曝險」這個限定詞。風險規則不得、也不應該阻止減碼或平倉：
-    風控的目的是限制風險敞口，而在風險最高的時刻剝奪處置風險的能力，
-    與這個目的正好相反。
+    Rules gate new exposure only. They must never block reducing or closing:
+    taking away the ability to cut risk when risk is highest defeats the purpose.
     """
 
     @abstractmethod
@@ -40,7 +39,7 @@ class IRiskRule(ABC):
 
 
 class VIXHaltRule(IRiskRule):
-    """VIX 高於門檻時停止新增曝險。"""
+    """Block new entries when VIX is above the threshold."""
 
     def __init__(self, threshold: float = 30.0):
         self.threshold = float(threshold)
@@ -48,20 +47,19 @@ class VIXHaltRule(IRiskRule):
     def assess(self, context: Dict[str, Any]) -> Tuple[bool, str]:
         vix_series = context.get("vix_series")
         if vix_series is None or len(vix_series) == 0:
-            return True, "VIX 資料缺席，不阻擋"
+            return True, "No VIX data; not blocking"
 
         latest = float(vix_series.iloc[-1])
         if latest > self.threshold:
-            return False, f"VIX {latest:.2f} 高於門檻 {self.threshold:.0f}。"
-        return True, f"VIX {latest:.2f} 正常"
+            return False, f"VIX {latest:.2f} above threshold {self.threshold:.0f}."
+        return True, f"VIX {latest:.2f} normal"
 
 
 class ReversalRiskRule(IRiskRule):
-    """頂部反轉風險過高時停止新增曝險。
+    """Block new entries when top-reversal risk is too high.
 
-    與 CoreStrategy 內的 reversal_block_level 是兩道獨立的閘門：
-    策略層看的是單一標的的訊號品質，這裡看的是投資組合層級的進場許可。
-    兩者都通過才會開新倉。
+    Separate from CoreStrategy's reversal_block_level: the strategy judges one symbol's
+    signal, this rule is the portfolio-level entry gate. Both must pass.
     """
 
     def __init__(self, threshold: float = 0.75):
@@ -70,13 +68,13 @@ class ReversalRiskRule(IRiskRule):
     def assess(self, context: Dict[str, Any]) -> Tuple[bool, str]:
         risk = context.get("reversal_risk")
         if risk is None:
-            return True, "無反轉風險資料"
+            return True, "No reversal risk data"
         if float(risk) >= self.threshold:
             return (
                 False,
-                f"頂部反轉風險 {float(risk):.0%} 高於門檻 {self.threshold:.0%}。",
+                f"Top-reversal risk {float(risk):.0%} above threshold {self.threshold:.0%}.",
             )
-        return True, f"反轉風險 {float(risk):.0%} 可接受"
+        return True, f"Reversal risk {float(risk):.0%} acceptable"
 
 
 class EquityWatermark:
@@ -209,7 +207,7 @@ class DrawdownHaltRule(IRiskRule):
 
 
 class RiskController:
-    """依序套用所有風險規則。任一規則否決即停止新增曝險。"""
+    """Applies all risk rules in order; any veto blocks new entries."""
 
     def __init__(self, rules: List[IRiskRule]):
         self.rules = list(rules)
@@ -219,24 +217,24 @@ class RiskController:
             try:
                 allowed, reason = rule.assess(context)
             except Exception as exc:
-                logger.error(f"風險規則 {rule.name} 拋出例外，保守起見視為否決: {exc}")
-                return False, f"{rule.name} 評估失敗"
+                logger.error(f"Risk rule {rule.name} raised; treating as a veto: {exc}")
+                return False, f"{rule.name} failed"
             if not allowed:
                 return False, reason
-        return True, "風險檢查通過"
+        return True, "Risk checks passed"
 
     def check_trade_allowed(self, context: Dict[str, Any]) -> Tuple[bool, str]:
-        """相容舊呼叫端的別名。
+        """Legacy alias.
 
-        名稱容易被誤讀為「所有交易」，新程式碼請改用 check_entries_allowed。
+        The name suggests all trades; use check_entries_allowed in new code.
         """
         return self.check_entries_allowed(context)
 
 
 class PositionSizer:
-    """由風險預算換算股數。
+    """Converts a risk budget into a share count.
 
-    兩種模式擇一：給定每股風險時以風險預算計算，否則以資金比例計算。
+    Uses the risk budget when risk per share is given, otherwise a fraction of capital.
     """
 
     def __init__(
