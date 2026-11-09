@@ -35,6 +35,7 @@ log_settings:
 session_settings:
   calendar: NYSE
   extended_poll_multiplier: 3.0  # 盤前/盤後/夜盤的輪詢間隔倍數
+  allow_extended_entries: false  # false = open new positions in regular hours only; extended hours are close-only
 
   # ⚠️ 夜盤 (20:00-03:50 ET) 預設關閉。開啟前必須確認:
   #    1. IBKR 帳戶已開通 Overnight Trading 權限
