@@ -60,6 +60,8 @@ volatility_settings:
   model_band_hi: 3.0        # 上界。雙尾都要擋 —— 高估 σ 會讓停損過寬
   abs_floor_per_bar: 0.0005 # 每根 K 線波動率的絕對下限，防止平坦 K 線產生 σ=0
   trust_model: true         # 設為 false 可完全繞過 GARCH，直接採用實現波動率
+  # 舊版 GARCH 對小時/5 分 K 的 σ 換算錯誤 (小 2.5～8.8 倍)，此清單多半是那個 bug 的症狀。
+  # 修正後重新訓練，再觀察 log 中「模型波動率…相差」的錯誤是否消失，消失即可清空此清單。
   distrust_symbols:
     - ASML
     - IBM

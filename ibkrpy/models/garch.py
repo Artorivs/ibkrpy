@@ -43,14 +43,23 @@ class GARCHModel:
             )
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
-        """預測下一期的年化波動率"""
+        """
+        預測下一根 K 線的波動率，單位是「每根 K 線」(不年化)。
+
+        [修正] 舊版一律乘上 √252 當成年化值，呼叫端再除以 √(該週期每年 K 線數)。
+        這只對日 K 成立：1 小時 K 會小 √6.5 ≈ 2.5 倍 (仍落在合理帶內而被採用)，
+        5 分 K 小 √78 ≈ 8.8 倍。GARCH 是在同一週期的 K 線上擬合的，
+        它的條件變異數本來就是「每根 K 線」的量，不需要任何換算。
+
+        資料不足或擬合失敗時回傳 NaN，讓 VolatilityEstimator 改用實現波動率。
+        """
         if df.empty or "Close" not in df.columns:
-            return 0.02
+            return float("nan")
 
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna() * 100.0
 
         if len(returns) < 20:
-            return 0.02
+            return float("nan")
 
         try:
             model = arch_model(returns, vol="Garch", p=self.p, q=self.q, dist=self.dist)
@@ -63,14 +72,11 @@ class GARCHModel:
             forecasts = res.forecast(horizon=1, method="analytic")
             predicted_var = forecasts.variance.iloc[-1].item()
 
-            predicted_vol_daily = np.sqrt(predicted_var) / 100.0
-            annual_vol = predicted_vol_daily * np.sqrt(252)
-
-            return float(annual_vol)
+            return float(np.sqrt(predicted_var) / 100.0)
 
         except Exception as e:
             print(f"GARCH 預測失敗: {e}")
-            return float((returns.tail(20).std() / 100.0) * np.sqrt(252))
+            return float(returns.tail(20).std() / 100.0)
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
         """Fallback：GARCH 本身不預測價格"""

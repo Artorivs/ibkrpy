@@ -863,8 +863,6 @@ class TradingEngine:
                 "general_settings.long_term_bar_size", "1 day"
             )
 
-        is_short_term = term == "short_term"
-
         live_duration = "3 D"
         df_recent = await self.data.fetch_historical_data(
             contract=contract,
@@ -1038,15 +1036,9 @@ class TradingEngine:
                 else float("nan")
             )
 
-        if is_short_term:
-            bars_per_year = 252 * 78
-        elif term == "mid_term":
-            bars_per_year = 252 * 6.5
-        else:
-            bars_per_year = 252
-
+        # GARCH 在同一週期的 K 線上擬合，直接回傳「每根 K 線」的波動率，不需年化換算。
         try:
-            model_vol_per_bar = float(model_volatility) / math.sqrt(bars_per_year)
+            model_vol_per_bar = float(model_volatility)
         except (TypeError, ValueError):
             model_vol_per_bar = None
 
