@@ -183,8 +183,8 @@ strategy_settings:
   allow_shorting: true
   max_gross_exposure: 1.0
   min_trade_usd: 120
-  # 平倉單等待成交的秒數。逾時未成交會撤單並替剩餘持倉重掛停損/停利，
-  # 確保同一標的任何時刻只有一組出場單在場 (避免停損與平倉單同時成交而反手做空)。
+  # Seconds to wait for a closing order to fill before cancelling it and
+  # re-protecting the remaining shares.
   close_fill_timeout_sec: 60
 
 # ============================================================

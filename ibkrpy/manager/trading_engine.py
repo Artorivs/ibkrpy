@@ -684,11 +684,11 @@ class TradingEngine:
                 logger.warning(
                     f"[守護] 🛡️ 偵測到 {symbol} 存在無保護持倉 ({pos_qty} 股)，準備自動掛載 OCA 停損停利單..."
                 )
-                # 同方向還掛著的非停損單 (例如上次沒成交的平倉限價單、殘留的停利單)
-                # 必須先撤掉。否則它和新掛的 OCA 停損都可能成交，合計超過持倉量 → 反手變成空單。
+                # Clear leftover exit orders first so they can't fill alongside the new OCA.
                 if not await self._cancel_open_orders(symbol):
                     logger.critical(
-                        f"❌ [{symbol}] 既有委託未能確認撤銷，暫不掛保護傘以免出場單重複 (需人工確認)。"
+                        f"❌ [{symbol}] Could not confirm cancellation of existing orders; "
+                        "not attaching protection to avoid duplicate exits. Check manually."
                     )
                     continue
                 await self._attach_oca_protection(symbol, pos_qty)
@@ -828,7 +828,7 @@ class TradingEngine:
     CANCEL_CONFIRM_SECONDS = 5.0
 
     async def _wait_done(self, trades, timeout: float) -> bool:
-        """等到所有 trade 進入終止狀態 (Filled / Cancelled / Inactive)，逾時回傳 False。"""
+        """Wait until every trade is Filled/Cancelled/Inactive; False on timeout."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
@@ -839,11 +839,9 @@ class TradingEngine:
             await asyncio.sleep(0.25)
 
     async def _cancel_open_orders(self, symbol: str) -> bool:
-        """
-        [關鍵防護] 取消該標的所有未成交委託，並「等到券商確認撤銷」才回傳。
+        """Cancel all open orders for the symbol and wait for confirmation.
 
-        回傳 True 表示該標的已沒有任何在途委託。舊版送出撤單後只睡 0.5 秒就繼續，
-        若撤單尚未生效就送出平倉單，停損與平倉單可能同時成交 → 反手變成空單。
+        Returns True only when nothing is left working for that symbol.
         """
         if self.dry_run:
             return True
@@ -861,29 +859,26 @@ class TradingEngine:
 
         confirmed = await self._wait_done(targets, self.CANCEL_CONFIRM_SECONDS)
         if confirmed:
-            logger.info(
-                f"[{symbol}] 🧹 已清除 {len(targets)} 筆歷史未決訂單 (防範孤兒單衝突)。"
-            )
+            logger.info(f"[{symbol}] 🧹 Cancelled {len(targets)} open order(s).")
         else:
             pending = [t.order.orderId for t in targets if not t.isDone()]
             logger.critical(
-                f"❌ [{symbol}] {len(pending)} 筆委託在 {self.CANCEL_CONFIRM_SECONDS:g} 秒內未確認撤銷: {pending}"
+                f"❌ [{symbol}] {len(pending)} order(s) not confirmed cancelled within "
+                f"{self.CANCEL_CONFIRM_SECONDS:g}s: {pending}"
             )
         return confirmed
 
     async def _close_position(
         self, contract, symbol: str, action: str, quantity: int, current_price: float
     ) -> float:
-        """
-        平倉，並維持「任何時刻同一標的只有一組出場單在場」的不變式：
+        """Close a position while keeping at most one exit order set working.
 
-          1. 先撤掉既有的停損/停利，且必須確認撤銷成功；失敗就不平倉 (原保護仍在)。
-          2. 常規時段用 Adaptive 市價單；延長時段用 outsideRth 的限價單
-             (Adaptive 只在常規時段有效)。
-          3. 在 close_fill_timeout_sec 內等待成交。
-          4. 未成交 (或部分成交) 就撤掉剩餘平倉單，確認後替剩餘持倉重掛保護傘。
+        1. Cancel the existing stop/target and wait for confirmation; abort if it fails.
+        2. Adaptive market order in RTH, outsideRth limit in extended hours.
+        3. Wait up to close_fill_timeout_sec.
+        4. If not fully filled, cancel the rest and re-protect the remaining shares.
 
-        回傳實際成交股數。
+        Returns the number of shares closed.
         """
         exits_before = [
             t
@@ -894,12 +889,12 @@ class TradingEngine:
         ]
         if not await self._cancel_open_orders(symbol):
             logger.critical(
-                f"❌ [{symbol}] 既有停損/停利未能確認撤銷，本次不送平倉單 (避免與停損重複成交)。"
+                f"❌ [{symbol}] Existing stop/target not confirmed cancelled; "
+                "skipping the close so it can't fill alongside the stop."
             )
             return 0.0
 
-        # 撤單與停損觸發可能同時發生：停損若在撤銷前已經成交，那部分持倉已經出場，
-        # 平倉量必須扣掉，否則會多賣出一份而反手。
+        # A stop can fill while we cancel it; don't close those shares twice.
         already_out = sum(float(t.orderStatus.filled or 0.0) for t in exits_before)
         if already_out > 0:
             prev = float(self.cached_positions.get(symbol, 0.0) or 0.0)
@@ -907,7 +902,7 @@ class TradingEngine:
                 already_out if action == "BUY" else -already_out
             )
             logger.warning(
-                f"[{symbol}] 撤單期間既有出場單已成交 {already_out:g} 股，平倉量相應扣除。"
+                f"[{symbol}] {already_out:g} shares exited while cancelling; reducing the close."
             )
             quantity = int(max(quantity - already_out, 0))
             if quantity <= 0:
@@ -951,16 +946,16 @@ class TradingEngine:
                 remaining = quantity - filled
                 if not cancelled:
                     logger.critical(
-                        f"❌ [{symbol}] 平倉單 {trade.order.orderId} 未成交也未確認撤銷，"
-                        f"剩餘 {remaining:g} 股暫無保護，請人工處理。"
+                        f"❌ [{symbol}] Close order {trade.order.orderId} neither filled nor cancelled; "
+                        f"{remaining:g} shares are unprotected. Check manually."
                     )
                     return filled
 
             if remaining > 0:
                 still_held = remaining if action == "SELL" else -remaining
                 logger.critical(
-                    f"⚠️ [{symbol}] 平倉僅成交 {filled:g}/{quantity} 股，"
-                    f"已撤銷剩餘平倉單，替剩餘 {still_held:+g} 股重掛保護傘。"
+                    f"⚠️ [{symbol}] Close filled {filled:g}/{quantity}; "
+                    f"cancelled the rest and re-protecting {still_held:+g} shares."
                 )
                 await self._attach_oca_protection(symbol, still_held)
 
@@ -968,7 +963,7 @@ class TradingEngine:
         signed_fill = filled if action == "BUY" else -filled
         self.cached_positions[symbol] = prev + signed_fill
         if filled > 0:
-            logger.info(f"[{symbol}] ✅ 平倉成交 {filled:g} 股。")
+            logger.info(f"[{symbol}] ✅ Closed {filled:g} shares.")
         return filled
 
     async def run_tick(self, symbol: str, session=None):
@@ -1429,7 +1424,9 @@ class TradingEngine:
             else:
                 if not await self._cancel_open_orders(symbol):
                     self._record_decision("CANCEL_UNCONFIRMED")
-                    logger.critical(f"❌ [{symbol}] 舊委託未能確認撤銷，本次不建倉。")
+                    logger.critical(
+                        f"❌ [{symbol}] Old orders not confirmed cancelled; skipping entry."
+                    )
                     return
 
                 self.cached_funds = max(0.0, self.cached_funds - trade_value)
