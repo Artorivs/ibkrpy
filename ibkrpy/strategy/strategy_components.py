@@ -163,6 +163,27 @@ class EquityWatermark:
         }
 
 
+class SessionEntryRule(IRiskRule):
+    """Opens new positions only in regular hours; extended hours are close-only.
+
+    Pre-market, after-hours and overnight have wide spreads, the Adaptive entry order
+    only works in regular hours, and the bracket's stop is not set to trigger outside
+    them, so a position opened then would sit unprotected until the next open.
+    """
+
+    def __init__(self, allow_extended_entries: bool = False):
+        self.allow_extended_entries = bool(allow_extended_entries)
+
+    def assess(self, context: Dict[str, Any]) -> Tuple[bool, str]:
+        session = context.get("session")
+        if session is None or self.allow_extended_entries:
+            return True, "Session allows entries"
+        if getattr(session, "is_extended", False):
+            name = getattr(session, "value", str(session))
+            return False, f"Outside regular hours ({name}); close-only."
+        return True, "Regular hours"
+
+
 class DrawdownHaltRule(IRiskRule):
     """Blocks new entries on a daily loss (latched for the day) or a drawdown from peak."""
 

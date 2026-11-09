@@ -34,6 +34,7 @@ log_settings:
 session_settings:
   calendar: NYSE
   extended_poll_multiplier: 3.0  # Polling interval multiplier for pre-market, after-hours and overnight
+  allow_extended_entries: false  # false = open new positions in regular hours only; extended hours are close-only
 
   # ⚠️ Overnight (20:00-03:50 ET) is off by default. Before enabling, check that:
   #    1. the IBKR account has Overnight Trading permission

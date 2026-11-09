@@ -51,6 +51,7 @@ from ibkrpy.strategy.strategy_components import (
     VIXHaltRule,
     ReversalRiskRule,
     DrawdownHaltRule,
+    SessionEntryRule,
 )
 from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 from ibkrpy.strategy.market_analyzer import MarketAnalyzer
@@ -304,6 +305,11 @@ async def run_live_mode(args):
                 max_drawdown_pct=float(
                     config.get("risk_settings.max_drawdown_pct", 0.10)
                 ),
+            ),
+            SessionEntryRule(
+                allow_extended_entries=bool(
+                    config.get("session_settings.allow_extended_entries", False)
+                )
             ),
         ]
     )

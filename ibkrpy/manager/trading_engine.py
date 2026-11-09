@@ -1134,6 +1134,9 @@ class TradingEngine:
             "current_price": current_price,
             "regime": regime,
             "reversal_risk": reversal_risk,
+            "session": (
+                session if session is not None else self.session_clock.classify()
+            ),
             **self.equity_watermark.snapshot(self.cached_net_liq),
         }
         check = getattr(
