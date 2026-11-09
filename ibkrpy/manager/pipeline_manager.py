@@ -280,7 +280,8 @@ class PipelineManager:
             df_new.index = pd.to_datetime(df_new.index, utc=True)
             df_new = (
                 df_new.sort_index()
-                .loc[~df_new.index.duplicated(keep="last")]
+                # 遮罩必須在排序後的 frame 上計算 (lambda)，否則位置錯亂
+                .loc[lambda d: ~d.index.duplicated(keep="last")]
                 .rename(
                     columns={
                         "open": "Open",
@@ -290,8 +291,7 @@ class PipelineManager:
                         "volume": "Volume",
                     }
                 )
-                .dropna(axis=1)
-                .loc[:, [c for c in cols_to_keep if c in df_new.columns]]
+                .loc[:, lambda d: [c for c in cols_to_keep if c in d.columns]]
             )
 
             if not df_existing.empty:

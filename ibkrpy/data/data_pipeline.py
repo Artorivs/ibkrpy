@@ -80,17 +80,14 @@ class DataPipeline:
         self._manifests: Dict[str, List[str]] = {}
 
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """使用 pandas_ta 快速計算技術指標"""
-        from ibkrpy.shared import indicators as ta
+        """計算技術指標 (欄名與數值和舊版 pandas_ta 0.3.14b 相同)
 
-        df_copy = df.copy()
-        df_copy = ta.sma(df_copy, length=10)
-        df_copy = ta.ema(df_copy, length=20)
-        df_copy = ta.rsi(df_copy, length=14)
-        df_copy = ta.atr(df_copy, length=14)
-        df_copy = ta.macd(df_copy, fast=12, slow=26, signal=9)
-        df_copy = ta.bbands(df_copy, length=20, std=2)
-        return df_copy.dropna()
+        indicators 的各函式吃的是單一價格序列，不是整個 DataFrame；
+        add_default_indicators 只取 High/Low/Close 計算，symbol 等文字欄位原樣保留。
+        """
+        from ibkrpy.shared.indicators import add_default_indicators
+
+        return add_default_indicators(df).dropna()
 
     def engineer_advanced_features(
         self,
