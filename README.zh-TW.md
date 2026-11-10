@@ -35,7 +35,7 @@ cp env.sample .env
 
 階段一：獲取歷史數據 (`--mode download`)
 
-透過 IBKR API 增量下載並縫合歷史數據，存入 SQLite 資料庫。
+透過 IBKR API 增量下載並縫合歷史數據，存入 SQLite 資料庫。每次執行也會補回先前斷線留下的缺口，並在股票分割後重新調整舊 K 線。
 
 ```bash
 python ibkrpy/core/main.py --mode download
@@ -43,7 +43,7 @@ python ibkrpy/core/main.py --mode download
 
 階段二：模型訓練與參數尋優 (`--mode train`)
 
-讀取資料庫數據，訓練模型，並以 Optuna 尋優策略參數。
+讀取資料庫數據，訓練模型，並以 Optuna 尋優策略參數。各週期的模型會預測未來多根 K 線（`forecast_settings.horizon_bars`：日線 1 週、小時線約 1 個交易日、5 分鐘線 1 小時）；若某週期完全沒有交易，訓練日誌會列出是哪道關卡擋下。更改預測週期後須重新訓練。
 （⚠️ 必須先執行過階段一，否則會找不到數據。）
 
 ```bash
@@ -80,6 +80,15 @@ python ibkrpy/core/main.py --mode live --dry-run --ui
 python ibkrpy/core/main.py --mode daemon --ui
 ```
 
+預測帳本 (`--mode ledger`)
+
+即時與守護進程模式會把每次掃描的預測寫入 `prediction_ledger` 資料表。此模式會在預測週期過後補上實際漲跌，並依模型世代與預測週期，彙總及逐檔列出命中率、IC（資訊係數）與校準斜率。不需連線 IBKR。建議模擬交易約兩週後執行，以判斷模型是否具備優勢。
+
+```bash
+python ibkrpy/core/main.py --mode ledger
+python ibkrpy/core/main.py --mode ledger SPY   # 單一標的
+```
+
 ## 3. 監控儀表板使用指南
 
 啟動時加上 `--ui` 參數，或單獨執行 `--mode ui`，系統會彈出獨立的監控視窗。
@@ -97,6 +106,7 @@ python ibkrpy/core/main.py --mode daemon --ui
 - 通訊埠號與客戶端編號。
 - 外部總體經濟數據介面（如 FRED API）的金鑰。
 - 交易標的池與各標的的週期。
+- 各週期的預測步數（`forecast_settings.horizon_bars`）。
 - 策略、風控與成本設定（部位大小、曝險上限、停損開關、佣金方案）。
 
 完整選項請見 `config.yaml.sample`。簡短範例如下：
@@ -109,6 +119,12 @@ ib_settings:
 
 api_keys_settings:
   fred_api_key: "YOUR_FRED_API_KEY_HERE" # Used for the VIX macro indicator
+
+forecast_settings:
+  horizon_bars:                  # Bars ahead each term predicts; retrain after changing
+    short_term: 12
+    mid_term: 7
+    long_term: 5
 
 strategy_settings:
   base_position_pct: 0.08        # Base size per position (share of net liquidation)

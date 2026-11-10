@@ -402,6 +402,14 @@ async def run_live_mode(args):
             ib_manager.ib.disconnect()
 
 
+def ledger_report(config, symbol=None) -> str:
+    """Resolve and summarise the prediction ledger (no IBKR connection needed)."""
+    from ibkrpy.data.prediction_ledger import build_prediction_ledger, report
+    from ibkrpy.shared.db_manager import DEFAULT_DB_PATH
+
+    return report(build_prediction_ledger(DEFAULT_DB_PATH, config), symbol)
+
+
 def main():
     _is_subprocess = "--client-id" in sys.argv
 
@@ -416,7 +424,7 @@ def main():
         "--mode",
         type=str,
         required=True,
-        choices=["download", "train", "autopilot", "live", "daemon", "ui"],
+        choices=["download", "train", "autopilot", "live", "daemon", "ui", "ledger"],
     )
     parser.add_argument(
         "symbol",
@@ -448,6 +456,8 @@ def main():
                 sys.exit(1)
         case "live" | "daemon":
             asyncio.run(run_live_mode(args))
+        case "ledger":
+            print(ledger_report(_boot_config, args.symbol))
 
 
 if __name__ == "__main__":

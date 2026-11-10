@@ -21,6 +21,7 @@ class CoreStrategy:
         self.config = dict(config) if config else {}
 
         self.term = self.config.get("term", "long_term")
+        self.horizon_bars = int(self.config.get("horizon_bars", 1) or 1)
         self.min_pred_threshold = self.config.get("min_prediction_threshold_pct", 0.005)
         self.sl_multiplier = self.config.get("volatility_stop_loss_multiplier", 2.0)
         self.tp_multiplier = self.config.get("volatility_take_profit_multiplier", 3.0)
@@ -46,6 +47,13 @@ class CoreStrategy:
         self.collapse_detector = collapse_detector
 
         self.last_decision: Dict[str, Any] = {}
+
+    @property
+    def history_key(self) -> str:
+        """Prediction-history key. Moves over different horizons have different scales,
+        so each horizon keeps its own history for the quantile threshold."""
+        h = int(self.horizon_bars or 1)
+        return self.symbol if h <= 1 else f"{self.symbol}@{h}"
 
     def _reject(self, code: str, detail: str, **fields) -> None:
         self.last_decision = {
@@ -214,7 +222,8 @@ class CoreStrategy:
 
         reversal_risk (0-1) never blocks exits; it only raises the bar for new exposure.
 
-        `volatility` is per bar.
+        `volatility` is σ over the forecast horizon (per-bar σ × √horizon_bars), the same
+        span as the predicted move.
         """
         regime_name = regime.name if hasattr(regime, "name") else str(regime)
         self._last_filtered_models = sorted((ensemble_predictions or {}).keys())
@@ -252,11 +261,12 @@ class CoreStrategy:
 
         price_diff_pct = (final_prediction / current_price) - 1
 
+        history_key = self.history_key
         if self.prediction_history is not None:
-            self.prediction_history.append(self.symbol, price_diff_pct)
+            self.prediction_history.append(history_key, price_diff_pct)
 
         history = (
-            self.prediction_history.get(self.symbol)
+            self.prediction_history.get(history_key)
             if self.prediction_history is not None
             else []
         )

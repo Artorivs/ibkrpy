@@ -2,23 +2,25 @@
 # Download, database and training pipeline
 
 import os
+import math
 import asyncio
 import pandas as pd
 import json
 import joblib
 import numpy as np
 import time
-from datetime import datetime
 from typing import Tuple, Dict
 
 from ib_insync import Stock
 
 from ibkrpy.shared.config_manager import ConfigManager
 from ibkrpy.shared.db_manager import DatabaseManager
+from ibkrpy.data import bar_sync
 from ibkrpy.data.data_pipeline import DataPipeline
 from ibkrpy.data.ibkr_data_manager import IBKRDataManager
 from ibkrpy.data.external_data import ExternalDataFetcher, align_daily_series
 from ibkrpy.evaluation.model_tuner import ModelTuner
+from ibkrpy.shared.horizon import forecast_horizon
 import logging
 
 logger = logging.getLogger(__name__)
@@ -195,7 +197,15 @@ class PipelineManager:
             }
 
     async def _sync_symbol_term_data(self, symbol: str, term: str, contract: Stock):
-        """Core data fetch, on demand."""
+        """
+        Bring stored bars up to date, on demand.
+
+        Fetches backwards from now until a chunk reaches the oldest bar that needs
+        refreshing, so a long outage never leaves a hole. That bar is the last stored one,
+        or an earlier one when the stored series has a hole of ≥2 weekdays or a split-like
+        jump inside the download window. If the refetched closes disagree with stored ones
+        (the provider re-adjusted for a split), older stored bars are rescaled to match.
+        """
         settings = self._get_term_settings(term)
         bar_size = settings["bar_size"]
         total_days = settings["total_days"]
@@ -203,106 +213,102 @@ class PipelineManager:
 
         logger.debug(f"\t-> 🔄 Syncing {term} ({bar_size}) data...")
         df_existing = self.db.get_market_data_sync(symbol, timeframe=bar_size)
-        days_to_fetch = 0
+        now = pd.Timestamp.now(tz="UTC")
+        window_start = now - pd.Timedelta(days=total_days)
 
         if df_existing.empty or len(df_existing) < 50:
-            days_to_fetch = total_days
+            df_existing = pd.DataFrame()
+            target = window_start
         else:
-            last_date = pd.Timestamp(df_existing.index[-1])
-            if last_date.tz is None:
-                last_date = last_date.tz_localize("UTC")
-            last_date_ny = last_date.tz_convert("America/New_York")
-            now_ny = pd.Timestamp.now(tz="America/New_York")
-
-            bus_days_diff = np.busday_count(last_date_ny.date(), now_ny.date())
-
-            if bus_days_diff <= 0:
+            df_existing = bar_sync.normalize_bars(df_existing)
+            last = df_existing.index[-1]
+            repairs = {
+                "hole": bar_sync.find_gap_start(df_existing.index, window_start),
+                "split-like jump": bar_sync.find_split_jump(
+                    df_existing["Close"], window_start
+                ),
+            }
+            repairs = {k: v for k, v in repairs.items() if v is not None}
+            behind = np.busday_count(
+                bar_sync.session_dates(df_existing.index[-1:])[0],
+                now.tz_convert(bar_sync.NY).date(),
+            )
+            if not repairs and behind <= 0:
                 logger.debug("\t✅ Data is up to date; nothing to sync.")
                 return
+            target = min([last, *repairs.values()])
+            for why, at in repairs.items():
+                logger.warning(
+                    f"\t-> [{symbol}] {bar_size}: stored series has a {why} after "
+                    f"{at:%Y-%m-%d}; refetching from there."
+                )
 
-            days_to_fetch = min(bus_days_diff + 1, total_days)
-
-        df_new_list = []
-        remaining_days = days_to_fetch
-        current_end_date = datetime.now()
-
-        while remaining_days > 0:
-            fetch_days = min(remaining_days, chunk_days)
-
-            if fetch_days >= 365:
-                duration_str = f"{fetch_days // 365} Y"
-            elif fetch_days >= 30 and bar_size != "1 day":
-                duration_str = f"{fetch_days // 30} M"
-            else:
-                duration_str = f"{fetch_days} D"
-
-            end_date_str = current_end_date.strftime("%Y%m%d %H:%M:%S")
+        chunks = []
+        end = None
+        max_requests = math.ceil(total_days / chunk_days) + 2
+        for _ in range(max_requests):
+            end_ts = end if end is not None else now
+            span = math.ceil((end_ts - target).total_seconds() / 86400) + 1
+            duration = bar_sync.duration_str(min(chunk_days, max(span, 1)), bar_size)
+            end_str = "" if end is None else end.strftime("%Y%m%d-%H:%M:%S")
 
             df_chunk = await self.ib_data.fetch_historical_data(
                 contract=contract,
-                end_datetime=end_date_str,
-                duration=duration_str,
+                end_datetime=end_str,
+                duration=duration,
                 bar_size=bar_size,
                 what_to_show="TRADES",
             )
-
             if df_chunk.empty:
                 logger.warning(
-                    f"\t-> [{symbol}] {duration_str}/{bar_size} first request returned no data; retrying in 20s..."
+                    f"\t-> [{symbol}] {duration}/{bar_size} request returned no data; retrying in 20s..."
                 )
                 await asyncio.sleep(20)
                 df_chunk = await self.ib_data.fetch_historical_data(
                     contract=contract,
-                    end_datetime=end_date_str,
-                    duration=duration_str,
+                    end_datetime=end_str,
+                    duration=duration,
                     bar_size=bar_size,
                     what_to_show="TRADES",
                     allow_cache=False,
                 )
-
-            if not df_chunk.empty:
-                df_chunk.index = pd.to_datetime(df_chunk.index, utc=True)
-                df_new_list.append(df_chunk)
-                first_dt = df_chunk.index[0]
-                if isinstance(first_dt, str):
-                    first_dt = pd.to_datetime(first_dt, utc=True)
-                current_end_date = first_dt
-            else:
+            if df_chunk.empty:
                 break
 
-            remaining_days -= fetch_days
+            df_chunk = bar_sync.normalize_bars(df_chunk)
+            chunks.append(df_chunk)
+            first = df_chunk.index[0]
+            if first <= target or (end is not None and first >= end):
+                break
+            end = first
             await asyncio.sleep(1)
 
-        if df_new_list:
-            cols_to_keep = ["Open", "High", "Low", "Close", "Volume"]
-            df_new = pd.concat(df_new_list)
-            df_new.index = pd.to_datetime(df_new.index, utc=True)
-            df_new = (
-                df_new.sort_index()
-                .loc[lambda d: ~d.index.duplicated(keep="last")]
-                .rename(
-                    columns={
-                        "open": "Open",
-                        "high": "High",
-                        "low": "Low",
-                        "close": "Close",
-                        "volume": "Volume",
-                    }
-                )
-                .loc[:, lambda d: [c for c in cols_to_keep if c in d.columns]]
+        if not chunks:
+            logger.error(f"❌ [{symbol}] Every chunk for this term failed.")
+            return
+
+        df_new = bar_sync.normalize_bars(pd.concat(chunks))
+        if df_new.index[0] > target and not df_existing.empty:
+            logger.warning(
+                f"\t-> [{symbol}] {bar_size}: download stopped at {df_new.index[0]:%Y-%m-%d}, "
+                f"short of {target:%Y-%m-%d}; the hole stays until the next sync."
             )
 
-            if not df_existing.empty:
-                df_combined = df_new
-                df_combined = df_combined.sort_index()
-                self.db.save_bulk_market_data(symbol, df_combined, timeframe=bar_size)
-            else:
-                self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
+        if not df_existing.empty:
+            ratio = bar_sync.adjustment_ratio(df_existing["Close"], df_new["Close"])
+            if bar_sync.needs_rescale(ratio):
+                older = df_existing[df_existing.index < df_new.index[0]]
+                if not older.empty:
+                    self.db.save_bulk_market_data(
+                        symbol, bar_sync.rescale_bars(older, ratio), timeframe=bar_size
+                    )
+                logger.warning(
+                    f"\t-> [{symbol}] {bar_size}: stored prices differ from the provider's "
+                    f"by ×{ratio:.3f} (split or adjustment); rescaled {len(older)} older bars."
+                )
 
-            logger.info(f"\t✅ [{symbol}] Merged {len(df_new)} {bar_size} bars.")
-        else:
-            if days_to_fetch > 0:
-                logger.error(f"❌ [{symbol}] Every chunk for this term failed.")
+        self.db.save_bulk_market_data(symbol, df_new, timeframe=bar_size)
+        logger.info(f"\t✅ [{symbol}] Merged {len(df_new)} {bar_size} bars.")
 
     def _train_dl_models(
         self,
@@ -311,6 +317,7 @@ class PipelineManager:
         bench_df: pd.DataFrame,
         macro_data: dict,
         benchmark_symbol: str = None,
+        horizon: int = 1,
     ):
         """Train the deep learning models (LSTM, Transformer) and save .keras files."""
         logger.info(f"🔍 [{symbol}] Training deep learning models...")
@@ -332,7 +339,8 @@ class PipelineManager:
 
         logger.info(
             f"\t=> Feature columns: {len(scale_cols)} "
-            f"(price-relative {len(price_rel)} / Min-Max {len(minmax_cols)}), target: log return"
+            f"(price-relative {len(price_rel)} / Min-Max {len(minmax_cols)}), "
+            f"target: log return over {horizon} bar(s)"
         )
 
         split = int(len(df_adv) * 0.8)
@@ -346,6 +354,7 @@ class PipelineManager:
             target_mode="log_return",
             target_scale=100.0,
             benchmark=benchmark_symbol or self.benchmark_for(symbol),
+            horizon_bars=horizon,
         )
         df_scaled = self.pipeline.transform_scale(df_adv, minmax_cols, symbol)
 
@@ -358,6 +367,7 @@ class PipelineManager:
             price_relative=price_rel,
             target_mode="log_return",
             target_scale=100.0,
+            horizon=horizon,
         )
 
         logger.info(
@@ -427,7 +437,7 @@ class PipelineManager:
         except Exception as e:
             logger.error(f"❌ [{symbol}] DL training failed: {e}")
 
-    def _train_safe_models(self, symbol: str, df: pd.DataFrame):
+    def _train_safe_models(self, symbol: str, df: pd.DataFrame, horizon: int = 1):
         """Train the statistical and regime models (ARIMA, GARCH, HMM) into one .pkl bundle."""
         logger.info(f"🔍 [{symbol}] Training statistical and regime models...")
         if df.empty or len(df) < 50:
@@ -439,7 +449,7 @@ class PipelineManager:
         weights_dir = WEIGHTS_DIR
         os.makedirs(weights_dir, exist_ok=True)
 
-        classical_bundle = {}
+        classical_bundle = {"horizon_bars": int(horizon)}
 
         logger.info("\t-> Fitting ARIMA...")
         try:
@@ -519,11 +529,12 @@ class PipelineManager:
         Generate genuine model predictions over the out-of-sample segment.
 
           - First 70% is in-sample, last 30% out-of-sample
-          - Models are fitted on in-sample only, then make true one-step predictions over OOS
-          - Row t holds the forecast made at bar t's close for bar t+1, as live does, so
+          - Models are fitted on in-sample only, then forecast the term's horizon over OOS
+          - Row t holds the forecast made at bar t's close for bar t+h, as live does, so
             prediction / Close[t] - 1 is the predicted move from the price live would see
           - Regimes come from MarketRegimeDetector
-          - Volatility is the rolling std of log returns (same units as the live strategy input)
+          - Volatility is the rolling per-bar std of log returns scaled by √h, the same
+            horizon σ the live strategy receives
 
         ARIMA only by default: it fits in seconds, and the tournament chooses the bar size and
         risk parameters rather than validating the networks. For an ensemble closer to live,
@@ -532,6 +543,7 @@ class PipelineManager:
         wf_models = self.config.get("tuning_settings.walk_forward_models", ["ARIMA"])
         oos_frac = float(self.config.get("tuning_settings.oos_fraction", 0.3))
         max_hist = int(self.config.get("tuning_settings.trailing_window", 500))
+        horizon = forecast_horizon(self.config, term)
 
         n = len(df)
         split = int(n * (1 - oos_frac))
@@ -559,7 +571,8 @@ class PipelineManager:
                     if len(hist) < 20:
                         continue
                     try:
-                        preds[k] = float(base.apply(hist).forecast(steps=1)[0])
+                        path = base.apply(hist).forecast(steps=horizon)
+                        preds[k] = float(path[horizon - 1])
                     except Exception:
                         preds[k] = close[t]
             except Exception as e:
@@ -567,7 +580,7 @@ class PipelineManager:
 
         dl_wanted = [m for m in wf_models if m in ("LSTM", "Transformer")]
         if dl_wanted:
-            dl_preds = self._walk_forward_dl(symbol, df, split, dl_wanted)
+            dl_preds = self._walk_forward_dl(symbol, df, split, dl_wanted, horizon)
             if dl_preds is not None:
                 stacked = [
                     p for p in ([preds] if "ARIMA" in wf_models else []) + [dl_preds]
@@ -584,7 +597,7 @@ class PipelineManager:
         bar_vol = (
             log_ret.rolling(20).std().reindex(oos.index).fillna(0.005).replace(0, 0.005)
         )
-        oos["volatility"] = bar_vol
+        oos["volatility"] = bar_vol * np.sqrt(horizon)
 
         oos["regime"] = (
             self._vectorised_regimes(df).reindex(oos.index).fillna("SIDEWAYS_QUIET")
@@ -592,14 +605,21 @@ class PipelineManager:
 
         edge = (oos["prediction"] / oos["Close"] - 1).abs()
         logger.info(
-            f"\t=> OOS samples {len(oos)} bars (total {n}), tuning models {wf_models}; "
-            f"median predicted edge {edge.median()*100:.3f}%, median per-bar vol {bar_vol.median()*100:.3f}%"
+            f"\t=> OOS samples {len(oos)} bars (total {n}), tuning models {wf_models}, "
+            f"horizon {horizon} bar(s); median predicted edge {edge.median()*100:.3f}%, "
+            f"median per-bar vol {bar_vol.median()*100:.3f}% "
+            f"(over the horizon {bar_vol.median() * np.sqrt(horizon) * 100:.3f}%)"
         )
 
         return oos
 
     def _walk_forward_dl(
-        self, symbol: str, df: pd.DataFrame, split: int, model_types: list
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        split: int,
+        model_types: list,
+        horizon: int = 1,
     ):
         """Train networks in-sample and infer window by window over OOS (expensive, not the default)."""
         try:
@@ -634,12 +654,16 @@ class PipelineManager:
                 price_relative=price_rel,
                 target_mode="log_return",
                 target_scale=100.0,
+                horizon=horizon,
             )
             if len(X) < 100:
                 return None
 
+            # Sequence i is anchored on bar seq_pos - 1 and labelled with bar seq_pos - 1 + h.
+            # Train only on labels inside the in-sample segment; predict from anchors after it.
             seq_pos = np.arange(len(X)) + look_back
-            in_mask = seq_pos < adv_split
+            in_mask = seq_pos - 1 + horizon < adv_split
+            out_mask = seq_pos >= adv_split
 
             cb = [
                 EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
@@ -661,12 +685,11 @@ class PipelineManager:
                     shuffle=False,
                     callbacks=cb,
                 )
-                raw = m.model.predict(X[~in_mask], verbose=0).reshape(-1)
-                anchors = df_adv["Close"].values[seq_pos[~in_mask] - 1]
+                raw = m.model.predict(X[out_mask], verbose=0).reshape(-1)
+                anchors = df_adv["Close"].values[seq_pos[out_mask] - 1]
                 outputs.append(anchors * np.exp(raw / 100.0))
 
-            # A sequence targeting bar seq_pos is the forecast made at bar seq_pos - 1.
-            oos_idx = df_adv.index[seq_pos[~in_mask] - 1]
+            oos_idx = df_adv.index[seq_pos[out_mask] - 1]
             series = pd.Series(np.mean(outputs, axis=0), index=oos_idx)
             return series.reindex(df.index[split:]).values
         except Exception as e:
@@ -921,6 +944,8 @@ class PipelineManager:
             )
 
             best_params["term"] = best_term
+            best_horizon = forecast_horizon(self.config, best_term)
+            best_params["horizon_bars"] = best_horizon
             if fmp_data:
                 best_params["fmp_sector"] = fmp_data.get("sector")
                 best_params["fmp_industry"] = fmp_data.get("industry")
@@ -939,9 +964,14 @@ class PipelineManager:
 
             logger.info(f"\t-> 📐 Benchmark used for this training: {chosen_benchmark}")
             self._train_dl_models(
-                symbol, best_df, bench_df, best_macro, benchmark_symbol=chosen_benchmark
+                symbol,
+                best_df,
+                bench_df,
+                best_macro,
+                benchmark_symbol=chosen_benchmark,
+                horizon=best_horizon,
             )
-            self._train_safe_models(symbol, best_df)
+            self._train_safe_models(symbol, best_df, horizon=best_horizon)
 
             if self.benchmark_store is not None:
                 try:
