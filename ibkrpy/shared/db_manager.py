@@ -183,9 +183,22 @@ class DatabaseManager:
     def save_bulk_market_data(
         self, symbol: str, df: pd.DataFrame, timeframe: str = "1 day"
     ):
-        """Upsert market data bars."""
+        """Upsert market data bars. Intraday rows are refused in a "1 day" series."""
         if df.empty:
             return
+
+        if timeframe == "1 day":
+            from ibkrpy.data.bar_sync import daily_rows_off_midnight
+
+            off = daily_rows_off_midnight(df.index)
+            if off.any():
+                global_logger.warning(
+                    f"[{symbol}] Dropped {int(off.sum())} intraday rows sent to the "
+                    f"1 day series (daily bars are stamped 00:00 UTC)."
+                )
+                df = df.loc[~off]
+                if df.empty:
+                    return
 
         df_db = df.copy()
         df_db["symbol"] = symbol
