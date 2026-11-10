@@ -35,7 +35,7 @@ Everything starts from `ibkrpy/core/main.py`; choose the stage with `--mode`.
 
 Stage 1: download history (`--mode download`)
 
-Downloads and stitches historical data incrementally through the IBKR API into the SQLite database.
+Downloads and stitches historical data incrementally through the IBKR API into the SQLite database. Each run also refills holes left by earlier outages and re-adjusts older bars after a stock split.
 
 ```bash
 python ibkrpy/core/main.py --mode download
@@ -43,7 +43,7 @@ python ibkrpy/core/main.py --mode download
 
 Stage 2: train models and tune parameters (`--mode train`)
 
-Reads the database, trains the models and tunes strategy parameters with Optuna.
+Reads the database, trains the models and tunes strategy parameters with Optuna. Each term's models predict several bars ahead (`forecast_settings.horizon_bars`: 1 week of daily bars, about 1 day of hourly bars, 1 hour of 5-minute bars), and the training log shows which gate held a term that made no trades. Retrain after changing a horizon.
 (⚠️ Run stage 1 first, or there is no data to train on.)
 
 ```bash
@@ -80,6 +80,15 @@ Starts the daemon: trades during market hours, and backfills data and retrains m
 python ibkrpy/core/main.py --mode daemon --ui
 ```
 
+Prediction ledger (`--mode ledger`)
+
+Live and daemon modes record every scan's prediction in the `prediction_ledger` table. This mode fills in the realized move once the forecast horizon has passed, then reports hit rate, IC (information coefficient) and calibration slope per model generation and horizon, pooled and per symbol. It needs no IBKR connection. Run it after about two weeks of paper trading to judge whether the models have an edge.
+
+```bash
+python ibkrpy/core/main.py --mode ledger
+python ibkrpy/core/main.py --mode ledger SPY   # one symbol
+```
+
 ## 3. Dashboard
 
 Add `--ui` at startup, or run `--mode ui` on its own, to open a separate monitoring window.
@@ -97,6 +106,7 @@ Static settings live in `config.yaml` at the project root (`./`). Secrets such a
 - The port and client ID.
 - API keys for external macro data (e.g. FRED).
 - The asset pool and each symbol's term.
+- The forecast horizon per term (`forecast_settings.horizon_bars`).
 - Strategy, risk and cost settings (position size, exposure caps, kill switch, commission plan).
 
 See `config.yaml.sample` for every option. A short example:
@@ -109,6 +119,12 @@ ib_settings:
 
 api_keys_settings:
   fred_api_key: "YOUR_FRED_API_KEY_HERE" # Used for the VIX macro indicator
+
+forecast_settings:
+  horizon_bars:                  # Bars ahead each term predicts; retrain after changing
+    short_term: 12
+    mid_term: 7
+    long_term: 5
 
 strategy_settings:
   base_position_pct: 0.08        # Base size per position (share of net liquidation)

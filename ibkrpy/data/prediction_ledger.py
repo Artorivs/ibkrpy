@@ -439,6 +439,42 @@ def verdict(stats: Optional[dict]) -> str:
     )
 
 
+def report(ledger: "PredictionLedger", symbol: str = None) -> str:
+    """
+    Resolve outcomes, then judge the edge per model generation and horizon (pooled over
+    symbols first, as required_samples advises). Generations and horizons are never
+    pooled together: mixing them makes the slope meaningless.
+    """
+    stats = ledger.resolve()
+    rows = ledger.fetch_resolved(symbol)
+    lines = [
+        f"Prediction ledger: {len(rows)} resolved rows "
+        f"({stats['resolved']} newly resolved, {stats['pending']} pending, "
+        f"{stats['expired']} expired)."
+    ]
+    groups: Dict[tuple, List[dict]] = {}
+    for r in rows:
+        key = (r.get("model_generation") or "unknown", int(r.get("horizon_bars") or 1))
+        groups.setdefault(key, []).append(r)
+
+    for (gen, h), grp in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f"\nModel generation {gen} · horizon {h} bar(s):")
+        lines.append("  Pooled: " + verdict(measure(grp)).replace("\n", "\n  "))
+        by_sym: Dict[str, List[dict]] = {}
+        for r in grp:
+            by_sym.setdefault(r["symbol"], []).append(r)
+        for sym, srows in sorted(by_sym.items()):
+            m = measure(srows)
+            if m is not None and not m.get("degenerate"):
+                lines.append(f"  {sym}: " + verdict(m).split("\n")[0])
+    if not rows:
+        lines.append(
+            "No resolved predictions yet. Rows resolve once the bar horizon_bars after "
+            "each prediction is in the database."
+        )
+    return "\n".join(lines)
+
+
 def build_prediction_ledger(db_path: str, config=None) -> PredictionLedger:
     """Used by the composition root."""
     enabled = True

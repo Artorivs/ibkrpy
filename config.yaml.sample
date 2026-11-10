@@ -227,7 +227,7 @@ risk_settings:
 # Clear the date or set it in the past to lift the freeze.
 #
 # Two weeks gives about 37 symbols × 10 trading days ≈ 370 samples, close to the ~500 needed
-# to detect a 0.40 slope. When it expires, run analyze_ledger.py before deciding to retrain.
+# to detect a 0.40 slope. When it expires, run --mode ledger before deciding to retrain.
 training_settings:
   auto_retrain: true          # false disables automatic retraining
   retrain_days: [sat, sun]    # Days retraining is allowed
