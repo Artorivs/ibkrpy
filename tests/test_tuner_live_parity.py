@@ -148,6 +148,37 @@ class TunerTests(unittest.TestCase):
         self.assertGreater(perf["total_trades"], 0)
 
 
+class ZeroTradeDiagnosisTests(unittest.TestCase):
+    def test_tiny_predicted_moves_are_held_by_the_cost_floor(self):
+        rng = np.random.default_rng(0)
+        sigma = 0.0045
+        close = 500 * np.exp(np.cumsum(rng.normal(0.0003, sigma, 200)))
+        rows = bars(close, highs=close * 1.002, lows=close * 0.998)
+        rows["prediction"] = close * (1 + rng.normal(0.0, 0.0005, 200))
+        rows["volatility"] = sigma
+        rows["regime"] = "SIDEWAYS_QUIET"
+
+        tuner = ModelTuner(
+            config=_DictConfig({"strategy_settings": {"min_edge_pct": 0.001}})
+        )
+        params = {
+            "volatility_stop_loss_multiplier": 1.0,
+            "volatility_take_profit_multiplier": 2.0,
+        }
+        perf = tuner.evaluate(
+            "SPY", rows.iloc[100:], params, "long_term", rows.iloc[:100]
+        )
+
+        self.assertEqual(perf["total_trades"], 0)
+        reasons = perf["hold_reasons"]
+        self.assertEqual(max(reasons, key=reasons.get), "EDGE_BELOW_COST")
+
+    def test_order_skips_are_reported(self):
+        decide, _ = scripted({0: "SELL"})
+        perf = BacktestEngine(allow_shorting=False).simulate(bars([100.0] * 3), decide)
+        self.assertEqual(perf["order_skips"], {"SHORTING_DISABLED": 1})
+
+
 class WalkForwardAlignmentTests(unittest.TestCase):
     def test_prediction_at_row_t_uses_close_t(self):
         from ibkrpy.manager.pipeline_manager import PipelineManager
