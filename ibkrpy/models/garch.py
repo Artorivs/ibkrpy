@@ -43,14 +43,14 @@ class GARCHModel:
             )
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
-        """預測下一期的年化波動率"""
+        """Next-bar volatility per bar (not annualized); NaN when there is too little data."""
         if df.empty or "Close" not in df.columns:
-            return 0.02
+            return float("nan")
 
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna() * 100.0
 
         if len(returns) < 20:
-            return 0.02
+            return float("nan")
 
         try:
             model = arch_model(returns, vol="Garch", p=self.p, q=self.q, dist=self.dist)
@@ -63,14 +63,11 @@ class GARCHModel:
             forecasts = res.forecast(horizon=1, method="analytic")
             predicted_var = forecasts.variance.iloc[-1].item()
 
-            predicted_vol_daily = np.sqrt(predicted_var) / 100.0
-            annual_vol = predicted_vol_daily * np.sqrt(252)
-
-            return float(annual_vol)
+            return float(np.sqrt(predicted_var) / 100.0)
 
         except Exception as e:
             print(f"GARCH 預測失敗: {e}")
-            return float((returns.tail(20).std() / 100.0) * np.sqrt(252))
+            return float(returns.tail(20).std() / 100.0)
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
         """Fallback：GARCH 本身不預測價格"""
