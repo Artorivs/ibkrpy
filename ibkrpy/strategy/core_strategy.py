@@ -107,7 +107,11 @@ class CoreStrategy:
     def _calculate_ensemble_prediction(
         self, predictions: Dict[str, float], regime: MarketRegime
     ) -> float:
-        """Regime-based weights, adjusted by each model's observed dispersion."""
+        """Equal-weight mean of the models that pass the outlier filter and are not collapsed.
+
+        Equal weights are the robust default for a few noisy forecasters (the forecast
+        combination puzzle): estimated or hand-set weights rarely beat 1/N out of sample.
+        """
         if not predictions:
             return 0.0
 
@@ -128,38 +132,18 @@ class CoreStrategy:
                 self._last_dropped = sorted(set(predictions) - set(kept))
                 filtered_predictions = kept
 
+        live = getattr(self, "_model_liveness", None) or {}
+        alive = {k: v for k, v in filtered_predictions.items() if live.get(k, 1.0) > 0}
+        if alive:
+            filtered_predictions = alive
+
         self._last_filtered_models = sorted(filtered_predictions.keys())
-
-        if regime in (MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND):
-            base_weights = {"LSTM": 0.45, "Transformer": 0.45, "ARIMA": 0.10}
-        elif regime == MarketRegime.SIDEWAYS_VOLATILE:
-            base_weights = {"LSTM": 0.33, "Transformer": 0.33, "ARIMA": 0.34}
-        else:
-            base_weights = {"LSTM": 0.15, "Transformer": 0.15, "ARIMA": 0.70}
-
-        fallback_w = 1.0 / len(filtered_predictions)
-        weights = {k: base_weights.get(k, fallback_w) for k in filtered_predictions}
-
-        live = getattr(self, "_model_liveness", None)
-        if live:
-            adjusted = {
-                k: w * max(float(live.get(k, 1.0)), 0.0) for k, w in weights.items()
-            }
-            if sum(adjusted.values()) > 1e-12:
-                weights = adjusted
-
-        total_weight = sum(weights.values())
-        if total_weight <= 1e-12:
-            return float(np.mean(list(filtered_predictions.values())))
-
-        return (
-            sum(filtered_predictions[k] * w for k, w in weights.items()) / total_weight
-        )
+        return float(np.mean(list(filtered_predictions.values())))
 
     def set_model_liveness(self, liveness: Dict[str, float]):
         """
-        Injected by TradingEngine: each model's liveness (0-1).
-        1.0 = normal output variation; near 0 = collapsed to a constant.
+        Injected by TradingEngine: 1.0 for a live model, 0.0 for one whose output has
+        collapsed to a constant. Collapsed models are left out of the mean.
         """
         self._model_liveness = dict(liveness or {})
 
