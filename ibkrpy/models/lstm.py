@@ -1,5 +1,5 @@
 # ibkrpy/models/lstm.py
-# 專責捕捉時間序列的序列記憶效應，輸出下一個時間步的預測值。
+# Sequence model that forecasts the next bar.
 
 import os
 from typing import List, Optional
@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 
 
 class LSTMModel:
-    """標準化 LSTM 模型，對接 ModelOrchestrator 介面"""
+    """LSTM model behind the ModelOrchestrator interface."""
 
     def __init__(
         self,
@@ -32,7 +32,7 @@ class LSTMModel:
         self.model = None
 
     def _build_model(self) -> Sequential:
-        """構建標準的 LSTM 雙層網路架構 (具備防神經元壞死機制)"""
+        """Build the two-layer LSTM network."""
         model = Sequential(
             [
                 LSTM(64, return_sequences=True, input_shape=self.input_shape),
@@ -52,32 +52,32 @@ class LSTMModel:
         return model
 
     def load_weights(self, symbol: str):
-        """載入 .keras 或 .h5 權重檔"""
+        """Load .keras or .h5 weights."""
         file_path = os.path.join(self.weights_dir, f"{symbol}_LSTM.keras")
 
         if os.path.exists(file_path):
             self.model = load_model(file_path)
-            print(f"[{symbol}] LSTM 模型權重載入成功。")
+            print(f"[{symbol}] LSTM weights loaded.")
         else:
             print(
-                f"[{symbol}] 找不到 LSTM 權重 ({file_path})，初始化全新未經訓練之模型。"
+                f"[{symbol}] LSTM weights not found ({file_path}); using an untrained model."
             )
             self.model = self._build_model()
 
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        """提取最後 look_back 筆資料，轉換為 (1, look_back, features) 的 3D 張量"""
+        """Take the last look_back rows as a (1, look_back, features) tensor."""
         if len(df) < self.look_back:
             return np.array([])
 
         missing_cols = [col for col in self.feature_cols if col not in df.columns]
         if missing_cols:
-            raise ValueError(f"數據缺失必要特徵欄位: {missing_cols}")
+            raise ValueError(f"Missing required feature columns: {missing_cols}")
 
         data = df[self.feature_cols].iloc[-self.look_back :].values
         return np.expand_dims(data, axis=0)
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
-        """預測下一個時間步的價格 (已縮放數值需在外部還原)"""
+        """Forecast the next bar (scaled output; decode it outside)."""
         if self.model is None:
             return df["Close"].iloc[-1]
 
@@ -90,7 +90,7 @@ class LSTMModel:
         return float(prediction[0, 0])
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
-        """若模型本身不預測波動率，提供基於近期歷史的波動率作為 fallback"""
+        """Fallback volatility from recent history (the model does not forecast it)."""
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
         vol = returns.tail(20).std() * np.sqrt(252) if len(returns) >= 20 else 0.02
         return float(vol)

@@ -1,12 +1,12 @@
 # config.yaml
-# 交易系統的設定檔
+# Trading system configuration
 
 # ============================================================
-# 1. 基礎設定
+# 1. General settings
 general_settings:
   benchmark_symbol: "QQQ"
 
-  # --- 週期下限 ---
+  # --- Term floor ---
   # short_term | mid_term | long_term
   min_term: "long_term"
   analyzer_lookback: 60
@@ -15,12 +15,12 @@ general_settings:
   long_term_bar_size: "1 day"
 
 # ============================================================
-# 2. 日誌設定
+# 2. Logging
 log_settings:
-  level: "INFO"              # 控制台輸出等級 (檔案一律 DEBUG)
+  level: "INFO"              # Console level (the log file is always DEBUG)
   enable_email_alerts: false
-  alert_throttle_minutes: 30   # 同一發生點在此時間窗內只寄一封信（控制台與檔案仍完整記錄）
-  # 啟用 email 警報時，以下四項為必填，缺一則警報不會生效 (啟動時會報錯提示)
+  alert_throttle_minutes: 30   # One email per call site per window (console and file still log everything)
+  # Required when email alerts are on; alerts stay off if any is missing (reported at startup)
   # smtp_server: "smtp.gmail.com"
   # smtp_port: 587
   # sender_email: ""
@@ -28,39 +28,38 @@ log_settings:
   # receiver_email: ""
 
 # ============================================================
-# 交易時段
+# Trading sessions
 #
-# live_trading_loop 過去完全不看時段，週末假日照樣每 60 秒喚醒一次。
-# 現在休市時直接睡到下一個時段開始 (deepsleep)。
+# When the market is closed the loop sleeps until the next session opens.
 session_settings:
   calendar: NYSE
-  extended_poll_multiplier: 3.0  # 盤前/盤後/夜盤的輪詢間隔倍數
+  extended_poll_multiplier: 3.0  # Polling interval multiplier for pre-market, after-hours and overnight
   allow_extended_entries: false  # false = open new positions in regular hours only; extended hours are close-only
 
-  # ⚠️ 夜盤 (20:00-03:50 ET) 預設關閉。開啟前必須確認:
-  #    1. IBKR 帳戶已開通 Overnight Trading 權限
-  #    2. 標的在夜盤可交易 (僅部分 ETF 與大型股)
-  #    3. strategy_settings.min_edge_pct 另設夜盤值 —— 夜盤價差通常是
-  #       日盤的數倍，沿用日盤成本假設會系統性高估邊際
+  # ⚠️ Overnight (20:00-03:50 ET) is off by default. Before enabling, check that:
+  #    1. the IBKR account has Overnight Trading permission
+  #    2. the symbols trade overnight (only some ETFs and large caps)
+  #    3. strategy_settings.min_edge_pct has an overnight value; overnight spreads are often
+  #       several times wider, so regular-hours cost assumptions overstate the edge
   enable_overnight: false
 
 # ============================================================
-# 特徵縮放參數的儲存
+# Feature scaler storage
 scaler_settings:
   consolidated: true
 
 # ============================================================
-# 波動率估計 (σ)
+# Volatility estimate (σ)
 #
-# σ 有四個下游消費者: 門檻政策、出場幾何的 noise_floor / risk_cap、
-# 情境判定、以及風險平價的倉位縮放。任何一個拿到錯的 σ 都會靜默失效。
+# σ feeds four consumers: the threshold policy, exit geometry noise_floor / risk_cap,
+# regime detection and risk-parity sizing. A wrong σ breaks each of them silently.
 volatility_settings:
-  lookback: 60              # 估計實現波動率所用的 K 線根數
-  ewma_halflife: 20.0       # 收盤對收盤退路的半衰期 (缺 OHLC 時才會用到)
-  model_band_lo: 0.333      # 模型值 / 實現值 的可接受下界
-  model_band_hi: 3.0        # 上界。雙尾都要擋 —— 高估 σ 會讓停損過寬
-  abs_floor_per_bar: 0.0005 # 每根 K 線波動率的絕對下限，防止平坦 K 線產生 σ=0
-  trust_model: true         # 設為 false 可完全繞過 GARCH，直接採用實現波動率
+  lookback: 60              # Bars used to estimate realized volatility
+  ewma_halflife: 20.0       # Half-life of the close-to-close fallback (only without OHLC)
+  model_band_lo: 0.333      # Lower bound of model / realized
+  model_band_hi: 3.0        # Upper bound. Both tails matter: an overstated σ widens stops
+  abs_floor_per_bar: 0.0005 # Absolute per-bar floor so flat bars never give σ=0
+  trust_model: true         # false bypasses GARCH and uses realized volatility only
   # Most entries here came from the GARCH intraday scaling bug; clear them once the
   # "model volatility differs" errors stop appearing in the log.
   distrust_symbols:
@@ -74,33 +73,33 @@ volatility_settings:
     - V
 
 # ============================================================
-# 預測—結果帳本
+# Prediction-outcome ledger
 
 ledger_settings:
   enabled: true
 
 # ============================================================
-# 成交成本
+# Execution costs
 #
-# ⚠️ 成本不是一個固定百分比。
-#    IBKR 的股票佣金是「每股計價 + 每筆最低金額」，所以成本佔名目的比例會隨部位縮小而爆炸。
+# ⚠️ Cost is not a fixed percentage. IBKR stock commission is per share with a per-order
+#    minimum, so cost as a share of notional grows sharply as positions get smaller.
 
 execution_cost_settings:
-  # ibkr_tiered | ibkr_fixed | zero(IBKR Lite)
-  # ⚠️ 請改成你帳戶實際的方案。填錯會讓成本被低估，等於沒有這道防線。
+  # ibkr_tiered | ibkr_fixed | zero (IBKR Lite)
+  # ⚠️ Set this to your account's actual plan. A wrong plan understates costs.
   commission_model: ibkr_tiered
 
-  # 留空則用上面方案的公告費率；自訂時兩者都要填
+  # Leave empty to use the plan's published rates; set both to override
   # per_share: 0.0035
   # minimum_per_order: 0.35
 
-  default_spread_bps: 2.0          # 買賣價差 (基點)。大型股約 1-3，中小型股更高
-  slippage_bps: 1.0                # 單邊滑價 (基點)
-  extended_spread_multiplier: 4.0  # 盤前/盤後/夜盤的價差倍數
-  include_regulatory_fees: true    # SEC 費 + FINRA TAF (僅賣出腳)
+  default_spread_bps: 2.0          # Bid-ask spread (bps). About 1-3 for large caps, more for small caps
+  slippage_bps: 1.0                # One-way slippage (bps)
+  extended_spread_multiplier: 4.0  # Spread multiplier for pre-market, after-hours and overnight
+  include_regulatory_fees: true    # SEC fee + FINRA TAF (sell leg only)
 
-  # 毛利必須是成本的幾倍才送單。剛好打平的交易期望值為零，
-  # 扣掉預測誤差就是負的，所以要求有安全邊際。
+  # Gross edge must be this multiple of cost before an order is sent. A break-even trade
+  # has zero expectancy and turns negative after forecast error, so keep a margin.
   safety_multiple: 1.5
 
 # ============================================================
@@ -113,20 +112,20 @@ threshold_settings:
   history_length: 500
   persist_history: true
 
-  # --- 模型塌陷防護 ---
+  # --- Model collapse guard ---
   enable_collapse_guard: true
   collapse_min_samples: 25
-  collapse_dispersion_floor: 0.00001    # 預測標準差低於此值視為常數
+  collapse_dispersion_floor: 0.00001    # Prediction std below this counts as constant
 
 # ============================================================
-# 3. IBKR 連線設定
+# 3. IBKR connection
 ib_settings:
   host: "127.0.0.1"
-  port: 7497       # 7496/7497 為 TWS Live/Paper, 4001/4002 為 Gateway Live/Paper
+  port: 7497       # 7496/7497 = TWS live/paper, 4001/4002 = Gateway live/paper
   client_id: 1
 
 # ============================================================
-# 4. 外部 API 密鑰
+# 4. External API keys
 api_keys_settings:
   fmp_api_key: ""  # Financial Modeling Prep
   fred_api_key: "" # Federal Reserve Economic Data
@@ -134,7 +133,7 @@ api_keys_settings:
 # ============================================================
 
 regime_settings:
-  # --- 均線與指標週期 ---
+  # --- Moving average and indicator periods ---
   regime_ma_short: 20
   regime_ma_long: 50
   regime_adx_period: 14
@@ -142,46 +141,46 @@ regime_settings:
   regime_adx_trend_threshold: 20.0
   regime_volatility_threshold_pct: 0.02
 
-  # --- 非對稱確認 (本區塊最重要的兩個值) ---
+  # --- Asymmetric confirmation (the two most important values here) ---
   regime_bull_confirm_bars: 3
   regime_bear_confirm_bars: 1
   regime_use_closed_bars_only: true
 
-  # --- 反轉風險評分 ---
+  # --- Reversal risk score ---
   regime_reversal_lookback: 20
   regime_reversal_weights:
-    momentum_fade: 0.22          # 快線斜率轉平/轉負
-    price_below_fast_ma: 0.20    # 收盤跌破快線
-    lower_highs: 0.20            # 距區間高點的回落幅度
-    trend_exhaustion: 0.13       # ADX 自高點回落
-    volatility_expansion: 0.13   # ATR 相對自身基線放大
-    distribution_volume: 0.12    # 下跌K棒量能大於上漲K棒
+    momentum_fade: 0.22          # Fast MA slope flattening or turning down
+    price_below_fast_ma: 0.20    # Close below the fast MA
+    lower_highs: 0.20            # Pullback from the range high
+    trend_exhaustion: 0.13       # ADX falling from its peak
+    volatility_expansion: 0.13   # ATR rising above its own baseline
+    distribution_volume: 0.12    # Down-bar volume above up-bar volume
 
 # ============================================================
 strategy_settings:
-  # --- 部位大小 (針對「多頭市場過度保守」) ---
-  base_position_pct: 0.08        # 單筆部位的基準大小 (佔淨值)
-  min_risk_parity_tilt: 0.5      # 高波動標的最多縮到基準的一半
-  max_risk_parity_tilt: 2.0      # 低波動標的最多放大到兩倍
+  # --- Position size ---
+  base_position_pct: 0.08        # Base size per position (share of net liquidation)
+  min_risk_parity_tilt: 0.5      # High-volatility symbols shrink to at most half the base
+  max_risk_parity_tilt: 2.0      # Low-volatility symbols grow to at most twice the base
 
-  # 依情境縮放部位。減碼與平倉一律不縮放 (縮小出場單等於留下處置不掉的尾巴)。
+  # Size scaling by regime. Reducing and closing are never scaled down.
   size_scale_bull: 1.25
   size_scale_bear: 0.60
   size_scale_volatile: 0.70
   size_scale_quiet: 0.90
 
-  # --- 進出場非對稱 ---
-  exit_threshold_ratio: 0.5      # 出場門檻 = 進場門檻 × 此值
-  reversal_caution_level: 0.5    # 反轉風險超過此值開始拉高進場門檻
-  reversal_threshold_boost: 1.0  # 拉高幅度：門檻 ×(1 + 風險×此值)
-  reversal_block_level: 0.75     # 反轉風險超過此值完全停止新增曝險
+  # --- Entry/exit asymmetry ---
+  exit_threshold_ratio: 0.5      # Exit threshold = entry threshold × this
+  reversal_caution_level: 0.5    # Above this reversal risk the entry threshold starts rising
+  reversal_threshold_boost: 1.0  # Threshold × (1 + risk × this)
+  reversal_block_level: 0.75     # Above this reversal risk no new exposure is opened
 
-  # --- 交易成本地板 (粗篩用) ---
-  # 這是門檻階段的粗略下限。真正的把關在下單前，由 execution_cost_settings
-  # 依實際股數與價格重算 —— 因為門檻階段還不知道會下幾股。
+  # --- Cost floor (coarse screen) ---
+  # Coarse floor at the threshold stage. The real check runs before ordering, when
+  # execution_cost_settings recomputes cost from the actual shares and price.
   min_edge_pct: 0.0010
 
-  # 預測偏離現價超過此比例即剔除該模型
+  # A model whose prediction deviates from price by more than this is dropped
   max_prediction_deviation: 0.10
   allow_shorting: true
   max_gross_exposure: 1.0
@@ -200,37 +199,37 @@ risk_settings:
   max_drawdown_pct: 0.10
 
 # ============================================================
-# 訓練排程
-# live 與 daemon 模式都會在休市時段以獨立行程自動重訓 (RetrainScheduler)。
-#   live:   休市 = 20:00-04:00 (未開夜盤時) 與整個週末
-#   daemon: 休市 = 常規時段 (09:30-16:00) 以外的所有時間
-# 預設每個 ISO 週一次，於週六或週日執行。若要每晚休市都重訓:
+# Retraining schedule
+# live and daemon modes retrain in a separate process while the market is closed (RetrainScheduler).
+#   live:   closed = 20:00-04:00 (when overnight is off) and the whole weekend
+#   daemon: closed = any time outside regular hours (09:30-16:00)
+# Default is once per ISO week, on Saturday or Sunday. To retrain every closed night:
 #   retrain_days: [mon, tue, wed, thu, fri, sat, sun]
 #   retrain_every: day
-# ⚠️ 平日重訓可能跑進下一個交易時段；重訓期間系統只維持連線、不做交易決策。
+# ⚠️ A weekday retrain can run into the next session; while it runs the system stays
+#    connected but makes no trading decisions.
 #
-# ❄️ 模型凍結
-# 自動重訓會在每個允許的休市時段觸發。收集預測帳本樣本
-# 期間這件事必須停下來 —— 中途換模型會讓同一份樣本混入兩個世代，
-# 匯總斜率就失去意義，而且不會有任何錯誤訊息提醒你。
-# 清空或設為過去的日期即可解除。
+# ❄️ Model freeze
+# Retraining must pause while ledger samples are collected: swapping models mid-way mixes
+# two generations in one sample and makes the pooled slope meaningless, with no error shown.
+# Clear the date or set it in the past to lift the freeze.
 #
-# 兩週約可累積 37 檔 × 10 個交易日 ≈ 370 筆，接近偵測 0.40 斜率
-# 所需的 500 筆。到期後先跑 analyze_ledger.py 再決定要不要重訓。
+# Two weeks gives about 37 symbols × 10 trading days ≈ 370 samples, close to the ~500 needed
+# to detect a 0.40 slope. When it expires, run analyze_ledger.py before deciding to retrain.
 training_settings:
-  auto_retrain: true          # false 則完全停用自動重訓
-  retrain_days: [sat, sun]    # 允許重訓的星期
-  retrain_every: week         # week (每週一次) | day (每個允許的日子一次)
-  retry_minutes: 60           # 重訓失敗後，隔多久再試
-  retrain_client_id: 101      # 重訓子行程的 IBKR client_id，不可與主行程相同
+  auto_retrain: true          # false disables automatic retraining
+  retrain_days: [sat, sun]    # Days retraining is allowed
+  retrain_every: week         # week (once a week) | day (every allowed day)
+  retry_minutes: 60           # Minutes before retrying a failed retrain
+  retrain_client_id: 101      # IBKR client_id for the retrain process; must differ from the main one
   freeze_until: "2026-09-24"
 
 # ============================================================
-# 6. Walk-forward 尋優設定
+# 6. Walk-forward tuning
 tuning_settings:
   walk_forward_models: ["ARIMA", "LSTM", "Transformer"]
-  oos_fraction: 0.3          # 後 30% 作為 out-of-sample
-  trailing_window: 500       # 逐根預測時餵給模型的最大歷史長度
+  oos_fraction: 0.3          # Last 30% is out-of-sample
+  trailing_window: 500       # Maximum history fed to the model per step
 
 # ============================================================
 benchmark_settings:
@@ -240,28 +239,28 @@ benchmark_settings:
     # NVDA: "SMH"
     # BRK B: "XLF"
     # ARM: "SMH"
- 
-  # --- 產業對應法 ---
+
+  # --- Sector mapping ---
   enable_sector_mapping: true
   classifications:
     # NVDA: { sector: "Technology", industry: "Semiconductors" }
     # JPM:  { sector: "Financial Services" }
- 
-  # 覆寫內建的對應表 (內建已涵蓋 11 個 GICS 板塊與 6 個常見細產業)
+
+  # Override the built-in maps (11 GICS sectors and 6 common industries)
   sector_etf_map:
     # Technology: "XLK"
   industry_etf_map:
     # Semiconductors: "SMH"
- 
-  # --- 相關性法 ---
-  # 不依賴任何人工分類，直接從候選池中挑出與該標的報酬相關性最高的一檔。
-  # ⚠️ 候選池中的每一檔都會被下載歷史資料，會增加 API 用量。
-  #    建議只留下你真的會用到的板塊 ETF。
+
+  # --- Correlation ---
+  # Picks the candidate whose returns correlate most with the symbol, no manual classification.
+  # ⚠️ Every candidate's history is downloaded, which adds API usage.
+  #    Keep only the sector ETFs you actually need.
   enable_correlation: true
-  correlation_timeframe: "1 day"      # 固定用日 K，比短週期穩定
-  correlation_lookback: 250           # 約一年交易日
-  correlation_min_observations: 60    # 少於此筆數不做判斷
-  correlation_min_threshold: 0.3      # 最佳候選也低於此值就棄權，交給 default
+  correlation_timeframe: "1 day"      # Daily bars, more stable than intraday
+  correlation_lookback: 250           # About one trading year
+  correlation_min_observations: 60    # No decision below this many observations
+  correlation_min_threshold: 0.3      # If even the best candidate is below this, defer to default
   candidate_pool:
     - "SPY"
     - "QQQ"
@@ -280,7 +279,7 @@ benchmark_settings:
     - "ITA"
 
 # ============================================================
-# 7. 交易資產池 (Assets)
+# 7. Asset pool
 assets:
   - symbol: "SPY"
   - symbol: "VOO"

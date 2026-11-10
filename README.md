@@ -1,114 +1,126 @@
-# 盈透證券非同步量化交易系統
+# IBKR Async Quantitative Trading System
 
-**免責聲明**: 本系統僅供學術研究與個人投資策略開發使用，切勿視為任何形式之投資建議。資本市場瞬息萬變，使用者須自行承擔參與市場所衍生之交易風險，開發者概不對任何資產減損負責。
+**English** | [繁體中文](README.zh-TW.md)
 
-**入市有風險，投資須謹慎。**
+**Disclaimer**: This system is for academic research and personal strategy development only. It is not investment advice of any kind. Markets change quickly; you bear all trading risk from using it, and the developers accept no responsibility for any loss.
 
-## 1. 系統準備要求 (Prerequisites)
+**Trading involves risk. Invest with care.**
 
-IBKR TWS 或 IB Gateway: 必須在本機運行並登入。
+## 1. Prerequisites
 
-至 `設定` -> `API` -> `設定` 中，勾選「啟用 ActiveX 和 Socket 客戶端」。
+IBKR TWS or IB Gateway must be running and logged in on this machine.
 
-取消勾選「只讀 API (Read-Only API)」，否則無法下單。
+In `Configure` -> `API` -> `Settings`, tick "Enable ActiveX and Socket Clients".
 
-Python 環境: 推薦使用 Python 3.10+；必須提前安裝 `Poetry` 以管理虛擬環境與依賴；推薦使用獨立虛擬環境。
+Untick "Read-Only API", or orders cannot be placed.
 
-安裝依賴:
+Python: 3.10+ is recommended. Install `Poetry` first to manage the virtual environment and dependencies; a dedicated virtual environment is recommended.
+
+Install dependencies:
 
 ```bash
 poetry install
 ```
 
-## 2. 系統啟動模式 (Operating Modes)
+Create your local settings from the samples:
 
-系統全部透過 `ibkrpy/core/main.py` 來啟動，請使用 --mode 參數來指定執行階段。
+```bash
+cp config.yaml.sample config.yaml
+cp env.sample .env
+```
 
-階段一：獲取歷史數據 (`--mode download`)
+## 2. Operating modes
 
-系統將透過 IBKR API 增量下載並縫合歷史數據，存入 SQLite 資料庫與 Feather 快取中。
+Everything starts from `ibkrpy/core/main.py`; choose the stage with `--mode`.
+
+Stage 1: download history (`--mode download`)
+
+Downloads and stitches historical data incrementally through the IBKR API into the SQLite database.
 
 ```bash
 python ibkrpy/core/main.py --mode download
 ```
 
-階段二：模型訓練與參數尋優 (`--mode train`)
+Stage 2: train models and tune parameters (`--mode train`)
 
-讀取資料庫數據，執行深度學習訓練，並利用 Optuna 進行策略參數的百次迭代尋優。
-(⚠️ 警告：必須先執行過階段一，否則會找不到數據。)
+Reads the database, trains the models and tunes strategy parameters with Optuna.
+(⚠️ Run stage 1 first, or there is no data to train on.)
 
 ```bash
 python ibkrpy/core/main.py --mode train
 ```
 
-成功後，`weights/` 資料夾下會生成對應的 `.json` (參數) 與 `.keras` / `.pkl` (權重)。
+On success, `weights/` holds the `.json` parameters and the `.keras` / `.pkl` weights.
 
-捷徑：一鍵全自動管線 (`--mode autopilot`)
+Shortcut: full pipeline (`--mode autopilot`)
 
-如果你想一次性執行階段一與階段二，請使用此模式。這是週末大保養最常用的指令。
+Runs stage 1 and stage 2 in one go. This is the usual weekend maintenance command.
 
 ```bash
 python ibkrpy/core/main.py --mode autopilot
 ```
 
-階段三：啟動交易引擎 (`--mode live`)
+Stage 3: start the trading engine (`--mode live`)
 
-載入訓練好的 AI 模型與策略參數，開始即時掃描市場並下單。
+Loads the trained models and strategy parameters, then scans the market and places orders.
 
 ```bash
-# 啟動實盤，但套用安全沙盒 (僅虛擬下單，不會真的發送電文給券商)
-python ibkrpy/core/main.py --mode live --dry-run 
+# Live loop in the safety sandbox (simulated orders only; nothing is sent to the broker)
+python ibkrpy/core/main.py --mode live --dry-run
 
-# 啟動並同時開啟視覺化儀表板
+# Same, with the dashboard
 python ibkrpy/core/main.py --mode live --dry-run --ui
 ```
 
-終極階段：24/7 全天候無人值守 (`--mode daemon`)
+Unattended 24/7 (`--mode daemon`)
 
-啟動系統守護進程。盤中自動執行交易，盤後/週末自動進行資料回補與模型重新訓練。
+Starts the daemon: trades during market hours, and backfills data and retrains models after hours and at weekends.
 
 ```bash
 python ibkrpy/core/main.py --mode daemon --ui
 ```
 
-## 3. 監控儀表板 (Dashboard) 使用指南
+## 3. Dashboard
 
-如果在啟動時加上了 `--ui` 參數，或單獨執行 `--mode ui`，系統將彈出一個獨立的監控視窗。
+Add `--ui` at startup, or run `--mode ui` on its own, to open a separate monitoring window.
 
-左側面板: 顯示實時的 AI 交易決策日誌與進出場方向。
+Left panel: the live trade decision log with entry and exit direction.
 
-右上方面板: 顯示從 IBKR 即時同步的淨清算值 (NLV) 與現有庫存。
+Top right: net liquidation value (NLV) and positions synced from IBKR.
 
-右下方面板: 透過下拉選單，可以即時切換查看帳戶總收益曲線 (Equity Curve)，或是個別監控標的之即時走勢圖。
+Bottom right: a drop-down switches between the account equity curve and the price chart of each symbol.
 
-## 4. 核心配置檔 (`config.yaml`) 詳解
+## 4. Configuration (`config.yaml`)
 
-系統之靜態參數均由根目錄（`./`）之 `config.yaml` 統一控管。你可於該檔案內配置：
+Static settings live in `config.yaml` at the project root (`./`). Secrets such as API keys and email credentials can go in `.env` instead, which takes precedence. There you set:
 
-- 通訊埠號與客戶端編號。
-- 外部總體經濟數據介面（如 FRED API）之金鑰。
-- 交易標的池（長線、中線、短線）。
-- 預設之策略閾值（如預測漲幅門檻、停損與停利倍數）。
+- The port and client ID.
+- API keys for external macro data (e.g. FRED).
+- The asset pool and each symbol's term.
+- Strategy, risk and cost settings (position size, exposure caps, kill switch, commission plan).
 
-以下為範例：
+See `config.yaml.sample` for every option. A short example:
 
 ```yaml
 ib_settings:
   host: "127.0.0.1"
-  port: 7497       # 7497為模擬盤(Paper)，實盤(Live)請改為7496
-  client_id: 1     # 系統主進程使用的 Client ID
+  port: 7497       # 7497 = paper; use 7496 for live
+  client_id: 1     # Client ID of the main process
 
 api_keys_settings:
-  fred_api_key: "YOUR_FRED_API_KEY_HERE" # 用於抓取 VIX 宏觀指標
+  fred_api_key: "YOUR_FRED_API_KEY_HERE" # Used for the VIX macro indicator
 
 strategy_settings:
-  # 預設參數 (若 weights/ 目錄下有 Optuna 產生的 JSON 檔，將會覆蓋此處設定)
-  min_prediction_threshold_pct: 0.005
-  volatility_stop_loss_multiplier: 1.5
-  volatility_take_profit_multiplier: 2.0
+  base_position_pct: 0.08        # Base size per position (share of net liquidation)
+  max_gross_exposure: 1.0
+  allow_shorting: true
+
+risk_settings:
+  max_daily_loss_pct: 0.02       # Block new entries after a 2% daily loss
+  max_drawdown_pct: 0.10         # Block new entries during a 10% drawdown from peak
 
 assets:
-   symbol: "NVDA"
+  - symbol: "NVDA"
     term: "mid_term"
     tags: "Semiconductor, GPU, AI, Data_Center, Tech"
 

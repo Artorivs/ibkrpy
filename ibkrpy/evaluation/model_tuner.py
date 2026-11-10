@@ -1,5 +1,5 @@
 # ibkrpy/evaluation/model_tuner.py
-# 結合 Optuna 優化與模型選拔 (支援跨週期錦標賽)
+# Optuna strategy tuning and term selection
 
 import optuna
 import pandas as pd
@@ -14,7 +14,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 class ModelTuner:
-    """負責模型的超參數尋優與最終模型選拔"""
+    """Tunes strategy parameters and scores candidates."""
 
     def __init__(self, model_orchestrator, data_manager):
         self.models = model_orchestrator
@@ -22,7 +22,7 @@ class ModelTuner:
         self.engine = BacktestEngine()
 
     def _calculate_composite_score(self, perf: Dict[str, Any]) -> float:
-        """超越單一夏普指數的機構級複合評分 (Composite Score)"""
+        """Composite score built on Sortino, profit factor, drawdown and trade count."""
         sortino = perf.get("sortino_ratio", 0.0)
         n_trades = perf.get("total_trades", 0)
 
@@ -62,7 +62,7 @@ class ModelTuner:
         n_trials: int = 50,
         term: str = "long_term",
     ) -> Tuple[Dict[str, Any], float]:
-        """使用 Optuna 尋找最佳風控參數並回傳 (最佳參數, 複合評分)"""
+        """Tune risk parameters with Optuna; returns (best params, composite score)."""
         from ibkrpy.strategy.core_strategy import CoreStrategy
         from ibkrpy.strategy.strategy_components import MarketRegime
 
@@ -105,14 +105,9 @@ class ModelTuner:
             perf = self.engine.run(df, signals)
             return self._calculate_composite_score(perf)
 
-        # [修正] 舊版用 n_jobs=-1 讓每個 CPU 核心各開一條執行緒，同時寫入同一個
-        # SQLite 檔 (data/optuna_study.db)。SQLite 一次只容許一個寫入者，
-        # 寫入排隊超過 5 秒就拋 "database is locked"，整個週期被記為 -999 而淘汰。
-        # objective 是純 Python 迴圈，受 GIL 限制，多執行緒本來也快不了。
-        #
-        # 另外 load_if_exists=True 會把歷次重訓的 trial 累積在同一個 study，
-        # best_params 可能來自用舊資料評分的舊 trial。改為每次重訓一個全新的
-        # 記憶體內 study，只依本次資料選出參數。
+        # Fresh in-memory study per run, trials run serially: the objective is pure
+        # Python (no gain from threads), and a shared SQLite study locked under
+        # concurrent writers and mixed trials scored on older data.
         try:
             study = optuna.create_study(
                 study_name=f"strategy_{symbol}_{term}",
@@ -122,5 +117,5 @@ class ModelTuner:
 
             return study.best_params, study.best_value
         except Exception as e:
-            logger.warning(f"⚠️ Optuna 優化失敗: {e}")
+            logger.warning(f"⚠️ Optuna optimization failed: {e}")
             return {}, -999.0

@@ -1,5 +1,5 @@
 # ibkrpy/models/transformer.py
-# 善於捕捉長時序之關聯與全局特徵。
+# Captures long-range dependencies across the input window.
 
 import os
 import numpy as np
@@ -22,20 +22,19 @@ from typing import List, Optional
 @keras.saving.register_keras_serializable(package="ibkrpy")
 class PositionalEmbedding(keras.layers.Layer):
     """
-    可學習的位置嵌入 (Learned Positional Embedding)。
+    Learned positional embedding.
 
-    對每一個時間步 t in [0, look_back) 學一個 d_model 維向量並加到該步的表徵上，
-    讓後續的 self-attention 能夠分辨「第幾根 K 線」。
+    Learns a d_model vector for each step t in [0, look_back) and adds it to that step,
+    so self-attention can tell bars apart by position.
 
-    實作註記：
-      權重以 add_weight() 在 build() 內直接建立，形狀為 (look_back, d_model)，
-      靠 broadcasting 加到 (batch, look_back, d_model) 上。
+    Implementation note:
+        The weight is created with add_weight() in build(), shape (look_back, d_model),
+        and broadcast onto (batch, look_back, d_model).
 
-      這裡刻意「不」使用 keras.layers.Embedding 子層。Keras 3 不會自動 build
-      在 __init__ 中建立的子層，除非父層的 build() 明確地去建立它的狀態；
-      否則存檔時子層變數會被寫入權重檔，載入時該層卻尚未 build，導致
-      「Layer 'pos_emb' was never built」的載入失敗。
-      add_weight() 是官方建議的標準路徑，沒有這個順序問題。
+        A keras.layers.Embedding sub-layer is deliberately avoided. Keras 3 doesn't build
+        sub-layers created in __init__ unless the parent's build() does, so saved weights
+        fail to load with "Layer 'pos_emb' was never built".
+        add_weight() is the recommended path and avoids that ordering issue.
     """
 
     def __init__(self, look_back: int, d_model: int, **kwargs):
@@ -65,7 +64,7 @@ class PositionalEmbedding(keras.layers.Layer):
 
 
 class TransformerModel:
-    """標準化 Transformer 模型，對接 ModelOrchestrator 介面"""
+    """Transformer model behind the ModelOrchestrator interface."""
 
     def __init__(
         self,
@@ -95,7 +94,7 @@ class TransformerModel:
         self.is_trained = False
 
     def _build_model(self) -> Model:
-        """構建具備位置編碼的 Transformer Encoder 架構"""
+        """Build the Transformer encoder with positional embedding."""
         inputs = Input(shape=(self.look_back, self.features), name="ohlcv_window")
 
         x = Dense(self.d_model, name="input_projection")(inputs)
@@ -132,41 +131,41 @@ class TransformerModel:
         return model
 
     def load_weights(self, symbol: str):
-        """載入 .keras 權重檔"""
+        """Load .keras weights."""
         file_path = os.path.join(self.weights_dir, f"{symbol}_Transformer.keras")
 
         if os.path.exists(file_path):
             try:
                 self.model = load_model(file_path)
                 self.is_trained = True
-                print(f"[{symbol}] Transformer 模型權重載入成功。")
+                print(f"[{symbol}] Transformer weights loaded.")
                 return
             except Exception as e:
-                print(f"❌ [{symbol}] Transformer 權重載入失敗: {e}")
+                print(f"❌ [{symbol}] Failed to load Transformer weights: {e}")
                 print(
-                    f"❌ [{symbol}] 若此檔為舊架構 (無位置編碼) 所存，請重新執行 --mode train。"
+                    f"❌ [{symbol}] If this file was saved by the old architecture (no positional embedding), run --mode train again."
                 )
 
         print(
-            f"❌ [{symbol}] 無可用的 Transformer 權重，初始化未訓練模型 (不應用於實盤決策)。"
+            f"❌ [{symbol}] No usable Transformer weights; using an untrained model (do not trade on it)."
         )
         self.model = self._build_model()
         self.is_trained = False
 
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        """特徵工程：擷取視窗並升維 (包含維度過濾防護)"""
+        """Take the input window as a 3D tensor, checking the feature columns."""
         if len(df) < self.look_back:
             return np.array([])
 
         missing_cols = [col for col in self.feature_cols if col not in df.columns]
         if missing_cols:
-            raise ValueError(f"數據缺失必要特徵欄位: {missing_cols}")
+            raise ValueError(f"Missing required feature columns: {missing_cols}")
 
         data = df[self.feature_cols].iloc[-self.look_back :].values
         return np.expand_dims(data, axis=0)
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
-        """預測下一個時間步的價格 (輸出為縮放值，需由呼叫端還原)"""
+        """Forecast the next bar (scaled output; the caller decodes it)."""
         if self.model is None:
             return float(df["Close"].iloc[-1])
 
@@ -179,11 +178,11 @@ class TransformerModel:
             prediction = self.model(X_tensor, training=False)
             return float(prediction[0, 0])
         except Exception as e:
-            print(f"Transformer 預測發生異常: {e}")
+            print(f"Transformer prediction failed: {e}")
             return float(df["Close"].iloc[-1])
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
-        """Fallback：計算歷史波動率"""
+        """Fallback: historical volatility."""
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
         vol = returns.tail(20).std() * np.sqrt(252) if len(returns) >= 20 else 0.02
         return float(vol)
