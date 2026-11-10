@@ -1,5 +1,5 @@
 # ibkrpy/data/scaler_store.py
-# 特徵縮放參數的儲存層
+# Storage for feature-scaling parameters
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ WF_MARKER = "__wf"
 
 
 class ScalerStore(ABC):
-    """DataPipeline 唯一依賴的介面。"""
+    """The only interface DataPipeline depends on."""
 
     @abstractmethod
     def load(self, symbol: str) -> Optional[ScalerDict]:
-        """讀不到回傳 None (不是拋例外，也不是空 dict —— 兩者語意不同)。"""
+        """Returns None when missing (not an exception, not an empty dict)."""
 
     @abstractmethod
     def save(self, symbol: str, scaler: ScalerDict) -> None: ...
@@ -36,7 +36,7 @@ class ScalerStore(ABC):
 
 
 class NullScalerStore(ScalerStore):
-    """不落盤。walk-forward 與測試使用。"""
+    """In-memory only. Used by walk-forward and tests."""
 
     def load(self, symbol):
         return None
@@ -53,9 +53,9 @@ class NullScalerStore(ScalerStore):
 
 class _FileLock:
     """
-    以 O_EXCL 建立鎖檔的簡易跨行程鎖。夠用是因為寫入本身很短 (< 10ms)，
-    而且重訓行程與實盤行程不會高頻爭用。逾時就放行並記錄 —— 寧可有極小
-    機率覆寫，也不要讓訓練整個卡死。
+    Simple cross-process lock using an O_EXCL lock file. Writes are short (< 10 ms)
+    and contention is rare, so on timeout we log and proceed rather than
+    block training.
     """
 
     def __init__(self, path: str, timeout: float = 10.0):
@@ -71,7 +71,7 @@ class _FileLock:
                 if time.time() > deadline:
                     age = time.time() - os.path.getmtime(self.path)
                     logger.warning(
-                        f"scaler 鎖等待逾時 (鎖已存在 {age:.0f} 秒)，強制取得。"
+                        f"Scaler lock wait timed out (lock is {age:.0f}s old); taking it."
                     )
                     try:
                         os.remove(self.path)
@@ -91,15 +91,15 @@ class _FileLock:
 
 class ConsolidatedScalerStore(ScalerStore):
     """
-    單一 weights/training_artifacts.json
+    Single weights/training_artifacts.json:
 
         {
           "version": 1,
           "scalers": { "AAPL": {"Close": {"min": .., "max": ..}, ...}, ... }
         }
 
-    走讀取路徑時會查記憶體快取，並以檔案 mtime 判斷是否需要重讀 ——
-    重訓行程更新檔案後，實盤行程不必重啟就會拿到新值。
+    Reads use an in-memory cache keyed on file mtime, so a live process picks up
+    a retrain's new values without restarting.
     """
 
     VERSION = 1
@@ -123,7 +123,7 @@ class ConsolidatedScalerStore(ScalerStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"training_artifacts.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"Failed to read training_artifacts.json ({self.path}): {e}")
             return self._cache or {}
 
     def _write_all(self, data: Dict[str, ScalerDict]) -> None:
@@ -174,7 +174,7 @@ class ConsolidatedScalerStore(ScalerStore):
 
 
 def build_scaler_store(weights_dir: str, config=None) -> ScalerStore:
-    """Composition Root 使用。預設啟用合併格式，並保留舊格式的讀取退路。"""
+    """Composition root. Uses the consolidated format, with a read fallback to the legacy one."""
     s = (config.get("scaler_settings") or {}) if config else {}
     return ConsolidatedScalerStore(
         os.path.join(weights_dir, s.get("filename", "_scalers.json"))

@@ -1,5 +1,5 @@
 # ibkrpy/strategy/prediction_calibrator.py
-# 進場門檻的校準，以及模型塌陷偵測。
+# Entry threshold calibration and model collapse detection.
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ logger = logging.getLogger("ibkrpy.calibrator")
 
 @dataclass(frozen=True)
 class ThresholdContext:
-    """計算門檻所需的全部輸入。新增欄位不會破壞既有 policy 的簽章。"""
+    """All inputs for a threshold. New fields don't break existing policies."""
 
     symbol: str
     sigma: float
@@ -36,7 +36,7 @@ class ThresholdDecision:
 
 @dataclass
 class CollapseReport:
-    """模型塌陷的診斷結果。"""
+    """Model collapse diagnosis."""
 
     collapsed: bool
     samples: int
@@ -46,7 +46,7 @@ class CollapseReport:
 
 
 class PredictionHistoryStore(ABC):
-    """記錄每檔標的的預測幅度，供門檻校準與塌陷偵測使用。"""
+    """Per-symbol history of predicted moves, for threshold calibration and collapse detection."""
 
     @abstractmethod
     def append(self, symbol: str, value: float) -> None: ...
@@ -56,7 +56,7 @@ class PredictionHistoryStore(ABC):
 
 
 class InMemoryPredictionHistory(PredictionHistoryStore):
-    """滾動視窗。重啟後歸零，適合回測與測試。"""
+    """Rolling window. Resets on restart; for backtests and tests."""
 
     def __init__(self, maxlen: int = 500):
         self._maxlen = maxlen
@@ -79,10 +79,10 @@ class InMemoryPredictionHistory(PredictionHistoryStore):
 
 class JsonPredictionHistory(InMemoryPredictionHistory):
     """
-    落盤版本。實盤重啟後不必重新累積樣本 —— 否則每次重啟都要等
-    min_samples 筆掃描才能開始交易。
+    Persisted version, so a live restart doesn't have to wait for min_samples scans
+    before trading again.
 
-    以 Decorator 的方式繼承記憶體版：寫入邏輯完全複用，只多一層節流落盤。
+    Extends the in-memory store and adds throttled writes to disk.
     """
 
     def __init__(self, path: str, maxlen: int = 500, flush_every: int = 25):
@@ -101,9 +101,9 @@ class JsonPredictionHistory(InMemoryPredictionHistory):
             for sym, values in raw.items():
                 for v in values:
                     super().append(sym, v)
-            logger.debug(f"預測歷史已載入 {len(raw)} 檔標的。")
+            logger.debug(f"Loaded prediction history for {len(raw)} symbols.")
         except Exception as e:
-            logger.warning(f"預測歷史載入失敗 ({self._path}): {e}")
+            logger.warning(f"Failed to load prediction history ({self._path}): {e}")
 
     def append(self, symbol: str, value: float) -> None:
         super().append(symbol, value)
@@ -118,13 +118,13 @@ class JsonPredictionHistory(InMemoryPredictionHistory):
                 json.dump(self.snapshot(), f)
             self._pending = 0
         except Exception as e:
-            logger.warning(f"預測歷史寫入失敗: {e}")
+            logger.warning(f"Failed to write prediction history: {e}")
 
 
 class ThresholdPolicy(ABC):
     """
-    契約：回傳一個正的門檻值 (小數)，永不拋例外。
-    所有實作可互換 —— 這是 LSP 的落腳處，也是能安全 A/B 切換的前提。
+    Contract: returns a positive threshold (decimal) and never raises.
+    All implementations are interchangeable, so policies can be swapped safely.
     """
 
     @abstractmethod
@@ -137,11 +137,11 @@ class ThresholdPolicy(ABC):
 
 class SigmaThresholdPolicy(ThresholdPolicy):
     """
-    舊版行為：門檻 = σ × multiplier。保留下來有兩個用途：
-      1. 需要回退時可以一行切換
-      2. 作為對照組，讓新政策的效果可被量化比較
+    Threshold = σ × multiplier. Kept for two uses:
+        1. a one-line fallback
+        2. a baseline to compare other policies against
 
-    ⚠️ 不建議在生產使用。σ 是價格的尺度，不是預測值的尺度。
+    Not recommended in production: σ is on the price scale, not the prediction's scale.
     """
 
     def __init__(self, multiplier: float = 1.0, static_floor: float = 0.0):
@@ -155,15 +155,15 @@ class SigmaThresholdPolicy(ThresholdPolicy):
 
 class QuantileThresholdPolicy(ThresholdPolicy):
     """
-    門檻 = 該標的過往 |預測| 的第 q 分位數。
+    Threshold = the q-th quantile of the symbol's past |prediction|.
 
-    語意變成「只在這個模型罕見地有強烈意見時進場」，而不是「等模型預測出
-    一個大過市場波動的數字」。後者對任何真實的次根 K 線預測器都是不可能的：
-    有效預測器的輸出標準差約為 σ × √R²，R² 只有幾個百分點時就是 0.1~0.2σ，
-    要求 |預測| > 1σ 等於要求預測落在自身分布的 5~10 個標準差外。
+    Means "enter only when this model is unusually confident", rather than "wait for a
+    prediction larger than market noise", which no real next-bar predictor produces:
+    its output std is about σ × √R², i.e. 0.1-0.2σ at a few percent R², so requiring
+    |prediction| > 1σ means waiting for a 5-10 std outlier of its own distribution.
 
-    樣本不足時回傳 None-like 行為 (source="insufficient")，由 Composite
-    決定要不要退回其他政策。
+    With too few samples it returns source="insufficient" and the fallback chain
+    decides what to use.
     """
 
     def __init__(self, quantile: float = 0.85, min_samples: int = 40):
@@ -176,25 +176,24 @@ class QuantileThresholdPolicy(ThresholdPolicy):
             return ThresholdDecision(
                 float("inf"),
                 "insufficient",
-                f"樣本 {len(hist)}/{self._min_samples}",
+                f"{len(hist)}/{self._min_samples} samples",
             )
         value = float(np.quantile(hist, self._q))
         if not np.isfinite(value) or value <= 0:
-            return ThresholdDecision(float("inf"), "insufficient", "分位數退化為 0")
+            return ThresholdDecision(float("inf"), "insufficient", "quantile is 0")
         return ThresholdDecision(
             value,
             "quantile",
-            f"P{self._q * 100:.0f} of {len(hist)} 筆歷史",
+            f"P{self._q * 100:.0f} of {len(hist)} samples",
         )
 
 
 class CostFloorThresholdPolicy(ThresholdPolicy):
     """
-    Decorator：在內層政策之上套一個交易成本地板。
+    Wraps another policy with a trading-cost floor.
 
-    這一層是安全閥，不是優化。少了它，分位數政策會忠實地讓系統在
-    「模型輸出 0.06% 而來回成本 0.05%」的情況下持續開單 —— 那不是交易，
-    是把資金餵給價差。
+    A safety valve: without it the quantile policy would keep trading when the model
+    predicts 0.06% and the round trip costs 0.05%, which just pays the spread.
     """
 
     def __init__(self, inner: ThresholdPolicy, absolute_floor: float):
@@ -209,7 +208,7 @@ class CostFloorThresholdPolicy(ThresholdPolicy):
         return ThresholdDecision(
             floor,
             "cost_floor",
-            f"{inner.source} 給出 {inner.value * 100:.3f}%，低於成本地板 {floor * 100:.3f}%",
+            f"{inner.source} gave {inner.value * 100:.3f}%, below the cost floor {floor * 100:.3f}%",
         )
 
     @property
@@ -219,14 +218,14 @@ class CostFloorThresholdPolicy(ThresholdPolicy):
 
 class FallbackThresholdPolicy(ThresholdPolicy):
     """
-    Composite：依序嘗試，第一個給出有限值的獲勝。
-    冷啟動時分位數政策樣本不足，自動退回 σ 政策 —— 保守但不會誤開單。
+    Tries policies in order; the first finite value wins.
+    On cold start the quantile policy lacks samples and the σ policy takes over.
     """
 
     def __init__(self, policies: Sequence[ThresholdPolicy]):
         self._policies = list(policies)
         if not self._policies:
-            raise ValueError("FallbackThresholdPolicy 至少需要一個政策")
+            raise ValueError("FallbackThresholdPolicy needs at least one policy")
 
     def compute(self, ctx: ThresholdContext) -> ThresholdDecision:
         last = None
@@ -234,12 +233,16 @@ class FallbackThresholdPolicy(ThresholdPolicy):
             try:
                 decision = policy.compute(ctx)
             except Exception as e:
-                logger.error(f"[{ctx.symbol}] {policy.name} 違反契約拋出例外: {e}")
+                logger.error(
+                    f"[{ctx.symbol}] {policy.name} raised, breaking its contract: {e}"
+                )
                 continue
             last = decision
             if np.isfinite(decision.value):
                 return decision
-        return last or ThresholdDecision(float("inf"), "none", "所有政策皆無法給出門檻")
+        return last or ThresholdDecision(
+            float("inf"), "none", "no policy produced a threshold"
+        )
 
     @property
     def name(self) -> str:
@@ -248,15 +251,11 @@ class FallbackThresholdPolicy(ThresholdPolicy):
 
 class CollapseDetector:
     """
-    偵測「模型輸出已退化成常數」。
+    Detects model output that has collapsed to a constant.
 
-    這是 2026-08-07 日誌暴露出來的真正病灶：LSTM 與 Transformer 對同一檔標的，
-    在一整個交易日的 33~34 次掃描中輸出「完全相同的單一數值」 ——
-    連 5 分 K 標的也是如此，儘管輸入每根 K 線都在變。
-
-    成因是以 MSE 迴歸次根 K 線對數報酬：報酬近似不可預測時，讓損失最小的常數解
-    就是樣本平均 (≈0)，網路會直接收斂到那裡。這種失效不會拋例外、不會有 NaN，
-    模型照樣輸出數字，只是那個數字沒有資訊 —— 必須主動偵測。
+    Regressing next-bar log returns with MSE lets a network settle on the sample mean
+    (about 0) when returns are nearly unpredictable. It then outputs the same value every
+    scan, with no exception or NaN, so it has to be detected explicitly.
     """
 
     def __init__(
@@ -278,7 +277,7 @@ class CollapseDetector:
                 n,
                 float("nan"),
                 float("nan"),
-                f"樣本不足 ({n}/{self._min_samples})，暫不判定",
+                f"too few samples ({n}/{self._min_samples}); not judging yet",
             )
 
         dispersion = float(np.std(values))
@@ -290,7 +289,7 @@ class CollapseDetector:
                 n,
                 dispersion,
                 unique_ratio,
-                f"預測標準差 {dispersion:.2e} ≈ 0，輸出已退化成常數",
+                f"prediction std {dispersion:.2e} ≈ 0; output collapsed to a constant",
             )
         if unique_ratio <= self._unique_floor:
             return CollapseReport(
@@ -298,19 +297,19 @@ class CollapseDetector:
                 n,
                 dispersion,
                 unique_ratio,
-                f"{n} 次預測僅 {int(unique_ratio * n)} 個相異值",
+                f"only {int(unique_ratio * n)} distinct values in {n} predictions",
             )
-        return CollapseReport(False, n, dispersion, unique_ratio, "輸出具備變異")
+        return CollapseReport(False, n, dispersion, unique_ratio, "output varies")
 
 
 def build_threshold_policy(config) -> ThresholdPolicy:
     """
-    Composition Root 使用。依 config.yaml 組出門檻政策。
+    Composition root. Builds the threshold policy from config.yaml.
 
-    預設鏈：CostFloor( Fallback( Quantile, Sigma ) )
-      - 有足夠歷史 -> 用預測分布的分位數
-      - 冷啟動     -> 退回 σ 政策 (保守)
-      - 兩者都不得低於交易成本地板
+    Default chain: CostFloor(Fallback(Quantile, Sigma))
+        - enough history -> quantile of the prediction distribution
+        - cold start     -> σ policy (conservative)
+        - neither may go below the trading-cost floor
     """
     s = config.get("threshold_settings") or {}
     mode = str(s.get("mode", "quantile")).lower()
@@ -341,7 +340,7 @@ def build_threshold_policy(config) -> ThresholdPolicy:
             inner = FallbackThresholdPolicy([quantile_policy, sigma_policy])
 
     return CostFloorThresholdPolicy(
-        inner, absolute_floor=float(s.get("cost_floor_pct"))
+        inner, absolute_floor=float(s.get("cost_floor_pct", 0.0003))
     )
 
 

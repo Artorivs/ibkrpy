@@ -20,7 +20,7 @@ TERM_BARS = {
 
 @dataclass
 class PredictionRecord:
-    """一次掃描產生的完整快照。欄位刻意齊全 —— 事後想切哪個維度都切得動。"""
+    """Full snapshot of one scan. Fields are deliberately complete so any dimension can be sliced later."""
 
     symbol: str
     timestamp: str
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS prediction_ledger (
     benchmark TEXT,
     reversal_risk REAL,
     model_generation TEXT,
-    -- 以下由 resolve() 事後回填
+    -- Filled in later by resolve()
     realized_return REAL,
     realized_price REAL,
     resolved_at DATETIME,
@@ -82,10 +82,9 @@ _INDEXES = [
 
 class PredictionLedger:
     """
-    契約: record() 永不拋例外、永不阻塞交易迴圈。
-
-    帳本壞掉不該讓系統停止交易；反過來，交易迴圈的例外也不該讓帳本漏記。
-    因此所有寫入都包在 try 裡並只記 log。
+    Contract: record() never raises and never blocks the trading loop.
+    A broken ledger must not stop trading, and trading-loop errors must not drop ledger
+    rows, so every write is wrapped in try and only logged.
     """
 
     def __init__(self, db_path: str, enabled: bool = True):
@@ -116,7 +115,7 @@ class PredictionLedger:
                     conn.execute(idx)
                 conn.commit()
         except Exception as e:
-            logger.error(f"預測帳本初始化失敗，已停用: {e}")
+            logger.error(f"Prediction ledger init failed; disabled: {e}")
             self.enabled = False
 
     _INSERT = """
@@ -155,8 +154,8 @@ class PredictionLedger:
 
     def record_many(self, recs: List["PredictionRecord"]) -> None:
         """
-        一次寫入多筆。交易迴圈每輪掃 39 檔，逐筆開連線等於每輪開 39 次;
-        累積一輪後一次寫入，連線成本降到 1/39。回填與匯入也用這條路徑。
+        Write several rows in one connection (one per loop instead of one per symbol).
+        Backfill and import use the same path.
         """
         if not self.enabled or not recs:
             return
@@ -165,12 +164,14 @@ class PredictionLedger:
                 conn.executemany(self._INSERT, [self._row(r) for r in recs])
                 conn.commit()
         except Exception as e:
-            logger.warning(f"預測帳本批次寫入失敗 (不影響交易): {e}")
+            logger.warning(
+                f"Prediction ledger batch write failed (trading unaffected): {e}"
+            )
 
     def record(self, rec: PredictionRecord) -> None:
         """
-        掃描時呼叫。HOLD 也要記 —— 被門檻擋掉的預測正是用來判斷
-        「門檻是否設得太高」的樣本，只記成交過的單會產生嚴重的選擇偏差。
+        Called on every scan. HOLDs are recorded too: predictions blocked by the threshold
+        are the samples that show whether it is too high; logging only fills is biased.
         """
         if not self.enabled:
             return
@@ -179,14 +180,16 @@ class PredictionLedger:
                 conn.execute(self._INSERT, self._row(rec))
                 conn.commit()
         except Exception as e:
-            logger.warning(f"[{rec.symbol}] 預測帳本寫入失敗 (不影響交易): {e}")
+            logger.warning(
+                f"[{rec.symbol}] Prediction ledger write failed (trading unaffected): {e}"
+            )
 
     def resolve(self, max_rows: int = 20000) -> Dict[str, int]:
         """
-        用 market_data 的 K 線把 realized_return 補上。可重複執行，只處理未回填的列。
+        Fill realized_return from market_data bars. Idempotent; only unresolved rows are touched.
 
-        對每一筆未回填的預測，取「預測時刻之後第 horizon_bars 根」的收盤價。
-        若那根還沒出現 (時間未到、或資料尚未下載) 就先跳過，下次再試。
+        Each prediction uses the close horizon_bars bars after the prediction time. If that
+        bar is not there yet (too early or not downloaded) the row is skipped until next time.
         """
         if not self.enabled:
             return {"resolved": 0, "pending": 0, "expired": 0}
@@ -248,7 +251,7 @@ class PredictionLedger:
                     )
                     conn.commit()
         except Exception as e:
-            logger.error(f"預測帳本回填失敗: {e}")
+            logger.error(f"Prediction ledger backfill failed: {e}")
         return stats
 
     @staticmethod
@@ -278,22 +281,22 @@ class PredictionLedger:
                 rows = [dict(r) for r in conn.execute(q, params).fetchall()]
             return rows if len(rows) >= min_rows else rows
         except Exception as e:
-            logger.error(f"預測帳本讀取失敗: {e}")
+            logger.error(f"Prediction ledger read failed: {e}")
             return []
 
 
 def measure(rows: List[dict], min_samples: int = 30) -> Optional[dict]:
     """
-    給定已回填的樣本，算出邊際的三個關鍵數字。
+    The three key edge statistics for resolved samples.
 
-    hit_rate  方向命中率。0.5 代表擲硬幣。
-    ic        預測與實際的相關係數 (Information Coefficient)。
-              量化界的經驗值: 0.03-0.05 已算可用，0.10 以上很強。
-    slope     以實際對預測做迴歸的斜率。這是校準係數 ——
-              斜率 0.4 表示「實際只走了預測的 4 成」，方向有訊息但幅度被壓縮，
-              把預測乘以 1/0.4 才是無偏估計。斜率 ~0 表示沒有邊際。
+    hit_rate  Directional hit rate; 0.5 is a coin flip.
+    ic        Correlation between predicted and realized (information coefficient).
+                        Rule of thumb: 0.03-0.05 is usable, above 0.10 is strong.
+    slope     Slope of realized on predicted, i.e. the calibration coefficient.
+                        0.4 means realized moves are 40% of predicted: direction is informative
+                        but magnitude is compressed. A slope near 0 means no edge.
 
-    另外回傳 slope 的標準誤與 t 值，因為斜率為正但不顯著等於沒有結論。
+    Also returns the slope's standard error and t-stat; a positive but insignificant slope is no conclusion.
     """
     pred = [float(r["predicted_return"]) for r in rows]
     real = [float(r["realized_return"]) for r in rows]
@@ -342,15 +345,11 @@ def measure(rows: List[dict], min_samples: int = 30) -> Optional[dict]:
 
 def weight_fingerprint(weights_dir: str, symbols=None) -> str:
     """
-    權重檔的指紋 (檔名 + 大小 + mtime 的雜湊前 12 碼)。
+    Fingerprint of the weight files (first 12 hex chars of a hash of name, size, mtime).
 
-    為什麼要記這個
-    --------------
-    收集樣本期間模型必須不變，否則同一份樣本會混入兩個世代，
-    匯總斜率就沒有意義。凍結開關是第一道防線，但它擋不住手動
-    --mode train、還原備份、或另一台機器同步過來的權重。
-    把指紋記進每一筆預測，事後至少能把樣本切開 ——
-    「悄悄混在一起」比「分成兩段」危險得多。
+    Stored with every prediction so samples from different model generations can be
+    separated. The freeze switch cannot stop a manual --mode train, a restored backup or
+    synced weights, and silently pooling two generations makes the slope meaningless.
     """
     import hashlib
 
@@ -369,7 +368,7 @@ def weight_fingerprint(weights_dir: str, symbols=None) -> str:
             return "no-weights"
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
     except Exception as e:
-        logger.debug(f"權重指紋計算失敗: {e}")
+        logger.debug(f"Weight fingerprint failed: {e}")
         return "unknown"
 
 
@@ -377,13 +376,12 @@ def required_samples(
     pred_std: float, resid_std: float, slope: float, t_target: float = 2.0
 ) -> Optional[int]:
     """
-    要在 |t| ≥ t_target 的水準上偵測到給定斜率，需要幾筆樣本。
+    Samples needed to detect a given slope at |t| ≥ t_target.
 
-    這個函式的存在是因為「沒偵測到」和「不存在」是兩回事。
-    以本系統的實際數量級 (預測 std ≈ 0.4%、日報酬 std ≈ 1.8%)，
-    真斜率 0.40 需要約 500 筆才看得出來 —— 單一標的每日一筆要等兩年，
-    但 37 檔匯總只要 14 個交易日。所以分析必須「先匯總、後分檔」，
-    否則會把樣本不足誤讀成沒有邊際，然後做出錯誤的重訓決定。
+    Not detecting an edge is not the same as no edge. With prediction std ≈ 0.4% and
+    daily return std ≈ 1.8%, a true slope of 0.40 needs about 500 samples: two years for
+    one symbol at one per day, but about 14 trading days pooled over 37 symbols. Analyse
+    pooled first, then per symbol.
     """
     try:
         if pred_std <= 0 or slope <= 0 or resid_std <= 0:
@@ -394,7 +392,7 @@ def required_samples(
 
 
 def power_note(stats: Optional[dict], slope_of_interest: float = 0.3) -> str:
-    """在斜率不顯著時，說明「還需要多少樣本」而不是逕自宣告沒有邊際。"""
+    """When the slope is insignificant, say how many more samples are needed instead of declaring no edge."""
     if not stats or stats.get("degenerate"):
         return ""
     se, n = stats.get("slope_se"), stats.get("n", 0)
@@ -404,45 +402,45 @@ def power_note(stats: Optional[dict], slope_of_interest: float = 0.3) -> str:
     if need <= n:
         return ""
     return (
-        f"\n  -> 檢定力: 目前 n={n} 只能偵測到 |斜率| ≥ {2 * se:.2f}。"
-        f"若真實斜率是 {slope_of_interest:.2f}，需約 {need:,} 筆才會顯著"
-        f" (再等 {need - n:,} 筆)。「沒偵測到」不等於「不存在」。"
+        f"\n  -> Power: with n={n} only |slope| ≥ {2 * se:.2f} is detectable. "
+        f"If the true slope is {slope_of_interest:.2f}, about {need:,} samples are needed"
+        f" ({need - n:,} more). Not detected does not mean absent."
     )
 
 
 def verdict(stats: Optional[dict]) -> str:
-    """把數字翻成一句可以據以行動的話。"""
+    """Turn the numbers into one actionable sentence."""
     if stats is None:
-        return "樣本不足，尚無法判斷。"
+        return "Not enough samples to judge yet."
     if stats.get("degenerate"):
-        return f"n={stats['n']}，但預測或實際完全沒有變異 —— 模型可能已塌陷成常數。"
+        return f"n={stats['n']}, but predictions or outcomes have no variance; the model may have collapsed to a constant."
 
     t = stats.get("slope_t", float("nan"))
     slope, ic, hr, n = stats["slope"], stats["ic"], stats["hit_rate"], stats["n"]
     head = (
-        f"n={n} · 命中率 {hr * 100:.1f}% · IC {ic:+.3f} · "
-        f"斜率 {slope:+.3f} (t={t:+.2f})"
+        f"n={n} · hit rate {hr * 100:.1f}% · IC {ic:+.3f} · "
+        f"slope {slope:+.3f} (t={t:+.2f})"
     )
 
     if not math.isfinite(t) or abs(t) < 2.0:
         return (
-            f"{head}\n  -> 斜率與 0 無法區分 (|t| < 2)。目前沒有證據顯示存在邊際。"
+            f"{head}\n  -> Slope is indistinguishable from 0 (|t| < 2). No evidence of edge yet."
             + power_note(stats)
         )
     if slope <= 0:
         return (
-            f"{head}\n  -> 斜率顯著為負。預測方向與實際相反 —— "
-            f"先確認目標定義與資料對齊有無錯誤，不要急著反向操作。"
+            f"{head}\n  -> Slope is significantly negative: predictions point the wrong way. "
+            f"Check the target definition and data alignment before trading the reverse."
         )
     shrink = 1.0 / slope if slope > 0 else float("inf")
     return (
-        f"{head}\n  -> 斜率顯著為正: 方向有訊息，幅度被壓縮約 {shrink:.1f} 倍。"
-        f"把預測乘以 {shrink:.2f} 才是無偏估計；門檻應據此重新設定。"
+        f"{head}\n  -> Slope is significantly positive: direction is informative, magnitude is compressed about {shrink:.1f}x."
+        f" Multiply predictions by {shrink:.2f} for an unbiased estimate and reset thresholds accordingly."
     )
 
 
 def build_prediction_ledger(db_path: str, config=None) -> PredictionLedger:
-    """Composition Root 使用。"""
+    """Used by the composition root."""
     enabled = True
     if config is not None:
         try:

@@ -1,5 +1,4 @@
-# tests/test_db_manager.py
-# 執行: python -m unittest discover -s tests
+# Run: python -m unittest discover -s tests
 
 import os
 import tempfile
@@ -32,7 +31,6 @@ class MarketDataRoundTripTests(unittest.TestCase):
         self.db = DatabaseManager(os.path.join(self.tmp, "t.db"))
 
     def test_save_then_load_keeps_ohlcv(self):
-        # 回歸測試：v0.5.3-beta 把欄位改名方向寫反，只剩 3 欄，8 個佔位符的 INSERT 失敗
         df = bars(["2024-01-02", "2024-01-03", "2024-01-04"])
         self.db.save_bulk_market_data("SPY", df)
         out = self.db.get_market_data_sync("SPY")
@@ -42,7 +40,6 @@ class MarketDataRoundTripTests(unittest.TestCase):
             self.assertIn(col, out.columns)
 
     def test_load_drops_duplicate_timestamps(self):
-        # 回歸測試：v0.5.3-beta 的遮罩算在 set_index 之前的 RangeIndex 上，永遠不去重
         def row(ts, close):
             return {
                 "timestamp": ts,

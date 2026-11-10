@@ -1,5 +1,5 @@
 # ibkrpy/shared/system_log.py
-# 統一處理系統日誌輸出與嚴重錯誤警報 (支援 Zero-Blocking 非阻塞架構)
+# Logging setup and throttled critical-error email alerts
 
 import logging
 import os
@@ -24,13 +24,13 @@ _log_listener = None
 
 class RateLimitFilter(logging.Filter):
     """
-    同一個發生點在時間窗內只放行一次，並在下次放行時附上被抑制的次數。
+    Lets each call site through once per time window, and reports how many were suppressed.
 
-    email 警報最常見的失效方式不是漏發，而是轟炸：某個每 5 分鐘執行一次的
-    迴圈開始持續失敗，一夜之間寄出上百封相同內容的信，收件人就會設規則
-    全部歸檔 —— 接著真正的問題發生時也沒人看見。
+    Email alerts usually fail by flooding, not by silence: a loop that fails every
+    5 minutes sends hundreds of identical emails overnight, the recipient filters
+    them, and the real incident goes unseen.
 
-    以 (模組, 行號, 等級) 為鍵，而非訊息內容，因為訊息通常含有變動的例外文字。
+    Keyed on (module, line, level), not message text, which often varies.
     """
 
     def __init__(self, interval_seconds: int = 1800):
@@ -52,7 +52,7 @@ class RateLimitFilter(logging.Filter):
 
         n = self._suppressed.pop(key, 0)
         if n:
-            record.msg = f"{record.getMessage()}\n\n[同一位置在過去 {self.interval // 60} 分鐘內另有 {n} 次相同等級的事件被抑制]"
+            record.msg = f"{record.getMessage()}\n\n[{n} more events at this location and level suppressed in the last {self.interval // 60} min]"
             record.args = ()
 
         self._last[key] = now
@@ -63,11 +63,11 @@ def setup_logger(
     config: Dict[str, Any] = None, enable_file: bool = True
 ) -> logging.Logger:
     """
-    初始化全域日誌系統。
+    Initialize logging.
 
-    :param config: config.yaml 中 log_settings 區塊的內容 (dict)。
-                   例如 ConfigManager().get("log_settings")
-    :param enable_file: 是否掛載檔案 handler。
+    :param config: the log_settings block of config.yaml (dict),
+                                  e.g. ConfigManager().get("log_settings")
+    :param enable_file: whether to attach the file handler.
     """
     global _log_listener
     cfg = config or {}
@@ -112,14 +112,14 @@ def setup_logger(
         missing = [k for k in required if not cfg.get(k)]
         if missing:
             logging.getLogger("ibkrpy").error(
-                f"已啟用 email 警報，但 log_settings 缺少必要欄位: {missing}，警報未生效。"
+                f"Email alerts are enabled but log_settings is missing: {missing}; alerts are off."
             )
         else:
             mail_handler = SMTPHandler(
                 mailhost=(cfg["smtp_server"], cfg.get("smtp_port", 587)),
                 fromaddr=cfg["sender_email"],
                 toaddrs=[cfg["receiver_email"]],
-                subject="[Trading Bot Alert] 系統發生嚴重異常",
+                subject="[Trading Bot Alert] Critical error",
                 credentials=(cfg["sender_email"], cfg["sender_password"]),
                 secure=(),
             )

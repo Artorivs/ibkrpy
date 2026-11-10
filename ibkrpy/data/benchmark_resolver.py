@@ -1,5 +1,5 @@
 # ibkrpy/data/benchmark_resolver.py
-# 每檔標的的 benchmark (基準 ETF) 選擇邏輯
+# Per-symbol benchmark ETF selection
 
 import json
 import logging
@@ -16,7 +16,7 @@ logger = logging.getLogger("ibkrpy.benchmark")
 
 @dataclass(frozen=True)
 class AssetClassification:
-    """標的的產業分類。兩個欄位都可能是 None (資料來源沒有涵蓋該標的)。"""
+    """Industry classification of a symbol. Either field may be None when the source lacks the symbol."""
 
     sector: Optional[str] = None
     industry: Optional[str] = None
@@ -26,14 +26,14 @@ class AssetClassification:
 
 
 class ClassificationProvider(ABC):
-    """提供標的的產業分類。單一方法，避免強迫實作者處理用不到的介面 (ISP)。"""
+    """Provides industry classification for a symbol."""
 
     @abstractmethod
     def classify(self, symbol: str) -> AssetClassification: ...
 
 
 class ReturnsProvider(ABC):
-    """提供對數報酬序列，供相關性計算使用。回傳 None 代表資料不足。"""
+    """Provides log-return series for correlation. Returns None when data is insufficient."""
 
     @abstractmethod
     def get_returns(
@@ -42,14 +42,14 @@ class ReturnsProvider(ABC):
 
 
 class BenchmarkReader(ABC):
-    """只讀介面。實盤路徑只需要這個 (ISP)。"""
+    """Read-only interface used by the live path."""
 
     @abstractmethod
     def get(self, symbol: str) -> Optional[str]: ...
 
 
 class BenchmarkWriter(ABC):
-    """只寫介面。只有訓練路徑需要這個 (ISP)。"""
+    """Write-only interface used by the training path."""
 
     @abstractmethod
     def set(self, symbol: str, benchmark: str) -> None: ...
@@ -66,7 +66,7 @@ class BenchmarkResolver(ABC):
 
 
 class PinnedBenchmarkResolver(BenchmarkResolver):
-    """讀取訓練階段鎖定的選擇"""
+    """Read the choice locked in during training."""
 
     def __init__(self, reader: BenchmarkReader):
         self._reader = reader
@@ -75,7 +75,7 @@ class PinnedBenchmarkResolver(BenchmarkResolver):
         try:
             pinned = self._reader.get(symbol)
         except Exception as e:
-            logger.warning(f"[{symbol}] 讀取已鎖定的 benchmark 失敗: {e}")
+            logger.warning(f"[{symbol}] Failed to read locked benchmark: {e}")
             return None
         if pinned and pinned != symbol:
             return pinned
@@ -83,7 +83,7 @@ class PinnedBenchmarkResolver(BenchmarkResolver):
 
 
 class ExplicitMapResolver(BenchmarkResolver):
-    """使用者在 config.yaml 明確指定的對應"""
+    """Explicit mapping from config.yaml."""
 
     def __init__(self, mapping: Dict[str, str] = None):
         self._map = {str(k).upper(): str(v).upper() for k, v in (mapping or {}).items()}
@@ -94,7 +94,7 @@ class ExplicitMapResolver(BenchmarkResolver):
 
 
 class SectorEtfResolver(BenchmarkResolver):
-    """依產業分類挑選對應的板塊 ETF"""
+    """Pick the sector ETF matching the industry classification."""
 
     DEFAULT_SECTOR_MAP = {
         "TECHNOLOGY": "XLK",
@@ -150,7 +150,7 @@ class SectorEtfResolver(BenchmarkResolver):
         try:
             cls = self._classifier.classify(symbol)
         except Exception as e:
-            logger.warning(f"[{symbol}] 產業分類查詢失敗: {e}")
+            logger.warning(f"[{symbol}] Classification lookup failed: {e}")
             return None
 
         if cls.is_empty():
@@ -160,7 +160,7 @@ class SectorEtfResolver(BenchmarkResolver):
             hit = self._industry_map.get(cls.industry.strip().upper())
             if hit and hit != symbol:
                 logger.debug(
-                    f"[{symbol}] 依 industry='{cls.industry}' 選定 benchmark {hit}"
+                    f"[{symbol}] Benchmark {hit} chosen by industry='{cls.industry}'"
                 )
                 return hit
 
@@ -168,7 +168,7 @@ class SectorEtfResolver(BenchmarkResolver):
             hit = self._sector_map.get(cls.sector.strip().upper())
             if hit and hit != symbol:
                 logger.debug(
-                    f"[{symbol}] 依 sector='{cls.sector}' 選定 benchmark {hit}"
+                    f"[{symbol}] Benchmark {hit} chosen by sector='{cls.sector}'"
                 )
                 return hit
 
@@ -176,7 +176,7 @@ class SectorEtfResolver(BenchmarkResolver):
 
 
 class CorrelationBenchmarkResolver(BenchmarkResolver):
-    """從候選池中挑出與該標的歷史報酬相關性最高的一檔"""
+    """Pick the candidate whose historical returns correlate most with the symbol."""
 
     def __init__(
         self,
@@ -198,7 +198,7 @@ class CorrelationBenchmarkResolver(BenchmarkResolver):
         try:
             target = self._returns.get_returns(symbol, self._timeframe, self._lookback)
         except Exception as e:
-            logger.warning(f"[{symbol}] 讀取報酬序列失敗: {e}")
+            logger.warning(f"[{symbol}] Failed to read return series: {e}")
             return None
 
         if target is None or len(target) < self._min_obs:
@@ -232,22 +232,22 @@ class CorrelationBenchmarkResolver(BenchmarkResolver):
 
         if best_corr < self._min_corr:
             logger.debug(
-                f"[{symbol}] 候選池中最佳相關性僅 {best_corr:.2f} "
-                f"(低於門檻 {self._min_corr:.2f})，放棄以相關性選擇。"
+                f"[{symbol}] Best candidate correlation is only {best_corr:.2f} "
+                f"(below threshold {self._min_corr:.2f}); skipping correlation-based choice."
             )
             return None
 
         logger.debug(
-            f"[{symbol}] 依相關性選定 benchmark {best_symbol} (ρ={best_corr:.2f})"
+            f"[{symbol}] Benchmark {best_symbol} chosen by correlation (ρ={best_corr:.2f})"
         )
         return best_symbol
 
 
 class StaticBenchmarkResolver(BenchmarkResolver):
     """
-    終端 resolver：永遠給得出答案，讓 Chain 保證有結果。
-    若預設值恰好就是該標的自己 (例如 QQQ 本身也在資產池中)，
-    改用備援代碼，避免 bench_correlation 恆等於 1。
+    Terminal resolver that always returns an answer. If the default is the symbol itself
+    (e.g. QQQ is in the asset pool), the fallback is used so bench_correlation is not
+    identically 1.
     """
 
     def __init__(
@@ -266,24 +266,26 @@ class StaticBenchmarkResolver(BenchmarkResolver):
 
 class ChainedBenchmarkResolver(BenchmarkResolver):
     """
-    Composite / Chain of Responsibility。依序詢問，第一個給出答案的獲勝。
+    Chain of responsibility: resolvers are asked in order and the first answer wins.
     """
 
     def __init__(self, resolvers: Sequence[BenchmarkResolver]):
         self._resolvers = list(resolvers)
         if not self._resolvers:
-            raise ValueError("ChainedBenchmarkResolver 至少需要一個 resolver")
+            raise ValueError("ChainedBenchmarkResolver needs at least one resolver")
 
     def resolve(self, symbol: str) -> Optional[str]:
         for resolver in self._resolvers:
             try:
                 result = resolver.resolve(symbol)
             except Exception as e:
-                logger.error(f"[{symbol}] {resolver.name} 違反契約拋出例外: {e}")
+                logger.error(
+                    f"[{symbol}] {resolver.name} raised, breaking its contract: {e}"
+                )
                 continue
             if result:
                 logger.debug(
-                    f"[{symbol}] benchmark = {result} (由 {resolver.name} 決定)"
+                    f"[{symbol}] benchmark = {result} (decided by {resolver.name})"
                 )
                 return result
         return None
@@ -291,8 +293,8 @@ class ChainedBenchmarkResolver(BenchmarkResolver):
 
 class CachingBenchmarkResolver(BenchmarkResolver):
     """
-    Decorator。快取不是「選擇」的職責，因此獨立成一層 (SRP)。
-    相關性計算會掃資料庫，沒有快取的話每個 tick 都會重算。
+    Caching decorator. Correlation scans the database, so without a cache it would rerun
+    every tick.
     """
 
     def __init__(self, inner: BenchmarkResolver):
@@ -317,7 +319,7 @@ class CachingBenchmarkResolver(BenchmarkResolver):
 
 
 class StaticClassificationProvider(ClassificationProvider):
-    """由 config.yaml 直接提供分類。也是單元測試最方便的替身。"""
+    """Classification supplied directly by config.yaml; also the simplest test double."""
 
     def __init__(self, table: Dict[str, Dict[str, str]] = None):
         self._table = {
@@ -333,8 +335,8 @@ class StaticClassificationProvider(ClassificationProvider):
 
 class FmpCacheClassificationProvider(ClassificationProvider):
     """
-    讀取 pipeline_manager 已經在抓的 weights/fmp_cache.json。
-    這些欄位本來就存在 (best_params['fmp_sector'])，只是從未被用來選 benchmark。
+    Reads weights/fmp_cache.json, which pipeline_manager already fetches
+    (best_params['fmp_sector']).
     """
 
     def __init__(self, cache_path: str):
@@ -354,7 +356,7 @@ class FmpCacheClassificationProvider(ClassificationProvider):
                     self._data = json.load(f) or {}
                 self._mtime = mtime
             except Exception as e:
-                logger.warning(f"FMP 快取讀取失敗 ({self._path}): {e}")
+                logger.warning(f"Failed to read FMP cache ({self._path}): {e}")
                 self._data = {}
         return self._data
 
@@ -368,7 +370,7 @@ class FmpCacheClassificationProvider(ClassificationProvider):
 
 
 class AssetProfileClassificationProvider(ClassificationProvider):
-    """從 config.yaml 的 assets[].tags 推導分類。"""
+    """Derive classification from assets[].tags in config.yaml."""
 
     def __init__(
         self,
@@ -406,7 +408,7 @@ class AssetProfileClassificationProvider(ClassificationProvider):
 
 
 class CompositeClassificationProvider(ClassificationProvider):
-    """依序詢問多個來源，補齊彼此缺漏的欄位。"""
+    """Ask several sources in order, filling each other's missing fields."""
 
     def __init__(self, providers: Sequence[ClassificationProvider]):
         self._providers = list(providers)
@@ -427,8 +429,8 @@ class CompositeClassificationProvider(ClassificationProvider):
 
 class DatabaseReturnsProvider(ReturnsProvider):
     """
-    把 DatabaseManager 接到 ReturnsProvider 埠上。
-    CorrelationBenchmarkResolver 因此完全不需要知道底層是 SQLite。
+    Adapts DatabaseManager to the ReturnsProvider port, so
+    CorrelationBenchmarkResolver does not depend on SQLite.
     """
 
     def __init__(self, db_manager, cache_enabled: bool = True):
@@ -467,8 +469,8 @@ class DatabaseReturnsProvider(ReturnsProvider):
 
 class ManifestBenchmarkReader(BenchmarkReader):
     """
-    從 DataPipeline 的特徵清單 (weights/training_artifacts.json 內的 manifest)
-    讀出訓練時實際使用的 benchmark。
+    Reads the benchmark actually used in training from the DataPipeline feature
+    manifest (weights/training_artifacts.json).
     """
 
     def __init__(self, data_pipeline):
@@ -489,8 +491,8 @@ class ManifestBenchmarkReader(BenchmarkReader):
 
 class JsonBenchmarkStore(BenchmarkReader, BenchmarkWriter):
     """
-    把訓練階段的決定落盤到 weights/benchmark_map.json。
-    同時實作讀寫兩個介面，但消費端各自只依賴自己需要的那一個。
+    Persists training-time choices to weights/benchmark_map.json. Implements both the
+    reader and writer interfaces; each consumer depends only on the one it needs.
     """
 
     def __init__(self, path: str):
@@ -511,7 +513,7 @@ class JsonBenchmarkStore(BenchmarkReader, BenchmarkWriter):
                     self._data = json.load(f) or {}
                 self._mtime = mtime
             except Exception as e:
-                logger.warning(f"benchmark 對應表讀取失敗: {e}")
+                logger.warning(f"Failed to read benchmark map: {e}")
                 self._data = {}
         return self._data
 
@@ -528,14 +530,14 @@ class JsonBenchmarkStore(BenchmarkReader, BenchmarkWriter):
             self._data = data
             self._mtime = os.path.getmtime(self._path)
         except Exception as e:
-            logger.error(f"benchmark 對應表寫入失敗: {e}")
+            logger.error(f"Failed to write benchmark map: {e}")
 
     def as_dict(self) -> Dict[str, str]:
         return dict(self._load())
 
 
 class NullBenchmarkStore(BenchmarkReader, BenchmarkWriter):
-    """空實作。回測或測試時不希望污染 weights/ 目錄。"""
+    """No-op store for backtests and tests, so weights/ is left untouched."""
 
     def get(self, symbol: str) -> Optional[str]:
         return None
@@ -578,18 +580,15 @@ def build_benchmark_resolver(
     data_pipeline=None,
 ) -> BenchmarkResolver:
     """
-    Composition Root 的輔助函式：依 config.yaml 組出完整的 resolver 鏈。
+    Build the full resolver chain from config.yaml.
 
-    刻意做成模組層級的函式而不是類別方法 —— 組裝是應用層的職責，
-    不屬於任何一個 resolver。這樣每個 resolver 都能單獨被測試與重用。
-
-    優先順序：
-      1. 訓練時寫進特徵清單的選擇 (最高權威：權重就是配著它訓練的)
-      2. benchmark_map.json 的紀錄
-      3. config 明確指定
-      4. 產業 / 板塊 ETF 對應
-      5. 歷史報酬相關性
-      6. 全域預設值 (終端，保證有答案)
+    Priority:
+      1. Choice recorded in the training feature manifest (the weights were trained with it)
+      2. benchmark_map.json
+      3. Explicit config mapping
+      4. Industry / sector ETF mapping
+      5. Historical return correlation
+      6. Global default (terminal, always answers)
     """
     settings = config.get("benchmark_settings") or {}
     default_symbol = settings.get("default") or config.get(
@@ -652,8 +651,7 @@ def distinct_benchmarks(
     resolver: BenchmarkResolver, symbols: Sequence[str]
 ) -> Dict[str, str]:
     """
-    批次解析。資料下載階段需要知道「總共要多抓哪幾檔 ETF」。
-    放在模組層級而非塞進介面，是為了讓 BenchmarkResolver 維持單一方法 (ISP)。
+    Resolve many symbols at once; the download step needs the full set of benchmark ETFs.
     """
     mapping: Dict[str, str] = {}
     for symbol in symbols:

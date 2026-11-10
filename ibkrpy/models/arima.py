@@ -1,5 +1,5 @@
 # ibkrpy/models/arima.py
-# 專司時間序列之線性預測，善於捕捉趨勢與均值回歸特性。
+# Linear time-series forecaster (trend and mean reversion).
 
 import os
 import numpy as np
@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")
 
 
 class ARIMAModel:
-    """標準化 ARIMA 模型，對接 ModelOrchestrator 介面"""
+    """ARIMA model behind the ModelOrchestrator interface."""
 
     def __init__(
         self, p: int = 5, d: int = 1, q: int = 0, weights_dir: str = "weights"
@@ -22,7 +22,7 @@ class ARIMAModel:
         self.model_results: ARIMAResultsWrapper = None
 
     def load_weights(self, symbol: str):
-        """從整合包載入 ARIMA 模型狀態 (.pkl)"""
+        """Load the fitted ARIMA from the classical bundle (.pkl)."""
         file_path = os.path.join(self.weights_dir, f"{symbol}_classical.pkl")
 
         if os.path.exists(file_path):
@@ -30,18 +30,20 @@ class ARIMAModel:
                 bundle = joblib.load(file_path)
                 self.model_results = bundle.get("arima")
                 if self.model_results:
-                    print(f"[{symbol}] ARIMA 模型權重載入成功。")
+                    print(f"[{symbol}] ARIMA weights loaded.")
                 else:
-                    print(f"[{symbol}] 整合包內無 ARIMA 權重，將回退實時擬合。")
+                    print(f"[{symbol}] No ARIMA in the bundle; will fit on the fly.")
             except Exception as e:
-                print(f"[{symbol}] ARIMA 權重載入失敗: {e}，將回退至實時擬合。")
+                print(
+                    f"[{symbol}] Failed to load ARIMA weights: {e}; will fit on the fly."
+                )
         else:
             print(
-                f"[{symbol}] 找不到傳統模型整合包 ({file_path})，將在預測時進行實時擬合。"
+                f"[{symbol}] Classical bundle not found ({file_path}); will fit on the fly."
             )
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
-        """預測下一個時間步的價格"""
+        """Forecast the next bar's price."""
         if df.empty or "Close" not in df.columns:
             return 0.0
 
@@ -63,11 +65,11 @@ class ARIMAModel:
                 return float(forecast[0])
 
         except Exception as e:
-            print(f"ARIMA 預測失敗: {e}")
+            print(f"ARIMA forecast failed: {e}")
             return last_price
 
     def predict_volatility(self, df: pd.DataFrame) -> float:
-        """Fallback：計算歷史波動率 (ARIMA 本身不負責波動率)"""
+        """Fallback: historical volatility (ARIMA does not model volatility)."""
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
         vol = returns.tail(20).std() * np.sqrt(252) if len(returns) >= 20 else 0.02
         return float(vol)

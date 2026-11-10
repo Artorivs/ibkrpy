@@ -1,5 +1,5 @@
 # ibkrpy/manager/model_orchestrator.py
-# 專注於管理 ML 模型的記憶體生命週期、快取與預測分發，避免重複載入。
+# Manages model lifetime, caching and prediction dispatch, so weights load once.
 
 import os
 import pandas as pd
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class ModelOrchestrator:
-    """管理各類預測模型 (LSTM, Transformer, ARIMA, GARCH) 的單例與生命週期"""
+    """Manages LSTM, Transformer, ARIMA and GARCH instances and their lifetime."""
 
     _WEIGHT_FILE_PATTERNS = {
         "LSTM": "{symbol}_LSTM.keras",
@@ -23,11 +23,11 @@ class ModelOrchestrator:
 
     def __init__(self, model_factory, weights_dir: str = None, data_pipeline=None):
         """
-        :param model_factory: 具備 create_model(model_type) 的工廠
-        :param weights_dir:   權重目錄。未指定時自動沿用 factory.weights_dir
-        :param data_pipeline: (可選) DataPipeline 實例。傳入後，權重更新時會一併
-                              清掉對應的訓練產物快取 —— 否則會出現「新模型配舊 scaler」
-                              的錯配，預測值會被還原到錯誤的價格區間。
+        :param model_factory: factory with create_model(model_type)
+        :param weights_dir:   weights directory; defaults to factory.weights_dir
+        :param data_pipeline: optional DataPipeline. When given, reloading weights also
+                                                    clears its cached training artifacts, so a new model is never
+                                                    paired with an old scaler (which decodes to the wrong price range).
         """
         self.factory = model_factory
         self.pipeline = data_pipeline
@@ -47,7 +47,7 @@ class ModelOrchestrator:
 
     @staticmethod
     def _mtime_of(path: Optional[str]) -> float:
-        """取得檔案 mtime；檔案不存在時回傳 -1.0 (代表「無權重」狀態)"""
+        """File mtime, or -1.0 when the file doesn't exist (no weights)."""
         if not path:
             return -1.0
         try:
@@ -57,10 +57,10 @@ class ModelOrchestrator:
 
     def invalidate(self, symbol: str = None, model_type: str = None):
         """
-        手動清除快取。
-        - 不帶參數：清空全部
-        - 只給 symbol：清除該標的的所有模型
-        - 兩者都給：只清除單一模型
+        Clear the cache.
+        - no arguments: everything
+        - symbol only: all models for that symbol
+        - both: one model
         """
         if symbol is None:
             self._loaded_models.clear()
@@ -80,28 +80,28 @@ class ModelOrchestrator:
 
     def _invalidate_artifacts(self, symbol: str):
         """
-        權重更新後，記憶體中的訓練產物也必須跟著重讀，否則會與新模型錯配。
+        After weights change, cached training artifacts must reload too, or they won't match the model.
         """
         if self.pipeline is None:
             return
         try:
             self.pipeline.invalidate(symbol)
         except Exception as e:
-            logger.warning(f"[{symbol}] 清除訓練產物快取失敗: {e}")
+            logger.warning(f"[{symbol}] Failed to clear training-artifact cache: {e}")
 
     _invalidate_scaler = _invalidate_artifacts
 
     def _is_model_usable(self, model, symbol: str, model_type: str) -> bool:
         """
-        判斷模型是否具備可用的訓練權重。
+        Whether the model has usable trained weights.
 
-        兩道檢查，涵蓋兩種失敗模式：
-          1. 模型自己回報 is_trained = False（權重檔存在但載入失敗，
-             例如架構變更後的舊 .keras）
-          2. 權重檔根本不存在（訓練從未跑過該標的）
+        Two checks, for two failure modes:
+            1. The model reports is_trained = False (the file exists but failed to load,
+                  e.g. an old .keras after an architecture change).
+            2. The weights file doesn't exist (never trained for this symbol).
 
-        lstm.py 目前沒有 is_trained 屬性，會由第 2 道檢查兜住；
-        若日後補上該屬性，第 1 道會自動生效，不需再改本檔。
+        lstm.py has no is_trained attribute yet, so check 2 covers it; check 1 applies
+        automatically if one is added.
         """
         if model_type not in self._REQUIRES_TRAINED_WEIGHTS:
             return True
@@ -113,8 +113,8 @@ class ModelOrchestrator:
 
     def is_ready(self, symbol: str, model_type: str) -> bool:
         """
-        供 TradingEngine 在組裝 Ensemble 前預先過濾，避免呼叫已知不可用的模型。
-        用法：
+        Lets TradingEngine skip models known to be unusable before building the ensemble.
+        Usage:
             usable = [m for m in ("LSTM", "Transformer", "ARIMA")
                       if orchestrator.is_ready(symbol, m)]
         """
@@ -128,8 +128,8 @@ class ModelOrchestrator:
 
     def _get_or_load_model(self, symbol: str, model_type: str = "LSTM"):
         """
-        惰性載入 (Lazy Loading) + mtime 失效檢查。
-        權重檔在磁碟上被更新過時，自動丟棄舊實例並重新載入。
+        Lazy loading with mtime invalidation: when the weights file changes on disk,
+        the old instance is dropped and reloaded.
         """
         cache_key = f"{symbol}_{model_type}"
         path = self._weight_path(symbol, model_type)
@@ -140,14 +140,12 @@ class ModelOrchestrator:
             if self._loaded_mtimes.get(cache_key) == current_mtime:
                 return cached
 
-            logger.debug(
-                f"[{symbol}] 偵測到 {model_type} 權重已更新，重新載入至記憶體..."
-            )
+            logger.debug(f"[{symbol}] {model_type} weights changed; reloading...")
             self._loaded_models.pop(cache_key, None)
             self._loaded_mtimes.pop(cache_key, None)
             self._invalidate_artifacts(symbol)
         else:
-            logger.debug(f"[{symbol}] 載入 {model_type} 模型至記憶體...")
+            logger.debug(f"[{symbol}] Loading {model_type} model...")
 
         model = self.factory.create_model(model_type, symbol=symbol)
         model.load_weights(symbol)
@@ -172,19 +170,19 @@ class ModelOrchestrator:
         if trained_features != len(expected):
             model.is_trained = False
             logger.error(
-                f"[{symbol}] {model_type} 權重是以 {trained_features} 個特徵訓練的，"
-                f"但目前的特徵清單有 {len(expected)} 個 —— 兩者必須一致。"
-                f"該模型已被排除。請確認 weights/training_artifacts.json 中有 "
-                f"{symbol} 的 manifest，且 ModelOrchestrator 有把 symbol 傳給工廠；"
-                f"否則請重新執行 --mode train。"
+                f"[{symbol}] {model_type} weights were trained on {trained_features} features "
+                f"but the current manifest has {len(expected)}; they must match. "
+                f"Model excluded. Check that weights/training_artifacts.json has a manifest for "
+                f"{symbol} and that ModelOrchestrator passes the symbol to the factory; "
+                f"otherwise run --mode train again."
             )
 
     def predict(
         self, symbol: str, df: pd.DataFrame, model_type: str = "LSTM"
     ) -> Tuple[float, float]:
         """
-        執行連續數值預測並返回 (預測價格, 預測波動率)
-        主要適用於: LSTM, Transformer, ARIMA, GARCH
+        Run a numeric prediction and return (predicted price, predicted volatility).
+        For LSTM, Transformer, ARIMA and GARCH.
         """
         if df.empty:
             return 0.0, 0.0
@@ -194,7 +192,7 @@ class ModelOrchestrator:
 
             if not self._is_model_usable(model, symbol, model_type):
                 logger.warning(
-                    f"[{symbol}] ⛔ {model_type} 尚未訓練，已排除於 Ensemble 之外。"
+                    f"[{symbol}] ⛔ {model_type} is not trained; excluded from the ensemble."
                 )
                 return 0.0, 0.0
 
@@ -202,6 +200,6 @@ class ModelOrchestrator:
             volatility = model.predict_volatility(df)
             return prediction, volatility
         except Exception as e:
-            logger.warning(f"[{symbol}] {model_type} 數值預測失敗: {e}")
+            logger.warning(f"[{symbol}] {model_type} prediction failed: {e}")
             current_price = df["Close"].iloc[-1]
             return current_price, 0.02

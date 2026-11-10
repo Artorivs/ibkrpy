@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Only what the tests import; TensorFlow and Keras are left out on purpose.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest "pandas>=2.2" "numpy>=2.0.2,<2.2" pyyaml python-dotenv \
+            ib_insync aiosqlite aiohttp fredapi joblib pandas-market-calendars arch \
+            optuna statsmodels
+
+      - name: Run tests
+        run: python -m pytest -q

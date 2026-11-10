@@ -1,5 +1,5 @@
 # ibkrpy/core/main.py
-# 系統總樞紐 (Command Center)
+# Command-line entry point
 
 import argparse
 import sys
@@ -50,6 +50,8 @@ from ibkrpy.strategy.strategy_components import (
     RiskController,
     VIXHaltRule,
     ReversalRiskRule,
+    DrawdownHaltRule,
+    SessionEntryRule,
 )
 from ibkrpy.strategy.regime_detector import MarketRegimeDetector
 from ibkrpy.strategy.market_analyzer import MarketAnalyzer
@@ -64,7 +66,7 @@ from ibkrpy.models.garch import GARCHModel
 
 class AutomatedModelFactory:
     """
-    依訓練時保存的特徵清單建立神經網路模型。
+    Build neural-network models from the feature manifest saved at training time.
     """
 
     def __init__(self, data_pipeline=None):
@@ -90,12 +92,12 @@ class AutomatedModelFactory:
             return ARIMAModel(weights_dir=self.weights_dir)
         if model_type == "GARCH":
             return GARCHModel(weights_dir=self.weights_dir)
-        raise ValueError(f"未知的模型類型: {model_type}")
+        raise ValueError(f"Unknown model type: {model_type}")
 
 
 def launch_dashboard():
     """
-    啟動視覺化儀表板。
+    Launch the dashboard.
     """
     candidates = [
         os.path.join(project_root, core_dir_name, "core", "trading_dashboard.py"),
@@ -104,18 +106,17 @@ def launch_dashboard():
     for ui_path in candidates:
         if os.path.exists(ui_path):
             subprocess.Popen([sys.executable, ui_path])
-            logger.info(f"已啟動儀表板: {ui_path}")
+            logger.info(f"Dashboard launched: {ui_path}")
             return
-    logger.error(f"找不到 trading_dashboard.py，已嘗試: {candidates}")
+    logger.error(f"trading_dashboard.py not found; tried: {candidates}")
 
 
 def _build_benchmark_stack(config, db_manager, data_pipeline):
     """
-    Composition Root：唯一知道「要用哪些 resolver、以什麼順序」的地方。
+    Composition root: the only place that decides which resolvers run, and in what order.
 
-    把組裝集中在這裡，TradingEngine 與 PipelineManager 都只依賴
-    BenchmarkResolver 抽象，兩者不需要知道任何一條選擇規則 (DIP)。
-    要改規則只改這一個函式。
+    TradingEngine and PipelineManager depend only on the BenchmarkResolver abstraction,
+    so changing the selection rules only touches this function.
     """
     weights_dir = os.path.join(project_root, "weights")
     store = JsonBenchmarkStore(os.path.join(weights_dir, "benchmark_map.json"))
@@ -131,7 +132,7 @@ def _build_benchmark_stack(config, db_manager, data_pipeline):
 
 
 def _build_ib_manager(config, client_id: int = None) -> IBKRDataManager:
-    """命令列的 --client-id 優先於 config，讓重訓子行程不與主行程搶同一個連線。"""
+    """--client-id overrides the config so the retrain subprocess uses its own connection."""
     ib_manager = IBKRDataManager(
         host=config.get("ib_settings.host", "127.0.0.1"),
         port=config.get("ib_settings.port", 7497),
@@ -142,7 +143,7 @@ def _build_ib_manager(config, client_id: int = None) -> IBKRDataManager:
         ),
     )
     print(
-        f"嘗試連線至 IBKR (Host: {ib_manager.host}:{ib_manager.port}, Client ID: {ib_manager.client_id})..."
+        f"Connecting to IBKR (host {ib_manager.host}:{ib_manager.port}, client ID {ib_manager.client_id})..."
     )
     return ib_manager
 
@@ -151,7 +152,7 @@ async def run_pipeline_mode(
     mode: str, target_symbol: str = None, client_id: int = None
 ) -> bool:
     """
-    回傳是否成功。
+    Returns whether it succeeded.
     """
     config = ConfigManager()
     db_manager = DatabaseManager()
@@ -165,7 +166,7 @@ async def run_pipeline_mode(
     try:
         await ib_manager.connect()
     except ConnectionError as e:
-        logger.error(f"❌ 無法連線至 IBKR，中止本次作業: {e}")
+        logger.error(f"❌ Could not connect to IBKR; aborting: {e}")
         return False
 
     benchmark_resolver, benchmark_store = _build_benchmark_stack(
@@ -199,12 +200,11 @@ async def live_trading_loop(
     engine: TradingEngine, symbols: list, retrain: RetrainScheduler = None
 ):
     """
-    由 engine.should_tick() 依 bar size 決定該不該問：日 K 標的每小時一次、
-    小時 K 每 15 分鐘一次、5 分 K 才每 5 分鐘一次。有持倉的標的不受節流限制。
+    engine.should_tick() throttles by bar size: daily symbols hourly, hourly bars every
+    15 minutes, 5-minute bars every 5 minutes. Symbols with a position aren't throttled.
 
-    休市時進入 deepsleep —— 直接睡到下一個時段開始，而不是每分鐘醒來確認一次。
-    原本的迴圈完全不知道市場是否開盤，週末與假日照樣每 60 秒喚醒並呼叫
-    update_system_state()，一個週末就是 3,330 次無用的喚醒與 IBKR 請求。
+    When the market is closed, sleep until the next session starts instead of waking
+    every minute.
     """
     offset = 0
     loop_seconds = 60
@@ -223,21 +223,23 @@ async def live_trading_loop(
                     retrain.maybe_start(state.now)
                     nap = min(nap, retrain.seconds_until_recheck(state.now))
                 logger.info(
-                    f"😴 {state.session.value} —— 深度休眠 {nap / 3600:.2f} 小時，"
-                    f"{state.next_change:%m-%d %H:%M} 進入 {state.next_session.value}"
+                    f"😴 {state.session.value}: sleeping {nap / 3600:.2f} h, "
+                    f"{state.next_session.value} starts {state.next_change:%m-%d %H:%M}"
                 )
                 await asyncio.sleep(max(nap, 1.0))
                 continue
 
             if retrain is not None and retrain.running:
-                logger.warning("⚠️ 重訓仍在進行中，本輪僅維持連線，不進行交易決策。")
+                logger.warning(
+                    "⚠️ Retrain still running; staying connected without trading this loop."
+                )
                 await asyncio.sleep(
                     min(loop_seconds, max(state.seconds_until_change, 1.0))
                 )
                 continue
 
             if state.session is not last_session:
-                logger.info(f"🔔 進入 {state.session.value} 時段")
+                logger.info(f"🔔 Entering {state.session.value} session")
                 last_session = state.session
 
             await engine.update_system_state()
@@ -247,7 +249,7 @@ async def live_trading_loop(
             due = [s for s in order if engine.should_tick(s, state.session)]
             if due:
                 logger.info(
-                    f"🔁 本輪待掃描 {len(due)}/{len(symbols)} 檔: {', '.join(due[:12])}"
+                    f"🔁 Scanning {len(due)}/{len(symbols)} symbols: {', '.join(due[:12])}"
                     + (" ..." if len(due) > 12 else "")
                 )
             for symbol in due:
@@ -277,7 +279,7 @@ async def run_live_mode(args):
     try:
         await ib_manager.connect()
     except ConnectionError as e:
-        logger.error(f"❌ 無法連線至 IBKR，中止啟動: {e}")
+        logger.error(f"❌ Could not connect to IBKR; aborting startup: {e}")
         return
 
     model_orchestrator = ModelOrchestrator(
@@ -294,6 +296,19 @@ async def run_live_mode(args):
             ReversalRiskRule(
                 threshold=float(
                     config.get("strategy_settings.reversal_block_level", 0.75)
+                )
+            ),
+            DrawdownHaltRule(
+                max_daily_loss_pct=float(
+                    config.get("risk_settings.max_daily_loss_pct", 0.02)
+                ),
+                max_drawdown_pct=float(
+                    config.get("risk_settings.max_drawdown_pct", 0.10)
+                ),
+            ),
+            SessionEntryRule(
+                allow_extended_entries=bool(
+                    config.get("session_settings.allow_extended_entries", False)
                 )
             ),
         ]
@@ -317,7 +332,7 @@ async def run_live_mode(args):
         if _cs.get("enable_collapse_guard", True)
         else None
     )
-    logger.info(f"📏 進場門檻政策: {threshold_policy.name}")
+    logger.info(f"📏 Entry threshold policy: {threshold_policy.name}")
 
     strategy_map = {}
     symbol_terms = {}
@@ -369,7 +384,7 @@ async def run_live_mode(args):
 
     def _on_retrained():
         model_orchestrator.invalidate()
-        logger.info("已清除模型快取，下一輪將載入新權重。")
+        logger.info("Model cache cleared; new weights load on the next loop.")
 
     retrain = RetrainScheduler(config, on_success=_on_retrained)
 
@@ -394,7 +409,7 @@ def main():
     setup_logger(_boot_config.get("log_settings") or {}, enable_file=not _is_subprocess)
 
     parser = argparse.ArgumentParser(
-        description="IBKR AI 量化交易系統 總樞紐",
+        description="IBKR AI trading system",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -408,7 +423,7 @@ def main():
         nargs="?",
         type=str,
         default=None,
-        help="指定單一股票代碼 (選填，例如 MRVL)",
+        help="Run for a single symbol (optional, e.g. MRVL)",
     )
     parser.add_argument("--ui", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -416,8 +431,8 @@ def main():
         "--client-id",
         type=int,
         default=None,
-        help="覆寫 config 的 IBKR client_id。SystemDaemon 以此讓重訓子行程\n"
-        "使用不同號碼，避免與 24/7 主行程的連線衝突。",
+        help="Override the IBKR client_id from config. Used to give the retrain subprocess\n"
+        "its own ID so it doesn't clash with the 24/7 main process.",
     )
     args = parser.parse_args()
 
