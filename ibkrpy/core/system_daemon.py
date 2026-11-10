@@ -87,6 +87,7 @@ class SystemDaemon:
             for symbol in self._scan_order():
                 await self.engine.run_tick(symbol)
                 await asyncio.sleep(2)
+            self.engine.log_cycle_summary()
 
         self.logger.info(
             f"✅ Scan done. Waiting for the next {self.tick_interval_minutes}-minute bar..."

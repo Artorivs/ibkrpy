@@ -191,5 +191,40 @@ class LiveHorizonTests(unittest.TestCase):
         self.assertEqual(rec.action, "BUY")
 
 
+class DaemonLedgerFlushTests(unittest.TestCase):
+    def test_market_cycle_flushes_the_ledger(self):
+        import asyncio
+        import datetime
+        from unittest import mock
+
+        from ibkrpy.core import system_daemon
+
+        calls = []
+
+        async def run_tick(symbol):
+            calls.append(symbol)
+
+        engine = types.SimpleNamespace(
+            run_tick=run_tick,
+            update_system_state=mock.AsyncMock(),
+            log_cycle_summary=lambda: calls.append("summary"),
+        )
+        d = system_daemon.SystemDaemon.__new__(system_daemon.SystemDaemon)
+        d.engine = engine
+        d.symbols = ["SPY", "QQQ"]
+        d._scan_offset = 0
+        d.tick_interval_minutes = 0
+        d.logger = mock.Mock()
+        d.ib_manager = types.SimpleNamespace(
+            ib=types.SimpleNamespace(isConnected=lambda: True)
+        )
+
+        with mock.patch.object(system_daemon.asyncio, "sleep", mock.AsyncMock()):
+            asyncio.run(d._run_market_cycle(datetime.datetime(2026, 11, 10, 10, 0)))
+
+        self.assertEqual(calls[-1], "summary")
+        self.assertEqual(sorted(calls[:-1]), ["QQQ", "SPY"])
+
+
 if __name__ == "__main__":
     unittest.main()
