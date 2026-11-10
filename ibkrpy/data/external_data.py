@@ -1,5 +1,5 @@
 # ibkrpy/data/external_data.py
-# 外部數據獲取器，整合 FMP (基本面/產業) 與 FRED (宏觀經濟) API 的輕量級模組
+# External data fetchers: FMP (fundamentals / sector) and FRED (macro)
 
 import aiohttp
 import asyncio
@@ -15,11 +15,11 @@ DEFAULT_VIX = 20.0
 
 def bar_trading_days(index) -> pd.DatetimeIndex:
     """
-    K 線索引對應的交易日 (naive, 午夜)。
+    Trading day for each bar in the index (naive, midnight).
 
-    資料庫與 IBKR (formatDate=2) 的時間都是 UTC。日 K 存成「交易日的 UTC 午夜」，
-    直接取 UTC 日期即可；盤中 K 要換成紐約時間再取日期，否則 20:00 ET 之後的
-    K 線會被算到隔天。
+    The DB and IBKR (formatDate=2) use UTC. Daily bars are stored at UTC midnight of the
+    trading day, so the UTC date is correct; intraday bars are converted to New York time
+    first, or bars after 20:00 ET would land on the next day.
     """
     idx = pd.DatetimeIndex(index)
     if idx.tz is None:
@@ -34,13 +34,10 @@ def align_daily_series(
     series: Optional[pd.Series], index, default: float = DEFAULT_VIX
 ) -> pd.Series:
     """
-    把日頻序列 (例如 FRED VIXCLS) 對齊到 K 線索引，每根 K 線取「前一個交易日」的值。
+    Align a daily series (e.g. FRED VIXCLS) to the bar index, using the previous trading day's value.
 
-    [修正] 舊版直接以帶時區的 K 線索引去 map 無時區的 FRED 日期，
-    永遠對不上，整欄 NaN 後退回常數 20.0 —— 訓練與實盤看到的 VIX 從來不是真的。
-
-    只取前一日的值有兩個理由: 當日收盤的 VIX 在盤中尚未產生 (避免前視偏差)，
-    而 FRED 也要隔日才公布，實盤本來就只拿得到前一日 —— 訓練與實盤因此一致。
+    Previous day only: the same-day close doesn't exist during the session (lookahead),
+    and FRED publishes a day late, so live trading only ever sees the previous day.
     """
     if series is None or series.empty:
         return pd.Series(default, index=index, dtype=float)
@@ -64,7 +61,7 @@ def align_daily_series(
 
 
 class ExternalDataFetcher:
-    """統合外部 API (FMP, FRED) 的數據獲取"""
+    """Fetches data from external APIs (FMP, FRED)."""
 
     def __init__(self, fmp_api_key: str = None, fred_api_key: str = None):
         self.fmp_api_key = fmp_api_key
@@ -72,9 +69,9 @@ class ExternalDataFetcher:
         self.fmp_base_url = "https://financialmodelingprep.com/api/v3"
 
     async def fetch_fmp_profile(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """獲取 FMP 公司基本面/產業配置"""
+        """Fetch an FMP company profile (fundamentals / sector)."""
         if not self.fmp_api_key:
-            print("未配置 FMP API Key。")
+            print("FMP API key not configured.")
             return None
 
         url = f"{self.fmp_base_url}/profile/{symbol}?apikey={self.fmp_api_key}"
@@ -87,13 +84,13 @@ class ExternalDataFetcher:
                             return data[0]
                     return None
         except Exception as e:
-            print(f"獲取 FMP 數據 ({symbol}) 失敗: {e}")
+            print(f"Failed to fetch FMP data ({symbol}): {e}")
             return None
 
     async def fetch_fred_series(self, series_id: str) -> pd.Series:
-        """獲取 FRED 宏觀經濟指標 (例如 VIX)"""
+        """Fetch a FRED series (e.g. VIX)."""
         if not self.fred:
-            print("未配置 FRED API Key。")
+            print("FRED API key not configured.")
             return pd.Series(dtype=float)
 
         try:
@@ -101,5 +98,5 @@ class ExternalDataFetcher:
             series.index = pd.to_datetime(series.index)
             return series
         except Exception as e:
-            print(f"獲取 FRED 數據 ({series_id}) 失敗: {e}")
+            print(f"Failed to fetch FRED data ({series_id}): {e}")
             return pd.Series(dtype=float)

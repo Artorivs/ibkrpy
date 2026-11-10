@@ -1,5 +1,5 @@
 # ibkrpy/shared/db_manager.py
-# 負責交易紀錄、市場數據、資金與持倉的 SQLite 持久化儲存
+# SQLite storage for trades, market data, account and positions
 
 import os
 import sqlite3
@@ -15,7 +15,7 @@ DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, "data", "trading_data.db")
 
 
 class DatabaseManager:
-    """輕量化 SQLite 非同步/同步雙軌管理器 (具備 WAL 併發防護與 Upsert 增量寫入)"""
+    """SQLite manager with async and sync access (WAL mode, upsert writes)."""
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -25,21 +25,21 @@ class DatabaseManager:
         self._init_tables()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """獲取連線並開啟 WAL 模式，防範 UI 讀取與交易迴圈寫入造成的 Database Locked"""
+        """Open a connection in WAL mode so dashboard reads don't lock out the trading loop."""
         conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
     def _execute_sync(self, query: str, params: tuple = ()) -> None:
-        """內部同步執行 (寫入)"""
+        """Synchronous write."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()
 
     def _fetch_sync(self, query: str, params: tuple = ()) -> list:
-        """內部同步讀取"""
+        """Synchronous read."""
         with self._get_connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
@@ -47,7 +47,7 @@ class DatabaseManager:
             return [dict(row) for row in cursor.fetchall()]
 
     def _init_tables(self):
-        """初始化必要之資料表"""
+        """Create the required tables."""
         query_trades = """
         CREATE TABLE IF NOT EXISTS trade_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +111,7 @@ class DatabaseManager:
     async def update_account_info(
         self, net_liq: float, avail_funds: float, positions: dict
     ):
-        """非同步更新帳戶資金與持倉狀態，並記錄收益歷史"""
+        """Update account funds and positions, and record equity history."""
 
         def _sync_update():
             with self._get_connection() as conn:
@@ -151,7 +151,7 @@ class DatabaseManager:
         try:
             await asyncio.to_thread(_sync_update)
         except Exception as e:
-            self.logger.error(f"更新帳戶狀態失敗: {e}")
+            self.logger.error(f"Failed to update account state: {e}")
 
     async def log_trade(self, trade_data: Dict[str, Any]):
         query = """
@@ -169,7 +169,7 @@ class DatabaseManager:
         try:
             await asyncio.to_thread(self._execute_sync, query, params)
         except Exception as e:
-            self.logger.error(f"記錄交易日誌失敗: {e}")
+            self.logger.error(f"Failed to log trade: {e}")
 
     async def get_recent_trades(self, limit: int = 50) -> pd.DataFrame:
         query = "SELECT * FROM trade_logs ORDER BY timestamp DESC LIMIT ?"
@@ -177,13 +177,13 @@ class DatabaseManager:
             results = await asyncio.to_thread(self._fetch_sync, query, (limit,))
             return pd.DataFrame(results)
         except Exception as e:
-            self.logger.error(f"獲取交易紀錄失敗: {e}")
+            self.logger.error(f"Failed to fetch trade history: {e}")
             return pd.DataFrame()
 
     def save_bulk_market_data(
         self, symbol: str, df: pd.DataFrame, timeframe: str = "1 day"
     ):
-        """儲存市場資料，採用 Upsert 達成無損增量寫入"""
+        """Upsert market data bars."""
         if df.empty:
             return
 
@@ -208,15 +208,16 @@ class DatabaseManager:
             "close",
             "volume",
         ]
+        # Table columns are lowercase.
         df_db = df_db.rename(
             columns={
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
             }
-        ).loc[:, [c for c in cols if c in df_db.columns]]
+        ).loc[:, cols]
 
         data_tuples = list(df_db.itertuples(index=False, name=None))
 
@@ -233,7 +234,7 @@ class DatabaseManager:
     def get_market_data_sync(
         self, symbol: str, timeframe: str = "1 day"
     ) -> pd.DataFrame:
-        """同步提取完整歷史市場資料"""
+        """Load the full market data history for a symbol and timeframe."""
         query = "SELECT * FROM market_data WHERE symbol = ? AND timeframe = ? ORDER BY timestamp ASC"
         results = self._fetch_sync(query, (symbol, timeframe))
 
@@ -246,7 +247,7 @@ class DatabaseManager:
 
         df = (
             df.set_index("timestamp")
-            .loc[~df.index.duplicated(keep="last")]
+            .loc[lambda d: ~d.index.duplicated(keep="last")]
             .sort_index()
             .rename(
                 columns={

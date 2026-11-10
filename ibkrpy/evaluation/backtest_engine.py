@@ -1,5 +1,5 @@
 # evaluation/backtest_engine.py
-# 整合模擬交易與高階機構級績效評估
+# Bar-by-bar backtest with performance metrics
 
 import pandas as pd
 import numpy as np
@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 
 
 class BacktestEngine:
-    """提供高保真度歷史回測，並自動結算機構級績效指標"""
+    """Historical backtest that also computes performance metrics."""
 
     def __init__(
         self,
@@ -24,9 +24,9 @@ class BacktestEngine:
     @staticmethod
     def _infer_periods_per_year(index: pd.Index) -> float:
         """
-        由索引的時間間隔推導年化係數。
-        日線 -> 252；1 小時 (美股 RTH 6.5h) -> 1638；5 分鐘 -> 19656。
-        推導失敗時保守回退為 252。
+        Infer the annualization factor from the index spacing.
+        Daily -> 252; 1 hour (6.5h RTH) -> 1638; 5 minutes -> 19656.
+        Falls back to 252 if it can't be inferred.
         """
         try:
             if not isinstance(index, pd.DatetimeIndex) or len(index) < 3:
@@ -47,7 +47,7 @@ class BacktestEngine:
             return 252.0
 
     def _fill_price(self, price: float, is_buy: bool) -> float:
-        """買入滑價使成本變高，賣出滑價使收入變少"""
+        """Slippage makes buys cost more and sells receive less."""
         return (
             price * (1 + self.slippage_pct)
             if is_buy
@@ -61,11 +61,11 @@ class BacktestEngine:
         benchmark_df: pd.DataFrame = None,
     ) -> Dict[str, Any]:
         """
-        執行回測 (支援做多/做空，逐根 K 線計算 MTM 淨值，並模擬 bracket 出場)
+        Run the backtest (long/short, mark-to-market per bar, simulated bracket exits).
 
-        :param df: 歷史 K 線數據。需含 Close；若含 High/Low 則啟用 bracket 模擬。
-        :param signals: 策略生成的信號列表 (含 stop_loss_price / take_profit_price)
-        :param benchmark_df: (可選) 大盤數據，用於 Alpha、資訊比率等指標
+        :param df: OHLCV bars. Needs Close; High/Low enable bracket simulation.
+        :param signals: strategy signals (with stop_loss_price / take_profit_price)
+        :param benchmark_df: optional benchmark bars for alpha / information ratio
         """
         if df.empty or "Close" not in df.columns:
             return self._empty_metrics()

@@ -1,5 +1,5 @@
 # ibkrpy/models/hmm.py
-# 專責市場隱藏狀態 (Regime) 之偵測，如牛熊市或波動率高低狀態。
+# Hidden-state (regime) detection, e.g. bull/bear or high/low volatility.
 
 import os
 import numpy as np
@@ -13,20 +13,20 @@ try:
     from hmmlearn.hmm import GaussianHMM
 except ImportError:
     GaussianHMM = None
-    print("警告: 尚未安裝 hmmlearn，請執行 `pip install hmmlearn`")
+    print("Warning: hmmlearn is not installed; run `pip install hmmlearn`")
 
 
 class HMMModel:
     """
-    隱馬爾可夫模型 (Hidden Markov Model)
-    用於偵測市場的隱藏狀態 (如: 0 代表低波盤整，1 代表高波趨勢等)
+    Hidden Markov Model
+    that detects hidden market states (e.g. 0 = quiet range, 1 = volatile trend).
     """
 
     def __init__(self, n_components: int = 2, weights_dir: str = "weights"):
         """
-        初始化 HMM 模型
-        :param n_components: 隱藏狀態的數量 (預設為 2，例如牛/熊)
-        :param weights_dir: 模型權重存放的目錄
+        Initialize the HMM.
+        :param n_components: number of hidden states (default 2, e.g. bull/bear)
+        :param weights_dir: directory holding model weights
         """
         self.n_components = n_components
         self.weights_dir = weights_dir
@@ -34,30 +34,32 @@ class HMMModel:
         self.is_trained = False
 
     def load_weights(self, symbol: str):
-        """從整合包載入 HMM 模型權重 (.pkl)"""
+        """Load the HMM from the classical bundle (.pkl)."""
         if GaussianHMM is None:
-            raise ImportError("hmmlearn 未安裝，無法載入 HMM 模型。")
+            raise ImportError("hmmlearn is not installed; cannot load the HMM.")
 
         file_path = os.path.join(self.weights_dir, f"{symbol}_classical.pkl")
 
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"找不到 {symbol} 的傳統模型整合包: {file_path}")
+            raise FileNotFoundError(
+                f"Classical bundle for {symbol} not found: {file_path}"
+            )
 
         try:
             bundle = joblib.load(file_path)
             self.model = bundle.get("hmm")
             if self.model:
                 self.is_trained = True
-                print(f"[{symbol}] HMM 模型權重載入成功。")
+                print(f"[{symbol}] HMM weights loaded.")
             else:
-                raise ValueError("整合包內無 HMM 模型")
+                raise ValueError("No HMM in the bundle")
         except Exception as e:
-            raise RuntimeError(f"[{symbol}] 載入 HMM 模型失敗: {e}")
+            raise RuntimeError(f"[{symbol}] Failed to load the HMM: {e}")
 
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
         """
-        內部特徵工程：將原始 OHLCV 轉換為 HMM 需要的觀測特徵。
-        這裡實作了最經典的 HMM 雙特徵：對數收益率 (Log Return) 與 波動率 (Volatility)。
+        Turn OHLCV into HMM observations:
+        log return and volatility.
         """
         df_features = pd.DataFrame(index=df.index)
 
@@ -71,19 +73,19 @@ class HMMModel:
 
     def predict_state(self, df: pd.DataFrame) -> int:
         """
-        預測當前最新的市場狀態
-        此方法供 ModelOrchestrator 呼叫
-        :param df: 包含歷史 K 線數據的 DataFrame
-        :return: 狀態 ID (int)
+        Predict the latest market state.
+        Called by ModelOrchestrator.
+        :param df: DataFrame of historical bars
+        :return: state ID (int)
         """
         if not self.is_trained or self.model is None:
-            print("警告: HMM 模型未載入，回退至預設狀態 -1")
+            print("Warning: HMM not loaded; returning default state -1")
             return -1
 
         features = self._prepare_features(df)
 
         if len(features) == 0:
-            print("警告: 傳入數據長度不足以計算特徵，無法進行 HMM 狀態偵測")
+            print("Warning: not enough data to compute HMM features")
             return -1
 
         try:
@@ -93,5 +95,5 @@ class HMMModel:
             return current_state
 
         except Exception as e:
-            print(f"HMM 狀態預測失敗: {e}")
+            print(f"HMM state prediction failed: {e}")
             return -1

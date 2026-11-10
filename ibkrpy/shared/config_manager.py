@@ -1,5 +1,5 @@
 # ibkrpy/shared/config_manager.py
-# 極簡化的配置讀取器，並兼管全域的核心資料結構 (支援 .env 與 YAML)
+# Minimal config reader (.env + YAML) and the shared AssetProfile type
 
 import yaml
 import os
@@ -20,7 +20,7 @@ except ImportError:
 
 @dataclass
 class AssetProfile:
-    """定義交易標的的基本屬性 (原 interfaces.py 職責)"""
+    """Basic properties of a tradable asset."""
 
     symbol: str
     secType: str = "STK"
@@ -30,7 +30,7 @@ class AssetProfile:
 
 
 class ConfigManager:
-    """輕量級配置管理器，負責載入 YAML、環境變數與分發參數"""
+    """Loads YAML and environment variables and serves config values."""
 
     def __init__(self, config_path: str = None):
         self.config_path = config_path or os.path.join(PROJECT_ROOT, "config.yaml")
@@ -39,9 +39,11 @@ class ConfigManager:
         self.reload()
 
     def reload(self):
-        """重新載入 YAML 配置檔案"""
+        """Reload the YAML config file."""
         if not os.path.exists(self.config_path):
-            print(f"警告: 找不到配置檔 {self.config_path}，將使用預設空配置。")
+            print(
+                f"Warning: config file {self.config_path} not found; using an empty config."
+            )
             return
 
         try:
@@ -50,10 +52,10 @@ class ConfigManager:
 
             self._parse_asset_profiles()
         except Exception as e:
-            print(f"解析配置檔失敗: {e}")
+            print(f"Failed to parse config file: {e}")
 
     def _parse_asset_profiles(self):
-        """將 YAML 中的 dict 轉換為 AssetProfile 資料類別"""
+        """Convert the YAML asset dicts into AssetProfile objects."""
         raw_assets = self._config_data.get("assets", [])
         self.asset_profiles = []
         for asset in raw_assets:
@@ -66,8 +68,8 @@ class ConfigManager:
 
     def get(self, dot_path: str, default: Any = None) -> Any:
         """
-        支援點綴語法獲取巢狀字典的值，例如: get("ib_settings.port")
-        優先級別為 1. 環境變數 (.env) -> 2. config.yaml -> 3. default
+        Read a nested value with dot syntax, e.g. get("ib_settings.port").
+        Precedence: 1. environment variable (.env) -> 2. config.yaml -> 3. default
         """
         env_key = dot_path.split(".")[-1].upper()
         if env_key in os.environ and os.environ[env_key].strip() != "":

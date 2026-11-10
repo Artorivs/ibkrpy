@@ -1,5 +1,5 @@
 # ibkrpy/shared/session_clock.py
-# 交易時段管理：負責時間的切換與檢查
+# Trading session clock: classifies the current session and finds transitions
 
 from __future__ import annotations
 
@@ -22,10 +22,10 @@ except ImportError:
 
 class Session(str, Enum):
     """
-    美股的時段劃分。時間皆為紐約時間。
+    US equity sessions, all in New York time.
 
-    OVERNIGHT 指 IBKR 的 Overnight Trading (20:00 - 03:50)，僅部分標的可交易，
-    且流動性與價差和日盤完全不同 —— 不可以套用同一組成本假設。
+    OVERNIGHT is IBKR Overnight Trading (20:00-03:50). Only some symbols trade, and
+    liquidity and spreads differ from the day session, so cost assumptions differ too.
     """
 
     CLOSED = "closed"
@@ -40,7 +40,7 @@ class Session(str, Enum):
 
     @property
     def is_extended(self) -> bool:
-        """非常規時段。流動性較差，成本假設必須另計。"""
+        """Outside regular hours: thinner liquidity, separate cost assumptions."""
         return self in (Session.PRE, Session.POST, Session.OVERNIGHT)
 
 
@@ -65,11 +65,11 @@ class SessionState:
 
 class SessionClock:
     """
-    以 NYSE 日曆判斷時段。沒有 pandas_market_calendars 時退回粗略判斷，
-    但會明確警告 —— 因為假日與提早收市在降級模式下無法辨識。
+    Classifies sessions with the NYSE calendar. Without pandas_market_calendars it falls back
+    to a rough weekday schedule and warns, since holidays and early closes are then missed.
 
-    契約: classify() 與 next_transition() 永不拋例外。日曆查詢失敗時
-    退回粗略判斷並記錄，寧可多醒幾次也不要讓迴圈整個停住。
+    Contract: classify() and next_transition() never raise. A calendar failure falls back to
+    the rough schedule and is logged; waking too often beats stopping the loop.
     """
 
     def __init__(self, calendar_name: str = "NYSE", enable_overnight: bool = False):
@@ -80,15 +80,15 @@ class SessionClock:
             try:
                 self._calendar = mcal.get_calendar(calendar_name)
             except Exception as e:
-                logger.error(f"無法載入 {calendar_name} 日曆: {e}")
+                logger.error(f"Could not load the {calendar_name} calendar: {e}")
         if self._calendar is None:
             logger.warning(
-                "未安裝 pandas_market_calendars，退回「週一至週五 09:30-16:00」的粗略判斷。"
-                " 休市日與提早收市日將無法辨識，建議執行 poetry install 補齊相依。"
+                "pandas_market_calendars is not installed; falling back to Mon-Fri 09:30-16:00."
+                " Holidays and early closes will be missed; run poetry install."
             )
 
     def _rth_bounds(self, day: dt.date) -> Optional[Tuple[dt.datetime, dt.datetime]]:
-        """該日的 (開盤, 收盤)，紐約時間。休市日回傳 None。"""
+        """(open, close) for the day in New York time, or None on a holiday."""
         if day in self._cache:
             return self._cache[day]
 
@@ -102,7 +102,7 @@ class SessionClock:
                         sched.iloc[0]["market_close"].tz_convert(NY).to_pydatetime(),
                     )
             except Exception as e:
-                logger.error(f"查詢交易日曆失敗 ({day}): {e}")
+                logger.error(f"Trading calendar lookup failed ({day}): {e}")
                 bounds = self._crude_bounds(day)
         else:
             bounds = self._crude_bounds(day)
@@ -125,7 +125,7 @@ class SessionClock:
         return self._rth_bounds(day) is not None
 
     def _next_trading_day(self, day: dt.date, limit: int = 10) -> Optional[dt.date]:
-        """夜盤判斷「不」使用這個函式 (見 classify)，但排程與回填會用到。"""
+        """Not used for the overnight check (see classify), but used by scheduling and backfill."""
         for i in range(1, limit + 1):
             cand = day + dt.timedelta(days=i)
             if self.is_trading_day(cand):
@@ -159,11 +159,11 @@ class SessionClock:
         self, now: Optional[dt.datetime] = None
     ) -> Tuple[dt.datetime, Session]:
         """
-        回傳 (下一次時段改變的時刻, 改變後的時段)。
+        Returns (time of the next session change, the session after it).
 
-        作法是「往前掃描候選邊界，取第一個時段真的不同的」。比起手寫
-        每個時段的下一步，這個作法不會在假日、提早收市、夜盤跨日這些
-        邊角情況上漏掉分支 —— 邊界由日曆提供，判斷交給 classify()。
+        Scans candidate boundaries and returns the first where the session actually changes,
+        so holidays, early closes and the overnight day roll can't be missed; the calendar
+        supplies the boundaries and classify() decides.
         """
         now = self._to_ny(now)
         current = self.classify(now)
@@ -179,7 +179,7 @@ class SessionClock:
         return fallback, self.classify(fallback)
 
     def _candidate_boundaries(self, now: dt.datetime):
-        """未來 10 天內所有可能的時段邊界，已排序。"""
+        """All candidate session boundaries in the next 10 days, sorted."""
         out = []
         for offset in range(0, 11):
             day = now.date() + dt.timedelta(days=offset)
@@ -208,7 +208,7 @@ class SessionClock:
 
 
 def build_session_clock(config) -> SessionClock:
-    """Composition Root 使用。"""
+    """Composition root."""
     s = (config.get("session_settings") or {}) if config else {}
     return SessionClock(
         calendar_name=s.get("calendar", "NYSE"),

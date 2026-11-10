@@ -1,5 +1,5 @@
 # ibkrpy/data/artifact_store.py
-# 訓練產物 (scaler + feature manifest) 的儲存層
+# Storage for training artifacts (scaler + feature manifest)
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ _LEGACY_SUFFIX = {"_scaler.json": SCALER, "_features.json": MANIFEST}
 
 
 class ArtifactStore(ABC):
-    """DataPipeline 唯一依賴的介面。"""
+    """The only interface DataPipeline depends on."""
 
     @abstractmethod
     def load_scaler(self, symbol: str) -> Optional[ScalerDict]: ...
@@ -47,7 +47,7 @@ class ArtifactStore(ABC):
         scaler: Optional[ScalerDict] = None,
         manifest: Optional[ManifestDict] = None,
     ) -> None:
-        """一次原子寫入。scaler 與 manifest 不會出現只更新一半的狀態。"""
+        """One atomic write, so scaler and manifest are never half-updated."""
 
     @abstractmethod
     def delete(self, symbol: str) -> None: ...
@@ -57,7 +57,7 @@ class ArtifactStore(ABC):
 
 
 class NullArtifactStore(ArtifactStore):
-    """不落盤。walk-forward 與測試使用。"""
+    """In-memory only. Used by walk-forward and tests."""
 
     def load_scaler(self, symbol):
         return None
@@ -83,8 +83,8 @@ class NullArtifactStore(ArtifactStore):
 
 class LegacyFileStore(ArtifactStore):
     """
-    舊格式: weights/{symbol}_scaler.json 與 weights/{symbol}_features.json。
-    保留完整讀寫能力，讓 scaler_settings.consolidated=false 仍可運作。
+    Legacy format: weights/{symbol}_scaler.json and weights/{symbol}_features.json.
+    Fully readable and writable, so scaler_settings.consolidated=false still works.
     """
 
     def __init__(self, weights_dir: str):
@@ -102,7 +102,7 @@ class LegacyFileStore(ArtifactStore):
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.error(f"[{symbol}] 舊格式 {kind} 讀取失敗 ({path}): {e}")
+            logger.error(f"[{symbol}] Failed to read legacy {kind} ({path}): {e}")
             return None
 
     def _write(self, symbol: str, kind: str, blob) -> None:
@@ -148,7 +148,7 @@ class LegacyFileStore(ArtifactStore):
 
 class LegacyScalersJsonStore(ArtifactStore):
     """
-    過渡格式: weights/_scalers.json ({"version":1,"scalers":{...}})。
+    Transitional format: weights/_scalers.json ({"version":1,"scalers":{...}}).
     """
 
     def __init__(self, path: str):
@@ -169,7 +169,7 @@ class LegacyScalersJsonStore(ArtifactStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"scalers.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"Failed to read scalers.json ({self.path}): {e}")
             return self._cache or {}
 
     def load_scaler(self, symbol):
@@ -196,7 +196,7 @@ class LegacyScalersJsonStore(ArtifactStore):
 
 class ChainedArtifactStore(ArtifactStore):
     """
-    依序嘗試多個唯讀退路。第一個給出非 None 的就採用。
+    Tries several read-only fallbacks in order; the first non-None result wins.
     """
 
     def __init__(self, stores: List[ArtifactStore]):
@@ -246,9 +246,9 @@ class ChainedArtifactStore(ArtifactStore):
 
 class _FileLock:
     """
-    以 O_EXCL 建立鎖檔的跨行程鎖。重訓是獨立行程 (見 retrain_client_id)，
-    兩個行程同時 read-modify-write 同一個 JSON 會互相蓋掉。
-    逾時就搶下陳舊的鎖 —— 寧可極小機率覆寫，也不要讓訓練永久卡死。
+    Cross-process lock using an O_EXCL lock file. Retraining runs in its own process
+    (see retrain_client_id), and two concurrent read-modify-writes of one JSON clobber
+    each other. A stale lock is taken over on timeout rather than blocking training.
     """
 
     def __init__(self, path: str, timeout: float = 10.0):
@@ -265,7 +265,7 @@ class _FileLock:
                     try:
                         age = time.time() - os.path.getmtime(self.path)
                         logger.warning(
-                            f"訓練產物鎖等待逾時 (鎖已存在 {age:.0f} 秒)，強制取得。"
+                            f"Training-artifact lock wait timed out (lock is {age:.0f}s old); taking it."
                         )
                         os.remove(self.path)
                     except OSError:
@@ -284,10 +284,10 @@ class _FileLock:
 
 class ConsolidatedArtifactStore(ArtifactStore):
     """
-    新格式: 單一 weights/training_artifacts.json。
+    Current format: a single weights/training_artifacts.json.
 
-    讀取時以 mtime 判斷快取是否過期，因此重訓行程更新檔案後，
-    實盤行程不必重啟就會拿到新值。
+    The cache is invalidated by file mtime, so a live process picks up a
+    retrain's new values without restarting.
     """
 
     VERSION = 1
@@ -312,7 +312,7 @@ class ConsolidatedArtifactStore(ArtifactStore):
             self._cache, self._mtime = data, mtime
             return data
         except Exception as e:
-            logger.error(f"training_artifacts.json 讀取失敗 ({self.path}): {e}")
+            logger.error(f"Failed to read training_artifacts.json ({self.path}): {e}")
             return self._cache or {}
 
     def _write_all(self, data: Dict[str, dict]) -> None:
@@ -345,7 +345,9 @@ class ConsolidatedArtifactStore(ArtifactStore):
                 else self.fallback.load_manifest(symbol)
             )
             if legacy is not None:
-                logger.debug(f"[{symbol}] {kind} 由舊格式載入 (尚未遷移)。")
+                logger.debug(
+                    f"[{symbol}] {kind} loaded from the legacy format (not migrated yet)."
+                )
             return legacy
         return None
 
@@ -360,8 +362,8 @@ class ConsolidatedArtifactStore(ArtifactStore):
 
     def _warn_if_unpaired(self, symbol: str) -> None:
         """
-        manifest 有、scaler 沒有 (或反之) 代表上一次訓練寫到一半就中斷。
-        用這種配對推論出來的結果不可信，必須讓人知道。
+        A manifest without a scaler (or the reverse) means the last training run stopped
+        halfway. Predictions built on that pairing aren't reliable, so say so.
         """
         if symbol in self._warned_unpaired:
             return
@@ -371,8 +373,8 @@ class ConsolidatedArtifactStore(ArtifactStore):
             self._warned_unpaired.add(symbol)
             missing = "scaler" if has_m else "manifest"
             logger.error(
-                f"[{symbol}] 訓練產物不成對 —— 缺少 {missing}。"
-                f"這代表上次訓練中途失敗，該標的的預測不可信，請重新執行 --mode train。"
+                f"[{symbol}] Training artifacts are unpaired; missing {missing}. "
+                f"The last training run failed partway; predictions are unreliable. Run --mode train."
             )
 
     def save_scaler(self, symbol: str, scaler: ScalerDict) -> None:
@@ -414,7 +416,7 @@ class ConsolidatedArtifactStore(ArtifactStore):
         return sorted(self._read_all().keys())
 
     def audit(self) -> Dict[str, List[str]]:
-        """回傳 {"paired": [...], "scaler_only": [...], "manifest_only": [...]}"""
+        """Returns {"paired": [...], "scaler_only": [...], "manifest_only": [...]}"""
         out = {"paired": [], "scaler_only": [], "manifest_only": []}
         for sym, entry in self._read_all().items():
             has_s = entry.get(SCALER) is not None
@@ -430,7 +432,7 @@ class ConsolidatedArtifactStore(ArtifactStore):
     def migrate_from(
         self, legacy: ArtifactStore, remove_old: bool = False
     ) -> Tuple[int, int]:
-        """把舊的逐檔產物併入單一檔案。回傳 (標的數, 產物數)。可重複執行。"""
+        """Merge legacy per-file artifacts into the single file. Returns (symbols, artifacts). Idempotent."""
         syms = moved = 0
         with _FileLock(self.path):
             self._mtime = -1.0
@@ -468,10 +470,8 @@ class ConsolidatedArtifactStore(ArtifactStore):
 
 def _setting(config, key: str, default):
     """
-    config 可能是 dict，也可能是 ConfigManager (用點路徑的 get)。
-    兩種都要能讀，否則設定值會靜默地取不到 —— DataPipeline 過去
-    用 getattr(self, "config", None) 拿設定，而它根本沒有 config 屬性，
-    結果 scaler_settings.filename 從來沒被讀過。
+    config can be a dict or a ConfigManager (dot-path get); both must work,
+    or settings silently come back empty.
     """
     if config is None:
         return default
@@ -492,7 +492,7 @@ def _setting(config, key: str, default):
 
 def build_artifact_store(weights_dir: str, config=None) -> ArtifactStore:
     """
-    Composition Root 使用。預設合併格式，並保留所有舊格式的讀取退路。
+    Composition root. Uses the consolidated format and keeps every legacy read fallback.
     """
     legacy_files = LegacyFileStore(weights_dir)
     if not _setting(config, "consolidated", True):

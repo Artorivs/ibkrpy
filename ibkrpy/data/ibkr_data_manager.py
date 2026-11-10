@@ -1,5 +1,5 @@
 # ibkrpy/data/ibkr_data_manager.py
-# 將底層連接、歷史數據、實時訂閱與帳戶資訊統合於一處。
+# Connection, historical data, real-time subscriptions and account info in one place.
 
 import asyncio
 import time
@@ -43,7 +43,7 @@ def bar_seconds(bar_size: str) -> int:
 
 
 class IBKRDataManager:
-    """統一處理所有與 IBKR 互動的數據請求 (具備機構級 API 頻率防護)"""
+    """All IBKR data requests, with API rate-limit protection."""
 
     HIST_WINDOW_SECONDS = 600
     HIST_MAX_IN_WINDOW = 50
@@ -82,17 +82,17 @@ class IBKRDataManager:
         try:
             await self.ib.connectAsync(self.host, self.port, self.client_id)
             logger.info(
-                f"IBKR 連線成功: {self.host}:{self.port} (Client ID: {self.client_id})"
+                f"IBKR connected: {self.host}:{self.port} (Client ID: {self.client_id})"
             )
             self._install_error_hook()
         except Exception as e:
-            logger.warning(f"IBKR 連線失敗: {e}")
+            logger.warning(f"IBKR connection failed: {e}")
             raise ConnectionError(
-                f"無法連線至 IBKR {self.host}:{self.port}: {e}"
+                f"Cannot connect to IBKR {self.host}:{self.port}: {e}"
             ) from e
 
     async def _ensure_connected(self) -> bool:
-        """資料讀取路徑專用：連線失敗時降級為 False，不中斷整輪掃描"""
+        """For data reads: returns False on connection failure instead of aborting the scan."""
         try:
             await self.connect()
             return True
@@ -101,9 +101,8 @@ class IBKRDataManager:
 
     def _install_error_hook(self):
         """
-        ib_insync 的 reqHistoricalDataAsync 在 Error 162 時「不會拋例外」，
-        而是回傳空 list 並把錯誤丟到 errorEvent。舊版因此只看得到 ib_insync
-        印出的裸合約，完全不知道是哪檔標的、哪個週期、哪一段區間失敗。
+        On Error 162, reqHistoricalDataAsync does not raise; it returns an empty list and
+        reports through errorEvent. This hook logs which symbol, bar size and range failed.
         """
         if self._error_hook_installed:
             return
@@ -132,50 +131,56 @@ class IBKRDataManager:
             msg = str(errorString)
             if "pacing violation" in msg.lower():
                 logger.error(
-                    f"[IBKR][{sym}] 🚦 觸發歷史資料 pacing violation。"
-                    f"代表速率控制仍不夠保守，或 TWS 上有其他 client 共用同一組配額。原文: {msg}"
+                    f"[IBKR][{sym}] 🚦 Historical data pacing violation. "
+                    f"Rate limiting is not conservative enough, or another client shares the quota. Original: {msg}"
                 )
             elif "no market data permissions" in msg.lower():
                 logger.error(
-                    f"[IBKR][{sym}] 🔒 缺少市場資料訂閱權限。請到 Account Management 開通對應交易所，"
-                    f"或改用 whatToShow='ADJUSTED_LAST' / 延遲報價。原文: {msg}"
+                    f"[IBKR][{sym}] 🔒 Missing market data permissions. Subscribe to the exchange in Account Management, "
+                    f"or use whatToShow='ADJUSTED_LAST' / delayed data. Original: {msg}"
                 )
             elif "unknown contract" in msg.lower():
                 logger.error(
-                    f"[IBKR][{sym}] ❓ 合約無法解析。多半是送出的合約欄位不完整 "
-                    f"(缺 symbol / currency / primaryExchange)，或該 conId 已下市 / 更名。原文: {msg}"
+                    f"[IBKR][{sym}] ❓ Contract cannot be resolved. Usually incomplete contract fields "
+                    f"(symbol / currency / primaryExchange), or the conId was delisted / renamed. Original: {msg}"
                 )
             elif "no historical market data" in msg.lower():
                 logger.warning(
-                    f"[IBKR][{sym}] 該區間沒有歷史資料 (可能早於上市日)。原文: {msg}"
+                    f"[IBKR][{sym}] No historical data for this range (possibly before listing). Original: {msg}"
                 )
             else:
-                logger.error(f"[IBKR][{sym}] 歷史資料服務錯誤 ({errorCode}): {msg}")
+                logger.error(
+                    f"[IBKR][{sym}] Historical data service error ({errorCode}): {msg}"
+                )
             return
 
         if errorCode in (200, 300, 321, 322, 366):
-            logger.error(f"[IBKR][{sym}] 合約/請求錯誤 ({errorCode}): {errorString}")
+            logger.error(
+                f"[IBKR][{sym}] Contract/request error ({errorCode}): {errorString}"
+            )
             return
 
         if errorCode in (1100, 1101, 1102, 504):
-            logger.warning(f"[IBKR] 連線狀態變化 ({errorCode}): {errorString}")
+            logger.warning(
+                f"[IBKR] Connection state change ({errorCode}): {errorString}"
+            )
             return
 
         logger.warning(f"[IBKR][{sym}] ({errorCode}) {errorString}")
 
     @staticmethod
     def _normalise_symbol(symbol: str) -> str:
-        """IBKR 的多股別代碼用空白分隔 (BRK B / BF B)，不是點或減號。"""
+        """IBKR separates share classes with a space (BRK B / BF B), not a dot or dash."""
         return str(symbol).strip().upper().replace(".", " ").replace("-", " ")
 
     async def qualify(
         self, symbol: str, primary_exchange: str = None
     ) -> Optional[Contract]:
         """
-        取得「完整」合約並快取。回傳 None 代表該代碼無法解析，呼叫端應直接跳過。
+        Resolve the full contract and cache it. Returns None if the symbol cannot be resolved.
 
-        重點：qualifyContractsAsync 回填的是 conId + primaryExchange + tradingClass +
-        currency 等一整組欄位，這一整組必須原封不動地拿去請求歷史資料。
+        qualifyContractsAsync fills conId, primaryExchange, tradingClass, currency etc.; that
+        whole set must be passed unchanged to historical data requests.
         """
         key = self._normalise_symbol(symbol)
         if key in self._contracts:
@@ -192,7 +197,7 @@ class IBKRDataManager:
         try:
             resolved = await self.ib.qualifyContractsAsync(contract)
         except Exception as e:
-            logger.error(f"[{key}] 合約解析請求失敗: {e}")
+            logger.error(f"[{key}] Contract resolution request failed: {e}")
             return None
 
         if not resolved:
@@ -204,9 +209,9 @@ class IBKRDataManager:
 
             if not details:
                 logger.error(
-                    f"[{key}] ❌ IBKR 找不到此股票代碼。請確認：(a) 拼寫正確且未更名/下市；"
-                    f"(b) 多股別代碼要用空白，例如 BRK B 而非 BRK.B；"
-                    f"(c) 非美股需要另外指定交易所與幣別。此代碼本輪之後將被跳過。"
+                    f"[{key}] ❌ IBKR does not know this symbol. Check that (a) it is spelled right and not renamed/delisted; "
+                    f"(b) share classes use a space, e.g. BRK B not BRK.B; "
+                    f"(c) non-US stocks specify exchange and currency. Skipping this symbol from now on."
                 )
                 self._unresolvable.add(key)
                 return None
@@ -221,18 +226,18 @@ class IBKRDataManager:
             picked.exchange = "SMART"
             contract = picked
             logger.warning(
-                f"[{key}] SMART 直接解析失敗，改由 contractDetails 選定 "
-                f"conId={contract.conId} / primary={contract.primaryExchange}。"
+                f"[{key}] SMART resolution failed; contractDetails picked "
+                f"conId={contract.conId} / primary={contract.primaryExchange}."
             )
 
         if not contract.conId:
-            logger.error(f"[{key}] ❌ 解析後仍無 conId，跳過此標的。")
+            logger.error(f"[{key}] ❌ Still no conId after resolution; skipping.")
             self._unresolvable.add(key)
             return None
 
         self._contracts[key] = contract
         logger.debug(
-            f"[{key}] 合約已解析: conId={contract.conId}, "
+            f"[{key}] Contract resolved: conId={contract.conId}, "
             f"primary={contract.primaryExchange}, currency={contract.currency}"
         )
         return contract
@@ -249,7 +254,7 @@ class IBKRDataManager:
                 if item.tag == "NetLiquidationByCurrency" and item.currency == currency:
                     return float(item.value)
         except Exception as e:
-            logger.warning(f"獲取帳戶淨值失敗: {e}")
+            logger.warning(f"Failed to get account net liquidation: {e}")
         return 0.0
 
     @staticmethod
@@ -278,9 +283,9 @@ class IBKRDataManager:
 
     def _cache_ttl(self, bar_size: str, end_datetime: str) -> float:
         """
-        指定了 endDateTime 的歷史區間是不變的，可以長期快取。
-        滾動請求 (endDateTime='') 的有效期綁在 bar size 上：
-        一根 1 小時 K 沒收完之前，重抓也只會拿到同一組已收 K 線。
+        A range with an explicit endDateTime never changes and can be cached long. A rolling
+        request (endDateTime='') expires with the bar size: until a bar closes, refetching
+        returns the same closed bars.
         """
         if end_datetime:
             return 24 * 3600.0
@@ -288,8 +293,8 @@ class IBKRDataManager:
 
     async def _acquire_hist_slot(self, signature: str, contract_key: str) -> float:
         """
-        回傳需要等待的秒數 (0 代表可立即送出)。在鎖內完成所有帳務，
-        呼叫端在鎖外 sleep，避免長時間持鎖擋住其他協程。
+        Seconds to wait (0 = send now). All bookkeeping happens under the lock; the caller
+        sleeps outside it so other coroutines are not blocked.
         """
         async with self._hist_req_lock:
             now = time.time()
@@ -319,9 +324,9 @@ class IBKRDataManager:
                 oldest = self._hist_req_timestamps[0]
                 wait = max(wait, self.HIST_WINDOW_SECONDS - (now - oldest) + 1.0)
                 logger.warning(
-                    f"🛡️ [API 防護] 10 分鐘窗內已用掉 {len(self._hist_req_timestamps)}/"
-                    f"{self.HIST_MAX_IN_WINDOW} 次歷史請求，降溫 {wait:.1f} 秒。"
-                    f"（快取命中率 {self.cache_hit_rate():.0%}，持續觸發代表輪詢頻率仍高於資料更新頻率）"
+                    f"🛡️ [API guard] {len(self._hist_req_timestamps)}/{self.HIST_MAX_IN_WINDOW} "
+                    f"historical requests used in the 10-minute window; cooling down {wait:.1f}s "
+                    f"(cache hit rate {self.cache_hit_rate():.0%}; repeated triggers mean polling is faster than data updates)"
                 )
 
             gap_since_last = now - self._last_request_at
@@ -364,12 +369,12 @@ class IBKRDataManager:
         allow_cache: bool = True,
     ) -> pd.DataFrame:
         """
-        獲取歷史 K 線 (受快取 + 三條 pacing 規則保護)。
+        Fetch historical bars (protected by the cache and three pacing rules).
         """
         if contract is None or not getattr(contract, "conId", 0):
             logger.error(
-                f"[{getattr(contract, 'symbol', '?')}] 合約尚未解析 (conId 為空)，"
-                f"拒絕送出歷史請求。請先呼叫 qualify()。"
+                f"[{getattr(contract, 'symbol', '?')}] Contract not resolved (empty conId); "
+                f"refusing the historical request. Call qualify() first."
             )
             return pd.DataFrame()
 
@@ -386,8 +391,8 @@ class IBKRDataManager:
             if cached and (time.time() - cached[0]) < ttl:
                 self._cache_hits += 1
                 logger.debug(
-                    f"[{contract.symbol}] 快取命中 ({bar_size}/{duration})，"
-                    f"未消耗 API 配額 (剩餘有效 {ttl - (time.time() - cached[0]):.0f}s)。"
+                    f"[{contract.symbol}] Cache hit ({bar_size}/{duration}); "
+                    f"no API quota used ({ttl - (time.time() - cached[0]):.0f}s left)."
                 )
                 return cached[1].copy()
 
@@ -396,7 +401,7 @@ class IBKRDataManager:
         wait = await self._acquire_hist_slot(signature, contract_key)
         if wait > 0:
             logger.debug(
-                f"[{contract.symbol}] 速率控制等待 {wait:.2f}s ({bar_size}/{duration})"
+                f"[{contract.symbol}] Rate limit wait {wait:.2f}s ({bar_size}/{duration})"
             )
             await asyncio.sleep(wait)
 
@@ -412,17 +417,17 @@ class IBKRDataManager:
             )
         except Exception as e:
             logger.warning(
-                f"[{contract.symbol}] 歷史請求發生例外 "
+                f"[{contract.symbol}] Historical request raised "
                 f"({bar_size}/{duration}/end={end_datetime or 'NOW'}): {e}"
             )
             return pd.DataFrame()
 
         if not bars:
             logger.warning(
-                f"[{contract.symbol}] 歷史請求無資料返回 "
+                f"[{contract.symbol}] Historical request returned no data "
                 f"(conId={contract.conId}, {bar_size}, {duration}, "
-                f"end={end_datetime or 'NOW'}, {what_to_show}, RTH={use_rth})。"
-                f"請對照上方 IBKR errorEvent 訊息判斷原因。"
+                f"end={end_datetime or 'NOW'}, {what_to_show}, RTH={use_rth}). "
+                f"See the IBKR errorEvent message above for the cause."
             )
             return pd.DataFrame()
 
@@ -453,7 +458,7 @@ class IBKRDataManager:
         return df
 
     async def fetch_historical_by_symbol(self, symbol: str, **kwargs) -> pd.DataFrame:
-        """便利入口：自動解析合約後抓資料。無法解析時回傳空 DataFrame。"""
+        """Convenience entry: resolve the contract, then fetch. Returns an empty DataFrame if unresolved."""
         contract = await self.qualify(symbol)
         if contract is None:
             return pd.DataFrame()
@@ -462,22 +467,22 @@ class IBKRDataManager:
     async def subscribe_realtime_bars(
         self, contract: Contract, bar_size: int = 5, callback: Callable = None
     ):
-        """訂閱實時 K 線 (5 秒 bar)。實時訂閱不佔用歷史請求配額。"""
+        """Subscribe to 5-second real-time bars. These do not use the historical request quota."""
         if not await self._ensure_connected():
             return
         if contract is None or not getattr(contract, "conId", 0):
-            logger.warning("拒絕訂閱：合約尚未解析。")
+            logger.warning("Subscription refused: contract not resolved.")
             return
 
         sub_key = f"{contract.symbol}_{bar_size}"
         if sub_key in self._active_subscriptions:
-            logger.debug(f"已存在 {sub_key} 的訂閱。")
+            logger.debug(f"Subscription {sub_key} already exists.")
             return
 
         if len(self._active_subscriptions) >= self.max_subscriptions:
             logger.warning(
-                f"❌ [API 防護] 拒絕訂閱 {contract.symbol}："
-                f"已達實時訂閱安全上限 ({self.max_subscriptions} 檔)。"
+                f"❌ [API guard] Subscription to {contract.symbol} refused: "
+                f"real-time subscription limit reached ({self.max_subscriptions})."
             )
             return
 
@@ -487,11 +492,11 @@ class IBKRDataManager:
                 bars.updateEvent += callback
             self._active_subscriptions[sub_key] = {"bars": bars, "callback": callback}
             logger.debug(
-                f"成功訂閱 {contract.symbol} 實時數據 "
-                f"(水位: {len(self._active_subscriptions)}/{self.max_subscriptions})。"
+                f"Subscribed to {contract.symbol} real-time data "
+                f"(usage: {len(self._active_subscriptions)}/{self.max_subscriptions})."
             )
         except Exception as e:
-            logger.warning(f"訂閱實時數據失敗: {e}")
+            logger.warning(f"Real-time subscription failed: {e}")
 
     def cancel_realtime_subscription(self, contract: Contract, bar_size: int = 5):
         sub_key = f"{contract.symbol}_{bar_size}"
@@ -502,4 +507,4 @@ class IBKRDataManager:
             if callback:
                 bars.updateEvent -= callback
             self.ib.cancelRealTimeBars(bars)
-            logger.info(f"已取消 {sub_key} 的訂閱，釋放 API 額度。")
+            logger.info(f"Cancelled subscription {sub_key}, releasing API quota.")

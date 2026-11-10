@@ -1,5 +1,5 @@
 # ibkrpy/data/indicators.py
-# 技術指標：取代 pandas_ta 0.3.14b
+# Technical indicators (replaces pandas_ta 0.3.14b)
 
 from typing import Optional
 
@@ -10,7 +10,7 @@ _EPSILON = np.finfo(float).eps
 
 
 def _non_zero_range(high: pd.Series, low: pd.Series) -> pd.Series:
-    """high - low；只要有任一個 0 就整段加上 epsilon (與 pandas_ta 相同)。"""
+    """high - low, plus epsilon everywhere if any range is 0 (as pandas_ta does)."""
     diff = high - low
     if diff.eq(0).any():
         diff = diff + _EPSILON
@@ -18,7 +18,7 @@ def _non_zero_range(high: pd.Series, low: pd.Series) -> pd.Series:
 
 
 def rma(close: pd.Series, length: int) -> pd.Series:
-    """Wilder 移動平均。pandas_ta 0.3.14b 使用 adjust=True (pandas 預設)。"""
+    """Wilder moving average. pandas_ta 0.3.14b uses adjust=True (the pandas default)."""
     return close.ewm(alpha=1.0 / length, min_periods=length).mean()
 
 
@@ -27,9 +27,9 @@ def sma(close: pd.Series, length: int) -> pd.Series:
 
 
 def ema(close: pd.Series, length: int) -> pd.Series:
-    """以前 length 根的 SMA 作為起點，之後 span=length、adjust=False 的 EMA。"""
+    """EMA seeded with the SMA of the first `length` bars, then span=length, adjust=False."""
     if len(close) < length:
-        # pandas_ta 在此回傳 None；回傳全 NaN 讓後續 dropna 自然剔除
+        # pandas_ta returns None here; all-NaN lets the later dropna remove it
         return pd.Series(np.nan, index=close.index, name=f"EMA_{length}")
     seeded = close.astype(float).copy()
     seeded.iloc[: length - 1] = np.nan
@@ -86,7 +86,7 @@ def macd(
 
 
 def bbands(close: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFrame:
-    """布林通道。標準差取母體 (ddof=0)，與 pandas_ta 預設相同。"""
+    """Bollinger Bands with population std (ddof=0), as in pandas_ta."""
     std = float(std)
     mid = close.rolling(length, min_periods=length).mean()
     deviation = std * close.rolling(length, min_periods=length).std(ddof=0)
@@ -109,7 +109,7 @@ def bbands(close: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFrame
 def adx(
     high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14
 ) -> pd.DataFrame:
-    """回傳 ADX_n、DMP_n、DMN_n 三欄 (第一欄為 ADX)，與 pandas_ta 相同。"""
+    """Returns ADX_n, DMP_n, DMN_n (ADX first), as in pandas_ta."""
     atr_ = atr(high, low, close, length)
     up = high - high.shift(1)
     down = low.shift(1) - low
@@ -129,14 +129,14 @@ def adx(
 
 
 def _enough(series: pd.Series, length: int) -> bool:
-    """pandas_ta 在資料筆數少於 length 時直接回傳 None (不附加欄位)。"""
+    """pandas_ta returns None when there are fewer than `length` rows."""
     return series is not None and len(series) >= length
 
 
 def add_default_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    附加模型使用的預設技術指標，欄名與 pandas_ta 0.3.14b 的
-    df.ta.<indicator>(append=True) 完全一致：
+    Append the default model indicators, with column names matching pandas_ta 0.3.14b
+    df.ta.<indicator>(append=True):
 
       SMA_10, EMA_20, RSI_14, ATRr_14,
       MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9,

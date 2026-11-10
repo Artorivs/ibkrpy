@@ -1,5 +1,5 @@
 # ibkrpy/core/trading_dashboard.py
-# 系統視覺化監控儀表板
+# Monitoring dashboard
 
 import os
 import sys
@@ -27,7 +27,7 @@ from ibkrpy.shared.db_manager import DatabaseManager
 class TradingDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("IBKR 量化交易監控中心")
+        self.root.title("IBKR Trading Monitor")
         self.root.geometry("1300x800")
 
         self.style = ttk.Style()
@@ -59,7 +59,9 @@ class TradingDashboard:
         top_frame = ttk.Frame(self.root, padding=10)
         top_frame.pack(side=tk.TOP, fill=tk.X)
         title_lbl = ttk.Label(
-            top_frame, text="🟢 系統狀態: 實盤/模擬盤自動運行中", style="Header.TLabel"
+            top_frame,
+            text="🟢 Status: live / paper trading running",
+            style="Header.TLabel",
         )
         title_lbl.pack(side=tk.LEFT)
 
@@ -68,7 +70,7 @@ class TradingDashboard:
 
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        ttk.Label(left_frame, text="📝 實盤 交易紀錄", style="Header.TLabel").pack(
+        ttk.Label(left_frame, text="📝 Trade log", style="Header.TLabel").pack(
             anchor=tk.W, pady=(0, 5)
         )
 
@@ -89,7 +91,7 @@ class TradingDashboard:
         right_frame.pack(side=tk.RIGHT, fill=tk.Y)
 
         ttk.Label(
-            right_frame, text="💼 帳戶資金與實盤庫存", style="Header.TLabel"
+            right_frame, text="💼 Account and positions", style="Header.TLabel"
         ).pack(anchor=tk.W, pady=(0, 5))
         self.account_info_text = tk.Text(
             right_frame,
@@ -108,7 +110,7 @@ class TradingDashboard:
         chart_ctrl_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(
             chart_ctrl_frame,
-            text="📉 選擇圖表: ",
+            text="📉 Chart: ",
             font=("Helvetica", 12, "bold"),
             foreground="#00E5FF",
         ).pack(side=tk.LEFT)
@@ -117,7 +119,7 @@ class TradingDashboard:
             chart_ctrl_frame, state="readonly", width=20, font=("Helvetica", 11)
         )
         self.chart_selector.pack(side=tk.LEFT, padx=5)
-        self.chart_selector.set("💰 帳戶收益曲線 (Equity)")
+        self.chart_selector.set("💰 Account equity curve")
 
         self.figure = plt.Figure(figsize=(5, 3.5), dpi=100, facecolor="#1E1E1E")
         self.ax = self.figure.add_subplot(111)
@@ -130,7 +132,7 @@ class TradingDashboard:
         bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Label(
             bottom_frame,
-            text="📡 底層監控終端 (API 防護 / MAD 剔除 / 宏觀警報)",
+            text="📡 System log (API guards / MAD filter / macro alerts)",
             style="Header.TLabel",
         ).pack(anchor=tk.W, pady=(0, 5))
 
@@ -146,7 +148,7 @@ class TradingDashboard:
         self.log_terminal.pack(fill=tk.X)
 
     def _tail_system_logs(self):
-        """讀取最新的 log，透過差異對比防範 macOS Mach Port 報錯"""
+        """Read new log lines, diffing to avoid macOS Mach port errors."""
         log_path = os.path.join(project_root, "logs", "trading_bot.log")
         if not os.path.exists(log_path):
             return
@@ -165,7 +167,7 @@ class TradingDashboard:
             pass
 
     def _update_data(self):
-        """每 5 秒自動讀取資料庫刷新畫面"""
+        """Refresh from the database every 5 seconds."""
         try:
             df_trades = self.db._fetch_sync(
                 "SELECT * FROM trade_logs ORDER BY timestamp DESC LIMIT 20"
@@ -198,20 +200,18 @@ class TradingDashboard:
             new_acc_text = ""
             if account_data:
                 acc = account_data[0]
-                new_acc_text += f"💰 總淨值(NLV): ${acc['net_liquidation']:,.2f}\n"
-                new_acc_text += f"💵 可用現金:   ${acc['available_funds']:,.2f}\n"
+                new_acc_text += f"💰 Net liquidation: ${acc['net_liquidation']:,.2f}\n"
+                new_acc_text += f"💵 Available funds: ${acc['available_funds']:,.2f}\n"
                 new_acc_text += "-" * 40 + "\n"
-                new_acc_text += "📦 當前實盤持倉:\n"
+                new_acc_text += "📦 Positions:\n"
                 if position_data:
                     for p in position_data:
                         color_prefix = "+" if p["position"] > 0 else ""
-                        new_acc_text += (
-                            f"  ➤ {p['symbol']:<6}: {color_prefix}{p['position']} 股\n"
-                        )
+                        new_acc_text += f"  ➤ {p['symbol']:<6}: {color_prefix}{p['position']} shares\n"
                 else:
-                    new_acc_text += "  (目前帳戶無持倉)\n"
+                    new_acc_text += "  (no positions)\n"
             else:
-                new_acc_text = "等待實盤引擎掃描市場與同步資金...\n"
+                new_acc_text = "Waiting for the engine to sync the account...\n"
 
             current_acc_text = self.account_info_text.get(1.0, tk.END)
             if new_acc_text.strip() != current_acc_text.strip():
@@ -221,10 +221,8 @@ class TradingDashboard:
             symbols_data = self.db._fetch_sync(
                 "SELECT DISTINCT symbol FROM market_data"
             )
-            available_symbols = [
-                f"📊 標的走勢: {row['symbol']}" for row in symbols_data
-            ]
-            options = ["💰 帳戶收益曲線 (Equity)"] + available_symbols
+            available_symbols = [f"📊 Symbol: {row['symbol']}" for row in symbols_data]
+            options = ["💰 Account equity curve"] + available_symbols
 
             current_selection = self.chart_selector.get()
             self.chart_selector["values"] = options
@@ -243,7 +241,7 @@ class TradingDashboard:
             for spine in self.ax.spines.values():
                 spine.set_color("#4DA8DA")
 
-            if selection == "💰 帳戶收益曲線 (Equity)":
+            if selection == "💰 Account equity curve":
                 df_eq = pd.DataFrame(
                     self.db._fetch_sync(
                         "SELECT timestamp, net_liquidation FROM equity_history ORDER BY timestamp DESC LIMIT 300"
@@ -265,7 +263,7 @@ class TradingDashboard:
                         loc="upper left", facecolor="#1E1E1E", labelcolor="white"
                     )
 
-            elif selection.startswith("📊 標的走勢:"):
+            elif selection.startswith("📊 Symbol:"):
                 sym = selection.split(": ")[1]
                 df_market = pd.DataFrame(
                     self.db._fetch_sync(
@@ -332,7 +330,7 @@ class TradingDashboard:
             self._tail_system_logs()
 
         except Exception as e:
-            logger.error(f"UI 更新錯誤: {e}")
+            logger.error(f"UI update error: {e}")
 
         self.root.after(5000, self._update_data)
 
