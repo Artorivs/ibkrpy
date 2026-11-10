@@ -340,7 +340,7 @@ def build_threshold_policy(config) -> ThresholdPolicy:
             inner = FallbackThresholdPolicy([quantile_policy, sigma_policy])
 
     return CostFloorThresholdPolicy(
-        inner, absolute_floor=float(s.get("cost_floor_pct"))
+        inner, absolute_floor=float(s.get("cost_floor_pct", 0.0003))
     )
 
 
