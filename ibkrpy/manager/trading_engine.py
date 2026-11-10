@@ -12,6 +12,14 @@ from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
 from ibkrpy.shared.session_clock import build_session_clock
 from ibkrpy.data.external_data import align_daily_series
 from ibkrpy.strategy.execution_costs import build_execution_cost_model
+from ibkrpy.strategy.order_intent import (
+    Intent,
+    OrderSnapshot,
+    cost_floor_pct,
+    decide_order,
+    is_reducing,
+    regime_size_scale,
+)
 from ibkrpy.data.prediction_ledger import (
     TERM_BARS,
     PredictionRecord,
@@ -23,6 +31,7 @@ import numpy as np
 import logging
 
 logger = logging.getLogger("ibkrpy.trading_engine")
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 _TERM_POLL_SECONDS = {
     "short_term": 300,
     "mid_term": 900,
@@ -194,25 +203,15 @@ class TradingEngine:
         return term
 
     def _cost_floor_pct(self, price: float, net_liquidation: float) -> float:
-        """
-        Round-trip cost as a fraction of the notional this loop intends to trade.
-
-        Share count is unknown at the threshold stage, so base_position_pct × net liquidation
-        stands in for notional. This is a coarse screen; the real check is before ordering
-        (see _execute_signal). Feeding it to min_edge_pct still matters: exit geometry uses
-        it as the take-profit floor, so a target is never set inside the cost band.
-        """
+        """Coarse cost floor for min_edge_pct; see order_intent.cost_floor_pct."""
         try:
-            base_pct = float(
-                self.config.get("strategy_settings.base_position_pct", 0.08)
+            return cost_floor_pct(
+                self.cost_model,
+                price,
+                net_liquidation,
+                float(self.config.get("strategy_settings.base_position_pct", 0.08)),
+                float(self.config.get("execution_cost_settings.safety_multiple", 1.5)),
             )
-            notional = max(float(net_liquidation) * base_pct, float(price))
-            shares = max(notional / float(price), 1.0)
-            cost = self.cost_model.estimate(price, shares)
-            safety = float(
-                self.config.get("execution_cost_settings.safety_multiple", 1.5)
-            )
-            return cost.pct * safety
         except Exception as e:
             logger.warning(f"Cost floor estimate failed; using configured value: {e}")
             return float(self.config.get("strategy_settings.min_edge_pct", 0.0010))
@@ -493,41 +492,6 @@ class TradingEngine:
             f"[{symbol}] 🧠 Model predictions ({term}/{bar_size}) "
             f"price {current_price:.2f} -> {detail}"
         )
-
-    def _regime_size_scale(
-        self, regime, reversal_risk: float, is_reducing: bool
-    ) -> float:
-        """Scale position size by regime and reversal risk.
-
-        Reducing and closing always return 1.0: shrinking an exit leaves a tail that cannot
-        be handled.
-
-        A confirmed bull regime scales up, so the system is not too conservative in bull
-        markets; rising reversal risk scales down linearly, so positions exit while a top
-        forms instead of waiting for the regime to turn bearish.
-        """
-        if is_reducing:
-            return 1.0
-
-        from ibkrpy.strategy.strategy_components import MarketRegime
-
-        scales = {
-            MarketRegime.BULL_TREND: self.config.get(
-                "strategy_settings.size_scale_bull", 1.25
-            ),
-            MarketRegime.BEAR_TREND: self.config.get(
-                "strategy_settings.size_scale_bear", 0.60
-            ),
-            MarketRegime.SIDEWAYS_VOLATILE: self.config.get(
-                "strategy_settings.size_scale_volatile", 0.70
-            ),
-            MarketRegime.SIDEWAYS_QUIET: self.config.get(
-                "strategy_settings.size_scale_quiet", 0.90
-            ),
-        }
-        scale = float(scales.get(regime, 1.0))
-        scale *= max(1.0 - reversal_risk * 0.75, 0.25)
-        return scale
 
     def _record_decision(self, code: str):
         self._cycle_decisions[code] = self._cycle_decisions.get(code, 0) + 1
@@ -984,37 +948,20 @@ class TradingEngine:
             logger.info(f"[{symbol}] ✅ Closed {filled:g} shares.")
         return filled
 
-    async def run_tick(self, symbol: str, session=None):
-        self._last_tick_at[symbol] = time.time()
-
-        available_funds = self.cached_funds
-        net_liquidation = self.cached_net_liq
-        current_pos = self.cached_positions.get(symbol, 0.0)
-
-        contract = await self._get_qualified_contract(symbol)
-        if contract is None:
-            self._record_decision("CONTRACT_UNRESOLVED")
-            return
-
-        term = self._effective_term(symbol)
-
+    def _bar_size(self, term: str) -> str:
         if term == "short_term":
-            bar_size_str = self.config.get(
-                "general_settings.short_term_bar_size", "5 mins"
-            )
-        elif term == "mid_term":
-            bar_size_str = self.config.get(
-                "general_settings.mid_term_bar_size", "1 hour"
-            )
-        else:
-            bar_size_str = self.config.get(
-                "general_settings.long_term_bar_size", "1 day"
-            )
+            return self.config.get("general_settings.short_term_bar_size", "5 mins")
+        if term == "mid_term":
+            return self.config.get("general_settings.mid_term_bar_size", "1 hour")
+        return self.config.get("general_settings.long_term_bar_size", "1 day")
 
-        live_duration = "3 D"
+    async def _fetch_bars(
+        self, symbol: str, contract, bar_size_str: str, duration: str
+    ) -> pd.DataFrame:
+        """Recent bars from IBKR stitched onto the database copy; new bars are saved."""
         df_recent = await self.data.fetch_historical_data(
             contract=contract,
-            duration=live_duration,
+            duration=duration,
             bar_size=bar_size_str,
             what_to_show="TRADES",
         )
@@ -1023,7 +970,7 @@ class TradingEngine:
         if self.db:
             df_db = self.db.get_market_data_sync(symbol, timeframe=bar_size_str)
             if not df_db.empty:
-                df_db = df_db[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+                df_db = df_db[OHLCV].astype(float)
                 df_db.index = pd.to_datetime(df_db.index, utc=True)
 
         if not df_recent.empty:
@@ -1037,27 +984,142 @@ class TradingEngine:
                     "volume": "Volume",
                 }
             )
-            df_recent = df_recent[["Open", "High", "Low", "Close", "Volume"]].astype(
-                float
-            )
+            df_recent = df_recent[OHLCV].astype(float)
 
             if self.db:
                 self.db.save_bulk_market_data(symbol, df_recent, timeframe=bar_size_str)
 
         if not df_db.empty and not df_recent.empty:
             df = pd.concat([df_db, df_recent])
-
             df = df[~df.index.duplicated(keep="last")].sort_index()
         elif not df_recent.empty:
             df = df_recent
         else:
             df = df_db
 
-        cols_to_keep = ["Open", "High", "Low", "Close", "Volume"]
-        for col in cols_to_keep:
+        for col in OHLCV:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
 
+    async def _macro_series(self, index: pd.Index) -> Dict[str, Any]:
+        """FRED VIX aligned to the bar index, refreshed at most every 8 hours."""
+        macro_dict = {}
+        if not self.ext:
+            return macro_dict
+
+        now = time.time()
+        if self.cached_vix_series is None or (now - self.vix_last_fetch_time) > 28800:
+            try:
+                vix_series = await self.ext.fetch_fred_series("VIXCLS")
+                if vix_series is not None and not vix_series.empty:
+                    self.cached_vix_series = vix_series
+                    self.vix_last_fetch_time = now
+                    logger.info(
+                        "🌍 [System] Macro data (VIXCLS) updated from FRED and cached locally (valid 8 hours)."
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ FRED fetch failed; keeping local cache: {e}")
+
+        if self.cached_vix_series is not None and not self.cached_vix_series.empty:
+            macro_dict["VIX"] = align_daily_series(self.cached_vix_series, index)
+        return macro_dict
+
+    def _build_features(self, symbol: str, df, bench_df, macro_dict) -> tuple:
+        """(df_adv, df_scaled): engineered features and their scaled copy for inference."""
+        if not self.pipeline:
+            df_adv = df.ffill().bfill().fillna(0)
+            return df_adv, df_adv
+
+        bench_data = bench_df if not bench_df.empty else None
+        df_adv = self.pipeline.engineer_advanced_features(df, bench_data, macro_dict)
+        df_adv = df_adv.ffill().bfill().fillna(0)
+        df_adv, _ = self.pipeline.align_to_manifest(df_adv, symbol)
+        df_scaled, _ = self.pipeline.transform_for_inference(df_adv, symbol)
+        return df_adv, df_scaled
+
+    def _assess_regime(self, symbol: str, df_adv) -> tuple:
+        """(regime, reversal_risk) for the latest bar."""
+        from ibkrpy.strategy.strategy_components import MarketRegime
+
+        if not self.regime_detector:
+            return MarketRegime.SIDEWAYS_QUIET, 0.0
+
+        assess = getattr(self.regime_detector, "assess", None)
+        if not callable(assess):
+            return self.regime_detector.detect(df_adv), 0.0
+
+        assessment = assess(df_adv, key=symbol)
+        if assessment.is_turning:
+            logger.warning(f"[{symbol}] ⚠️ Trend weakening: {assessment.describe()}")
+        return assessment.regime, assessment.reversal_risk
+
+    def _estimate_volatility(self, symbol: str, df_adv):
+        _, model_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
+        if isinstance(model_volatility, (list, np.ndarray)):
+            model_volatility = (
+                float(model_volatility[0])
+                if len(model_volatility) > 0
+                else float("nan")
+            )
+
+        # GARCH already returns σ per bar of this term.
+        try:
+            model_vol_per_bar = float(model_volatility)
+        except (TypeError, ValueError):
+            model_vol_per_bar = None
+
+        vol = self.vol_estimator.estimate(symbol, df_adv, model_vol_per_bar)
+        logger.debug(
+            f"[{symbol}] σ={vol.value * 100:.3f}% "
+            f"(source {vol.source}; realized {vol.realized * 100:.3f}%"
+            + (f"; model/realized ×{vol.ratio:.2f}" if vol.ratio is not None else "")
+            + ")"
+        )
+        return vol
+
+    def _sizing_inputs(
+        self, symbol: str, action: str, regime, reversal_risk: float, reducing: bool
+    ) -> tuple:
+        """(conviction, target_weight) from the macro analyzer and the regime scale."""
+        conviction = 1.0
+        target_weight = self.config.get("strategy_settings.base_position_pct", 0.08)
+        if self.market_analyzer:
+            analysis = self.market_analyzer.analyze_stock_risk(
+                symbol=symbol,
+                context=self.global_context,
+                action=action,
+                current_positions=self.cached_positions,
+            )
+            conviction = analysis["conviction_multiplier"]
+            target_weight = analysis.get("target_weight", 0.10)
+            if analysis["warnings"]:
+                logger.warning(
+                    f"[{symbol}] 🌍 Macro warning: {' | '.join(analysis['warnings'])}"
+                )
+
+        regime_scale = regime_size_scale(regime, reversal_risk, reducing, self.config)
+        logger.info(
+            f"[{symbol}] 📏 Sizing: base×tilt {target_weight * 100:.2f}% "
+            f"× regime {regime_scale:.2f} × conviction {conviction:.2f} "
+            f"= {target_weight * regime_scale * conviction * 100:.2f}% of net liquidation"
+        )
+        return conviction, target_weight * regime_scale
+
+    async def run_tick(self, symbol: str, session=None):
+        """One scan of one symbol: fetch -> features -> signal -> decide_order -> execute."""
+        self._last_tick_at[symbol] = time.time()
+
+        contract = await self._get_qualified_contract(symbol)
+        if contract is None:
+            self._record_decision("CONTRACT_UNRESOLVED")
+            return
+
+        term = self._effective_term(symbol)
+        bar_size_str = self._bar_size(term)
+        live_duration = "3 D"
+
+        df = await self._fetch_bars(symbol, contract, bar_size_str, live_duration)
         if df.empty or len(df) < 60:
             self._record_decision("NO_DATA")
             logger.warning(
@@ -1068,75 +1130,23 @@ class TradingEngine:
 
         current_price = float(df["Close"].iloc[-1])
         self._last_prices[symbol] = current_price
+        current_pos = self.cached_positions.get(symbol, 0.0)
 
         benchmark_symbol = self._get_dynamic_benchmark(symbol)
         bench_df = await self._load_benchmark_frame(
-            symbol, benchmark_symbol, df, bar_size_str, live_duration, cols_to_keep
+            symbol, benchmark_symbol, df, bar_size_str, live_duration, OHLCV
         )
+        macro_dict = await self._macro_series(df.index)
+        df_adv, df_scaled = self._build_features(symbol, df, bench_df, macro_dict)
+        regime, reversal_risk = self._assess_regime(symbol, df_adv)
 
-        macro_dict = {}
-        if self.ext:
-            current_time = time.time()
-
-            if (
-                self.cached_vix_series is None
-                or (current_time - self.vix_last_fetch_time) > 28800
-            ):
-                try:
-                    vix_series = await self.ext.fetch_fred_series("VIXCLS")
-                    if vix_series is not None and not vix_series.empty:
-                        self.cached_vix_series = vix_series
-                        self.vix_last_fetch_time = current_time
-                        logger.info(
-                            "🌍 [System] Macro data (VIXCLS) updated from FRED and cached locally (valid 8 hours)."
-                        )
-                except Exception as e:
-                    logger.warning(f"⚠️ FRED fetch failed; keeping local cache: {e}")
-
-            if self.cached_vix_series is not None and not self.cached_vix_series.empty:
-                macro_dict["VIX"] = align_daily_series(self.cached_vix_series, df.index)
-
-        if self.pipeline:
-            bench_data = bench_df if not bench_df.empty else None
-            df_adv = self.pipeline.engineer_advanced_features(
-                df, bench_data, macro_dict
-            )
-            df_adv = df_adv.ffill().bfill().fillna(0)
-
-            df_adv, scale_cols = self.pipeline.align_to_manifest(df_adv, symbol)
-            df_scaled, scale_cols = self.pipeline.transform_for_inference(
-                df_adv, symbol
-            )
-        else:
-            df_adv = df.ffill().bfill().fillna(0)
-            df_scaled = df_adv
-
-        from ibkrpy.strategy.strategy_components import MarketRegime
-
-        regime = MarketRegime.SIDEWAYS_QUIET
-        reversal_risk = 0.0
-
-        if self.regime_detector:
-            assess = getattr(self.regime_detector, "assess", None)
-            if callable(assess):
-                assessment = assess(df_adv, key=symbol)
-                regime = assessment.regime
-                reversal_risk = assessment.reversal_risk
-                if assessment.is_turning:
-                    logger.warning(
-                        f"[{symbol}] ⚠️ Trend weakening: {assessment.describe()}"
-                    )
-            else:
-                regime = self.regime_detector.detect(df_adv)
-
+        session = session if session is not None else self.session_clock.classify()
         context = {
             "vix_series": macro_dict.get("VIX"),
             "current_price": current_price,
             "regime": regime,
             "reversal_risk": reversal_risk,
-            "session": (
-                session if session is not None else self.session_clock.classify()
-            ),
+            "session": session,
             **self.equity_watermark.snapshot(self.cached_net_liq),
         }
         check = getattr(
@@ -1159,7 +1169,6 @@ class TradingEngine:
         self._log_predictions(
             symbol, term, bar_size_str, current_price, ensemble_preds, rejected_models
         )
-
         if not ensemble_preds:
             self._record_decision("NO_USABLE_MODEL")
             logger.warning(
@@ -1170,7 +1179,6 @@ class TradingEngine:
 
         preds_pct = {k: (v / current_price - 1) for k, v in ensemble_preds.items()}
         liveness = self._update_model_liveness(symbol, preds_pct)
-
         dead = [k for k, v in liveness.items() if v <= 0]
         if dead and symbol not in self._collapse_warned:
             self._collapse_warned.add(symbol)
@@ -1180,29 +1188,7 @@ class TradingEngine:
                 f"Retrain to fix this."
             )
 
-        _, model_volatility = self.models.predict(symbol, df_adv, model_type="GARCH")
-        if isinstance(model_volatility, (list, np.ndarray)):
-            model_volatility = (
-                float(model_volatility[0])
-                if len(model_volatility) > 0
-                else float("nan")
-            )
-
-        # GARCH already returns σ per bar of this term.
-        try:
-            model_vol_per_bar = float(model_volatility)
-        except (TypeError, ValueError):
-            model_vol_per_bar = None
-
-        vol = self.vol_estimator.estimate(symbol, df_adv, model_vol_per_bar)
-        adjusted_volatility = vol.value
-
-        logger.debug(
-            f"[{symbol}] σ={adjusted_volatility * 100:.3f}% "
-            f"(source {vol.source}; realized {vol.realized * 100:.3f}%"
-            + (f"; model/realized ×{vol.ratio:.2f}" if vol.ratio is not None else "")
-            + ")"
-        )
+        vol = self._estimate_volatility(symbol, df_adv)
 
         strategy = self.strategies.get(symbol)
         if not strategy:
@@ -1214,15 +1200,15 @@ class TradingEngine:
             strategy.set_model_liveness(liveness)
 
         dynamic_floor = self._cost_floor_pct(
-            context["current_price"], getattr(self, "cached_net_liq", 0.0) or 0.0
+            current_price, getattr(self, "cached_net_liq", 0.0) or 0.0
         )
         configured = float(self.config.get("strategy_settings.min_edge_pct", 0.0010))
         strategy.min_edge_pct = max(dynamic_floor, configured)
 
         signal = strategy.generate_signal(
-            current_price=context["current_price"],
-            volatility=adjusted_volatility,
-            regime=context["regime"],
+            current_price=current_price,
+            volatility=vol.value,
+            regime=regime,
             ensemble_predictions=ensemble_preds,
             current_position=current_pos,
             reversal_risk=reversal_risk,
@@ -1235,183 +1221,68 @@ class TradingEngine:
         )
         describe = getattr(strategy, "describe_last_decision", None)
         trace = describe() if callable(describe) else str(decision)
-
-        if signal:
-            logger.info(f"[{symbol}] ✅ Strategy decision: {trace}")
-        else:
+        if not signal:
             logger.info(f"[{symbol}] ⏸️ Strategy decision: {trace}")
             return
+        logger.info(f"[{symbol}] ✅ Strategy decision: {trace}")
 
-        is_reducing = (current_pos > 0 and signal["action"] == "SELL") or (
-            current_pos < 0 and signal["action"] == "BUY"
-        )
-        if not entries_allowed and not is_reducing:
-            self._record_decision("RISK_ENTRIES_BLOCKED")
-            logger.info(
-                f"[{symbol}] 🛡️ Signal valid but risk gate closed; skipping new exposure."
+        action = signal["action"]
+        reducing = is_reducing(action, current_pos)
+        conviction, target_weight = 1.0, 0.0
+        if entries_allowed or reducing:
+            conviction, target_weight = self._sizing_inputs(
+                symbol, action, regime, reversal_risk, reducing
             )
+
+        snapshot = OrderSnapshot(
+            action=action,
+            current_pos=current_pos,
+            price=current_price,
+            net_liquidation=self.cached_net_liq,
+            available_funds=self.cached_funds,
+            gross_exposure=self._current_gross_exposure(),
+            take_profit_price=signal.get("take_profit_price"),
+            entries_allowed=entries_allowed,
+            allow_shorting=bool(
+                self.config.get("strategy_settings.allow_shorting", False)
+            ),
+            target_weight=target_weight,
+            conviction=conviction,
+            max_gross_exposure=self.config.get(
+                "strategy_settings.max_gross_exposure", 1.0
+            ),
+            min_trade_usd=self.config.get("strategy_settings.min_trade_usd", 500.0),
+            extended_session=bool(getattr(session, "is_extended", False)),
+            safety_multiple=float(
+                self.config.get("execution_cost_settings.safety_multiple", 1.5)
+            ),
+        )
+        intent = decide_order(snapshot, self.cost_model)
+        await self._execute_intent(symbol, intent, signal, current_price)
+
+    async def _execute_intent(
+        self, symbol: str, intent: Intent, signal: Dict[str, Any], current_price: float
+    ):
+        """Carry out an Intent from decide_order: log a skip, or place the orders."""
+        if not intent.is_order:
+            self._record_decision(intent.reason_code)
+            if intent.reason_code in ("NO_BUYING_POWER", "GROSS_EXPOSURE_CAP"):
+                logger.warning(f"[{symbol}] ⚠️ {intent.message}")
+            else:
+                logger.info(f"[{symbol}] ⏸️ {intent.message}")
             return
 
-        if signal:
-            conviction = 1.0
-            target_weight = self.config.get("strategy_settings.base_position_pct", 0.08)
-            if self.market_analyzer:
-                analysis = self.market_analyzer.analyze_stock_risk(
-                    symbol=symbol,
-                    context=self.global_context,
-                    action=signal["action"],
-                    current_positions=self.cached_positions,
-                )
-                conviction = analysis["conviction_multiplier"]
-                target_weight = analysis.get("target_weight", 0.10)
-
-                if analysis["warnings"]:
-                    logger.warning(
-                        f"[{symbol}] 🌍 Macro warning: {' | '.join(analysis['warnings'])}"
-                    )
-
-            regime_scale = self._regime_size_scale(regime, reversal_risk, is_reducing)
-            target_weight *= regime_scale
-            logger.info(
-                f"[{symbol}] 📏 Sizing: base×tilt {target_weight / max(regime_scale, 1e-9) * 100:.2f}% "
-                f"× regime {regime_scale:.2f} × conviction {conviction:.2f} "
-                f"= {target_weight * conviction * 100:.2f}% of net liquidation"
-            )
-
-            await self._execute_signal(
-                symbol,
-                signal,
-                current_price,
-                available_funds,
-                net_liquidation,
-                current_pos,
-                conviction,
-                target_weight,
-            )
-
-    async def _execute_signal(
-        self,
-        symbol: str,
-        signal: Dict[str, Any],
-        current_price: float,
-        available_funds: float,
-        net_liquidation: float,
-        current_pos: float,
-        conviction: float = 1.0,
-        target_weight: float = 0.10,
-    ):
-        action = signal["action"]
+        action = intent.action
+        trade_quantity = intent.quantity
+        is_closing_only = intent.closing
+        trade_value = trade_quantity * current_price
         sl_price = signal["stop_loss_price"]
         tp_price = signal["take_profit_price"]
         regime_name = signal["regime"]
         term_name = signal.get("term", "unknown")
 
-        is_closing_only = False
-        trade_quantity = 0
-
-        allow_shorting = self.config.get("strategy_settings.allow_shorting", False)
-        final_weight = min(target_weight * conviction, 0.35)
-        max_gross = self.config.get("strategy_settings.max_gross_exposure", 1.0)
-
-        def _affordable_qty() -> int:
-            target_cash = net_liquidation * final_weight
-            budget = min(target_cash, available_funds * 0.95)
-
-            if net_liquidation > 0:
-                room = (max_gross * net_liquidation) - self._current_gross_exposure()
-                if room <= 0:
-                    logger.warning(
-                        f"⚠️ [{symbol}] Portfolio gross exposure cap reached ({max_gross*100:.0f}%); no new position."
-                    )
-                    return 0
-                budget = min(budget, room)
-
-            return int(budget / current_price) if current_price > 0 else 0
-
-        if action == "BUY":
-            if current_pos > 0:
-                self._record_decision("ALREADY_LONG")
-                logger.info(
-                    f"[{symbol}] ⏸️ Already long {current_pos:+.0f} shares; BUY signal does not add."
-                )
-                return
-            elif current_pos < 0:
-                trade_quantity = int(abs(current_pos))
-                is_closing_only = True
-            else:
-                trade_quantity = _affordable_qty()
-
-        elif action == "SELL":
-            if current_pos < 0:
-                self._record_decision("ALREADY_SHORT")
-                logger.info(
-                    f"[{symbol}] ⏸️ Already short {current_pos:+.0f} shares; SELL signal does not add."
-                )
-                return
-            elif current_pos > 0:
-                trade_quantity = int(current_pos)
-                is_closing_only = True
-            else:
-                if not allow_shorting:
-                    self._record_decision("SHORTING_DISABLED")
-                    logger.info(
-                        f"[{symbol}] ⏸️ SELL signal with no position and allow_shorting=False; "
-                        f"short blocked."
-                    )
-                    return
-                trade_quantity = _affordable_qty()
-
-        if trade_quantity <= 0:
-            self._record_decision("NO_BUYING_POWER")
-            budget = min(net_liquidation * final_weight, available_funds * 0.95)
-            logger.warning(
-                f"[{symbol}] ⚠️ {action} signal but 0 shares affordable. "
-                f"Target weight {final_weight * 100:.1f}% / net liq ${net_liquidation:,.0f} / "
-                f"available ${available_funds:,.0f} / budget ${budget:,.0f} / price {current_price:.2f}."
-            )
-            return
-
-        min_trade_usd = self.config.get("strategy_settings.min_trade_usd", 500.0)
-        trade_value = trade_quantity * current_price
-
-        if not is_closing_only:
-            try:
-                gross_edge = abs(float(tp_price) - current_price) / current_price
-            except (TypeError, ValueError, ZeroDivisionError):
-                gross_edge = 0.0
-
-            try:
-                session_now = self.session_clock.classify()
-                is_ext = bool(session_now.is_extended)
-            except Exception:
-                is_ext = False
-
-            viable, cost, why = self.cost_model.is_viable(
-                edge_pct=gross_edge,
-                price=current_price,
-                shares=trade_quantity,
-                extended_session=is_ext,
-                safety_multiple=float(
-                    self.config.get("execution_cost_settings.safety_multiple", 1.5)
-                ),
-            )
-            if not viable:
-                self._record_decision("COST_NOT_VIABLE")
-                logger.info(
-                    f"[{symbol}] ⏸️ {action} signal cancelled: costs exceed the edge. {why}"
-                )
-                return
-
-        if not is_closing_only and trade_value < min_trade_usd:
-            self._record_decision("BELOW_MIN_TRADE")
-            logger.info(
-                f"[{symbol}] ⏸️ {action} signal cancelled: trade value ${trade_value:.2f} "
-                f"is below the minimum ${min_trade_usd:.2f}, to avoid fee drag."
-            )
-            return
-
         logger.info(
-            f"[{symbol}] 🎯 Executing ({term_name}): {action} {trade_quantity} shares @ ~{current_price:.2f} (allocated weight: {final_weight*100:.1f}%)"
+            f"[{symbol}] 🎯 Executing ({term_name}): {action} {trade_quantity} shares @ ~{current_price:.2f} (allocated weight: {intent.weight*100:.1f}%)"
         )
         logger.info(
             f"\t=> [Protection] stop (STP) at {sl_price:.2f} | take-profit (LMT) at {tp_price:.2f}"
@@ -1425,7 +1296,7 @@ class TradingEngine:
             )
             return
 
-        self._record_decision(f"ORDER_{action}")
+        self._record_decision(intent.reason_code)
         try:
             if self.dry_run:
                 if not is_closing_only:
@@ -1494,7 +1365,7 @@ class TradingEngine:
                 reason = (
                     "AI close (reverse signal)"
                     if is_closing_only
-                    else f"AI entry ({term_name} | Alloc:{final_weight*100:.1f}%)"
+                    else f"AI entry ({term_name} | Alloc:{intent.weight*100:.1f}%)"
                 )
                 await self.db.log_trade(
                     {

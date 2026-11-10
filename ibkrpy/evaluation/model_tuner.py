@@ -83,14 +83,14 @@ class ModelTuner:
     def _engine(self) -> BacktestEngine:
         from ibkrpy.strategy.execution_costs import build_execution_cost_model
 
+        get = self.config.get
         return BacktestEngine(
-            position_pct=float(
-                self.config.get("strategy_settings.base_position_pct", 0.08)
-            ),
-            allow_shorting=bool(
-                self.config.get("strategy_settings.allow_shorting", False)
-            ),
+            position_pct=float(get("strategy_settings.base_position_pct", 0.08)),
+            allow_shorting=bool(get("strategy_settings.allow_shorting", False)),
             cost_model=build_execution_cost_model(self.config),
+            min_trade_usd=float(get("strategy_settings.min_trade_usd", 500.0)),
+            max_gross_exposure=float(get("strategy_settings.max_gross_exposure", 1.0)),
+            safety_multiple=float(get("execution_cost_settings.safety_multiple", 1.5)),
         )
 
     def evaluate(
@@ -104,14 +104,21 @@ class ModelTuner:
         """
         Backtest one parameter set the way live would trade it.
 
-        rows needs Close (High/Low/Open for brackets), prediction, volatility and regime;
-        each prediction is made at that bar's close for the next bar. warmup rows only
-        seed the prediction history used by the quantile threshold, as live history would.
+        rows needs Close (High/Low/Open for brackets), prediction, volatility and regime,
+        and may carry reversal_risk; each prediction is made at that bar's close for the
+        next bar. Orders go through decide_order with the live regime size scale. warmup
+        rows only seed the prediction history used by the quantile threshold, as live
+        history would.
         """
         from ibkrpy.strategy.core_strategy import CoreStrategy
         from ibkrpy.strategy.prediction_calibrator import (
             InMemoryPredictionHistory,
             build_threshold_policy,
+        )
+        from ibkrpy.strategy.order_intent import (
+            cost_floor_pct,
+            is_reducing,
+            regime_size_scale,
         )
         from ibkrpy.strategy.strategy_components import MarketRegime
 
@@ -134,28 +141,43 @@ class ModelTuner:
             prediction_history=history,
         )
         engine = self._engine()
-        cost_model = engine.cost_model
         configured_floor = float(cfg.get("min_edge_pct", 0.0010))
-        base_pct = engine.position_pct
-        safety = float(self.config.get("execution_cost_settings.safety_multiple", 1.5))
 
         def decide(ts, row, position, equity):
             price = float(row["Close"])
-            shares = max(equity * base_pct / price, 1.0)
-            dynamic_floor = cost_model.estimate(price, shares).pct * safety
-            strategy.min_edge_pct = max(dynamic_floor, configured_floor)
+            strategy.min_edge_pct = max(
+                cost_floor_pct(
+                    engine.cost_model,
+                    price,
+                    equity,
+                    engine.position_pct,
+                    engine.safety_multiple,
+                ),
+                configured_floor,
+            )
 
             regime_name = row.get("regime", "SIDEWAYS_QUIET")
             regime = MarketRegime.__members__.get(
                 str(regime_name), MarketRegime.SIDEWAYS_QUIET
             )
-            return strategy.generate_signal(
+            reversal_risk = float(row.get("reversal_risk", 0.0) or 0.0)
+            signal = strategy.generate_signal(
                 current_price=price,
                 prediction=float(row["prediction"]),
                 volatility=float(row.get("volatility", 0.02)),
                 regime=regime,
                 current_position=position,
+                reversal_risk=reversal_risk,
             )
+            if signal:
+                scale = regime_size_scale(
+                    regime,
+                    reversal_risk,
+                    is_reducing(signal["action"], position),
+                    self.config,
+                )
+                signal = {**signal, "target_weight": engine.position_pct * scale}
+            return signal
 
         return engine.simulate(rows, decide)
 

@@ -5,18 +5,18 @@ import pandas as pd
 import numpy as np
 from typing import Any, Callable, Dict, List, Optional
 
+from ibkrpy.strategy.order_intent import OrderSnapshot, decide_order
+
 Decide = Callable[[Any, Any, int, float], Optional[Dict[str, Any]]]
 
 
 class BacktestEngine:
     """Historical backtest that follows the live order rules and computes metrics.
 
-    Live rules mirrored here:
-      - entries are sized at position_pct of current equity, not all-in;
-      - an opposite signal only closes the position; it never flips it;
-      - a signal in the direction already held does not add;
-      - shorts open only when allow_shorting is true;
-      - costs come from the live ExecutionCostModel when one is given.
+    Every signal goes through order_intent.decide_order, the function live uses, so
+    sizing, close-only exits, no-add, shorting, the cost check and min_trade_usd match.
+    A signal may carry target_weight (default position_pct) and entries_allowed.
+    Fill costs come from the live ExecutionCostModel when one is given.
     """
 
     def __init__(
@@ -28,6 +28,9 @@ class BacktestEngine:
         position_pct: float = 0.08,
         allow_shorting: bool = True,
         cost_model=None,
+        min_trade_usd: float = 0.0,
+        max_gross_exposure: float = 1.0,
+        safety_multiple: float = 1.5,
     ):
         self.initial_capital = initial_capital
         self.commission = commission_per_share
@@ -36,6 +39,33 @@ class BacktestEngine:
         self.position_pct = float(position_pct)
         self.allow_shorting = bool(allow_shorting)
         self.cost_model = cost_model
+        self.min_trade_usd = float(min_trade_usd)
+        self.max_gross_exposure = float(max_gross_exposure)
+        self.safety_multiple = float(safety_multiple)
+
+    def _snapshot(
+        self,
+        sig: Dict[str, Any],
+        position: int,
+        price: float,
+        cash: float,
+        equity: float,
+    ) -> OrderSnapshot:
+        return OrderSnapshot(
+            action=sig["action"],
+            current_pos=position,
+            price=price,
+            net_liquidation=max(equity, 0.0),
+            available_funds=max(cash, 0.0),
+            gross_exposure=abs(position) * price,
+            take_profit_price=sig.get("take_profit_price"),
+            entries_allowed=bool(sig.get("entries_allowed", True)),
+            allow_shorting=self.allow_shorting,
+            target_weight=float(sig.get("target_weight", self.position_pct)),
+            max_gross_exposure=self.max_gross_exposure,
+            min_trade_usd=self.min_trade_usd,
+            safety_multiple=self.safety_multiple,
+        )
 
     @staticmethod
     def _infer_periods_per_year(index: pd.Index) -> float:
@@ -158,17 +188,17 @@ class BacktestEngine:
             action = sig.get("action") if sig else None
 
             if action in ("BUY", "SELL"):
-                direction = 1 if action == "BUY" else -1
-                if position != 0 and np.sign(position) != direction:
+                intent = decide_order(
+                    self._snapshot(sig, position, price, cash, equity), self.cost_model
+                )
+                if intent.is_order and intent.closing:
                     close_at(price)
-                elif position == 0 and (direction > 0 or self.allow_shorting):
-                    qty = int(max(equity, 0.0) * self.position_pct / price)
-                    if qty > 0:
-                        position = direction * qty
-                        cash -= position * price
-                        cash -= self._fill_cost(price, qty)
-                        active_sl = sig.get("stop_loss_price")
-                        active_tp = sig.get("take_profit_price")
+                elif intent.is_order:
+                    position = intent.quantity if action == "BUY" else -intent.quantity
+                    cash -= position * price
+                    cash -= self._fill_cost(price, intent.quantity)
+                    active_sl = sig.get("stop_loss_price")
+                    active_tp = sig.get("take_profit_price")
 
             equity_curve.append({"timestamp": ts, "equity": cash + position * price})
 
