@@ -2,6 +2,7 @@
 # 系統交易引擎：量化系統的主心臟。單向處理 數據 -> 宏觀全局 -> 預測 -> 策略 -> 執行
 
 import asyncio
+import os
 import math
 from datetime import datetime, timezone
 import time
@@ -99,6 +100,16 @@ class TradingEngine:
         self.cached_funds = 0.0
         self.cached_net_liq = 0.0
         self.cached_positions = {}
+        self._position_avg_cost: Dict[str, float] = {}
+        # Notional of entries sent since positions were last fetched.
+        self._pending_gross = 0.0
+
+        from ibkrpy.strategy.strategy_components import EquityWatermark
+        from ibkrpy.data.data_pipeline import PROJECT_ROOT
+
+        self.equity_watermark = EquityWatermark(
+            os.path.join(PROJECT_ROOT, "data", "risk_state.json")
+        )
         self.cached_vix_series = None
         self.vix_last_fetch_time = 0.0
 
@@ -624,6 +635,18 @@ class TradingEngine:
             self.cached_funds = available_funds
             self.cached_net_liq = net_liquidation
             self.cached_positions = pos_dict
+            self._position_avg_cost = {
+                p.contract.symbol: float(p.avgCost or 0.0)
+                for p in positions
+                if p.position != 0
+            }
+            self._pending_gross = 0.0
+
+            try:
+                ny_day = self.session_clock.state().now.strftime("%Y-%m-%d")
+            except Exception:
+                ny_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self.equity_watermark.update(net_liquidation, ny_day)
 
             if self.db:
                 await self.db.update_account_info(
@@ -649,10 +672,10 @@ class TradingEngine:
         for sym, qty in (self.cached_positions or {}).items():
             if not qty:
                 continue
-            price = self._last_prices.get(sym)
+            price = self._live_market_price(sym) or self._position_avg_cost.get(sym)
             if price:
                 total += abs(qty) * price
-        return total
+        return total + self._pending_gross
 
     async def _protect_unhedged_positions(self):
         """掃描帳戶中的持倉，若發現沒有掛出停損/停利單的持股（例如手動買入），自動補上 OCA 保護傘。"""
@@ -1116,6 +1139,7 @@ class TradingEngine:
             "current_price": current_price,
             "regime": regime,
             "reversal_risk": reversal_risk,
+            **self.equity_watermark.snapshot(self.cached_net_liq),
         }
         check = getattr(
             self.risk, "check_entries_allowed", self.risk.check_trade_allowed
@@ -1422,6 +1446,7 @@ class TradingEngine:
                     return
 
                 self.cached_funds = max(0.0, self.cached_funds - trade_value)
+                self._pending_gross += trade_value
 
                 algo_params = [TagValue("adaptivePriority", "Normal")]
 
