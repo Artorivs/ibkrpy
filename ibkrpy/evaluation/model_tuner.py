@@ -141,6 +141,7 @@ class ModelTuner:
             prediction_history=history,
         )
         engine = self._engine()
+        holds: Dict[str, int] = {}
         configured_floor = float(cfg.get("min_edge_pct", 0.0010))
 
         def decide(ts, row, position, equity):
@@ -169,7 +170,10 @@ class ModelTuner:
                 current_position=position,
                 reversal_risk=reversal_risk,
             )
-            if signal:
+            if not signal:
+                code = strategy.last_decision.get("reason_code", "UNKNOWN")
+                holds[code] = holds.get(code, 0) + 1
+            else:
                 scale = regime_size_scale(
                     regime,
                     reversal_risk,
@@ -179,7 +183,25 @@ class ModelTuner:
                 signal = {**signal, "target_weight": engine.position_pct * scale}
             return signal
 
-        return engine.simulate(rows, decide)
+        perf = engine.simulate(rows, decide)
+        perf["hold_reasons"] = {**holds, **perf.get("order_skips", {})}
+        return perf
+
+    @staticmethod
+    def _log_no_trades(symbol, term, rows, perf):
+        """Say which gate held every bar, so a 0-trade score is not mistaken for a bug."""
+        reasons = sorted(
+            (perf.get("hold_reasons") or {}).items(), key=lambda kv: -kv[1]
+        )
+        top = ", ".join(f"{k}×{v}" for k, v in reasons[:3]) or "none recorded"
+        edge = (rows["prediction"] / rows["Close"] - 1).abs()
+        vol = rows["volatility"] if "volatility" in rows else pd.Series(dtype=float)
+        logger.warning(
+            f"[{symbol}] {term}: no trade on the validation half under live rules. "
+            f"Held by: {top}. Median predicted move {edge.median() * 100:.3f}% "
+            f"(85th pct {edge.quantile(0.85) * 100:.3f}%) vs median σ "
+            f"{vol.median() * 100:.3f}%. Live holds this symbol at this term too."
+        )
 
     def optimize_strategy_params(
         self,
@@ -234,6 +256,8 @@ class ModelTuner:
         best = study.best_params
         perf = self.evaluate(symbol, validate, best, term, warmup=tune)
         score = self._calculate_composite_score(perf)
+        if perf.get("total_trades", 0) == 0:
+            self._log_no_trades(symbol, term, validate, perf)
         logger.info(
             f"[{symbol}] {term}: tune score {study.best_value:.2f}, "
             f"validation score {score:.2f} "

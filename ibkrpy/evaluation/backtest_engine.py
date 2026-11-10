@@ -142,6 +142,7 @@ class BacktestEngine:
 
         equity_curve = []
         round_trips = 0
+        skips: Dict[str, int] = {}
 
         def close_at(fill_price: float) -> None:
             nonlocal cash, position, active_sl, active_tp, round_trips
@@ -191,6 +192,8 @@ class BacktestEngine:
                 intent = decide_order(
                     self._snapshot(sig, position, price, cash, equity), self.cost_model
                 )
+                if not intent.is_order:
+                    skips[intent.reason_code] = skips.get(intent.reason_code, 0) + 1
                 if intent.is_order and intent.closing:
                     close_at(price)
                 elif intent.is_order:
@@ -207,7 +210,9 @@ class BacktestEngine:
             if equity_curve:
                 equity_curve[-1]["equity"] = cash
 
-        return self._evaluate_performance(equity_curve, round_trips, benchmark_df)
+        perf = self._evaluate_performance(equity_curve, round_trips, benchmark_df)
+        perf["order_skips"] = skips
+        return perf
 
     def _evaluate_performance(
         self,
