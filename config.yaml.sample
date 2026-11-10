@@ -73,6 +73,18 @@ volatility_settings:
     - V
 
 # ============================================================
+# Forecast horizon
+#
+# Bars ahead each term's models predict. Cost per trade is fixed while the expected move
+# grows with the horizon, so one-bar forecasts rarely clear costs. σ for thresholds and
+# exits is scaled to the same horizon (per-bar σ × √bars). Retrain after changing these.
+forecast_settings:
+  horizon_bars:
+    short_term: 12   # 12 × 5 min = 1 hour
+    mid_term: 7      # 7 × 1 hour ≈ 1 trading day
+    long_term: 5     # 5 days = 1 week
+
+# ============================================================
 # Prediction-outcome ledger
 
 ledger_settings:

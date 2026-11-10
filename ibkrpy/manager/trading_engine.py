@@ -9,6 +9,7 @@ import time
 from typing import Dict, Any
 from ib_insync import Order, LimitOrder, MarketOrder, Stock, TagValue
 from ibkrpy.strategy.volatility_estimator import build_volatility_estimator
+from ibkrpy.shared.horizon import horizon_sigma
 from ibkrpy.shared.session_clock import build_session_clock
 from ibkrpy.data.external_data import align_daily_series
 from ibkrpy.strategy.execution_costs import build_execution_cost_model
@@ -216,8 +217,33 @@ class TradingEngine:
             logger.warning(f"Cost floor estimate failed; using configured value: {e}")
             return float(self.config.get("strategy_settings.min_edge_pct", 0.0010))
 
+    def _horizon_bars(self, symbol: str, strategy=None) -> int:
+        """Bars ahead the loaded models predict: the training manifest's horizon, else the
+        horizon in this symbol's tuned parameters, else 1."""
+        manifest = None
+        if self.pipeline is not None:
+            try:
+                manifest = self.pipeline.load_manifest(symbol)
+            except Exception:
+                manifest = None
+        value = (manifest or {}).get("horizon_bars")
+        if value is None and strategy is not None:
+            value = getattr(strategy, "horizon_bars", None)
+        try:
+            return max(int(value or 1), 1)
+        except (TypeError, ValueError):
+            return 1
+
     def _record_to_ledger(
-        self, symbol, term, context, ensemble_preds, vol, decision, reversal_risk
+        self,
+        symbol,
+        term,
+        context,
+        ensemble_preds,
+        vol,
+        decision,
+        reversal_risk,
+        horizon_bars=1,
     ):
         """
         Buffer a full snapshot of this scan. Rows are written in one batch in
@@ -236,9 +262,9 @@ class TradingEngine:
                 for k, v in (ensemble_preds or {}).items()
                 if isinstance(v, (int, float)) and math.isfinite(float(v))
             }
-            ensemble = decision.get("expected_move")
+            ensemble = decision.get("predicted_pct")
             if ensemble is None and preds:
-                ensemble = sum(preds.values()) / len(preds)
+                ensemble = sum(preds.values()) / len(preds) / price - 1
 
             self._ledger_buffer.append(
                 PredictionRecord(
@@ -246,7 +272,7 @@ class TradingEngine:
                     timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     term=term,
                     timeframe=timeframe,
-                    horizon_bars=1,
+                    horizon_bars=int(horizon_bars),
                     price_at_prediction=price,
                     predicted_return=float(ensemble or 0.0),
                     model_predictions=preds,
@@ -254,10 +280,10 @@ class TradingEngine:
                     sigma_source=getattr(vol, "source", None),
                     sigma_realized=getattr(vol, "realized", None),
                     regime=str(context.get("regime")),
-                    threshold=decision.get("threshold"),
+                    threshold=decision.get("threshold_pct"),
                     threshold_source=decision.get("threshold_source"),
                     reason_code=decision.get("reason_code"),
-                    action=decision.get("action", "HOLD"),
+                    action=decision.get("outcome", "HOLD"),
                     benchmark=context.get("benchmark"),
                     reversal_risk=reversal_risk,
                     model_generation=self._model_generation,
@@ -1205,9 +1231,11 @@ class TradingEngine:
         configured = float(self.config.get("strategy_settings.min_edge_pct", 0.0010))
         strategy.min_edge_pct = max(dynamic_floor, configured)
 
+        horizon = self._horizon_bars(symbol, strategy)
+        strategy.horizon_bars = horizon
         signal = strategy.generate_signal(
             current_price=current_price,
-            volatility=vol.value,
+            volatility=horizon_sigma(vol.value, horizon),
             regime=regime,
             ensemble_predictions=ensemble_preds,
             current_position=current_pos,
@@ -1217,7 +1245,14 @@ class TradingEngine:
         decision = getattr(strategy, "last_decision", {}) or {}
         self._record_decision(decision.get("reason_code", "UNKNOWN"))
         self._record_to_ledger(
-            symbol, term, context, ensemble_preds, vol, decision, reversal_risk
+            symbol,
+            term,
+            context,
+            ensemble_preds,
+            vol,
+            decision,
+            reversal_risk,
+            horizon_bars=horizon,
         )
         describe = getattr(strategy, "describe_last_decision", None)
         trace = describe() if callable(describe) else str(decision)

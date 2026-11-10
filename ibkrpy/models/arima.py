@@ -20,6 +20,7 @@ class ARIMAModel:
         self.order = (p, d, q)
         self.weights_dir = weights_dir
         self.model_results: ARIMAResultsWrapper = None
+        self.horizon_bars = 1
 
     def load_weights(self, symbol: str):
         """Load the fitted ARIMA from the classical bundle (.pkl)."""
@@ -29,6 +30,7 @@ class ARIMAModel:
             try:
                 bundle = joblib.load(file_path)
                 self.model_results = bundle.get("arima")
+                self.horizon_bars = max(int(bundle.get("horizon_bars", 1)), 1)
                 if self.model_results:
                     print(f"[{symbol}] ARIMA weights loaded.")
                 else:
@@ -43,7 +45,7 @@ class ARIMAModel:
             )
 
     def predict_next_price(self, df: pd.DataFrame) -> float:
-        """Forecast the next bar's price."""
+        """Forecast the price horizon_bars bars ahead (the horizon it was trained for)."""
         if df.empty or "Close" not in df.columns:
             return 0.0
 
@@ -55,14 +57,11 @@ class ARIMAModel:
 
         try:
             if self.model_results is not None:
-                updated_model = self.model_results.apply(series.values)
-                forecast = updated_model.forecast(steps=1)
-                return float(forecast[0])
+                res = self.model_results.apply(series.values)
             else:
-                model = ARIMA(series.values, order=self.order)
-                res = model.fit()
-                forecast = res.forecast(steps=1)
-                return float(forecast[0])
+                res = ARIMA(series.values, order=self.order).fit()
+            h = self.horizon_bars
+            return float(res.forecast(steps=h)[h - 1])
 
         except Exception as e:
             print(f"ARIMA forecast failed: {e}")

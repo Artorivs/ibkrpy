@@ -190,6 +190,7 @@ class DataPipeline:
         target_mode: str = "log_return",
         target_scale: float = 100.0,
         benchmark: str = None,
+        horizon_bars: int = 1,
     ):
         """[Training only] Save feature columns, their scaling and the target definition."""
         manifest = {
@@ -197,6 +198,7 @@ class DataPipeline:
             "price_relative": list(price_relative or []),
             "target_mode": target_mode,
             "target_scale": target_scale,
+            "horizon_bars": int(horizon_bars),
             "benchmark": (str(benchmark).upper() if benchmark else None),
         }
         self.artifacts.save_manifest(symbol, manifest)
@@ -219,6 +221,7 @@ class DataPipeline:
             manifest.setdefault("price_relative", [])
             manifest.setdefault("target_mode", "level")
             manifest.setdefault("target_scale", 1.0)
+            manifest.setdefault("horizon_bars", 1)
             manifest.setdefault("benchmark", None)
             self._manifests[symbol] = manifest
             return manifest
@@ -265,6 +268,7 @@ class DataPipeline:
         target_mode: str = "log_return",
         target_scale: float = 100.0,
         benchmark: str = None,
+        horizon_bars: int = 1,
     ):
         """
         [Training only] Write scaler and manifest in one atomic step.
@@ -277,6 +281,7 @@ class DataPipeline:
             "price_relative": list(price_relative or []),
             "target_mode": target_mode,
             "target_scale": target_scale,
+            "horizon_bars": int(horizon_bars),
             "benchmark": (str(benchmark).upper() if benchmark else None),
         }
         self.artifacts.save_bundle(symbol, scaler=scaler, manifest=manifest)
@@ -431,8 +436,8 @@ class DataPipeline:
         """
         Convert raw model output back to a predicted price.
 
-        With target_mode = "log_return" the model outputs the next bar's log return x target_scale,
-        so price = current_price * exp(raw / target_scale).
+        With target_mode = "log_return" the model outputs the log return over the manifest's
+        horizon_bars x target_scale, so price = current_price * exp(raw / target_scale).
         """
         if not np.isfinite(raw) or current_price <= 0:
             return None
@@ -461,6 +466,7 @@ class DataPipeline:
         price_relative: List[str] = None,
         target_mode: str = "log_return",
         target_scale: float = 100.0,
+        horizon: int = 1,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Build sliding-window sequences for LSTM/Transformer.
@@ -469,12 +475,14 @@ class DataPipeline:
         :param raw_close:     unscaled close (needed for per-window anchors and target returns)
         :param price_relative: columns divided by each window's last close
         :param target_mode:   "log_return" (default) or "level"
+        :param horizon:       bars ahead the target looks
 
         Causality: window i covers [i, i+look_back-1], anchored on the close at i+look_back-1;
-        the target is the return from i+look_back-1 to i+look_back. The anchor only uses data
-        observed inside the window, so there is no lookahead.
+        the target is the return from the anchor to horizon bars later. The anchor only uses
+        data observed inside the window, so there is no lookahead.
         """
-        if len(df) <= look_back:
+        horizon = max(int(horizon), 1)
+        if len(df) < look_back + horizon:
             return np.array([]), np.array([])
 
         missing = [c for c in features if c not in df.columns]
@@ -492,9 +500,10 @@ class DataPipeline:
         price_idx = [features.index(c) for c in (price_relative or []) if c in features]
 
         X, y = [], []
-        for i in range(len(data) - look_back):
+        for i in range(len(data) - look_back - horizon + 1):
             window = data[i : (i + look_back)].copy()
-            anchor = closes[i + look_back - 1]
+            anchor_at = i + look_back - 1
+            anchor = closes[anchor_at]
 
             if price_idx:
                 if anchor <= 0 or not np.isfinite(anchor):
@@ -502,12 +511,14 @@ class DataPipeline:
                 window[:, price_idx] = window[:, price_idx] / anchor
 
             if target_mode == "log_return":
-                nxt = closes[i + look_back]
-                if anchor <= 0 or nxt <= 0:
+                ahead = closes[anchor_at + horizon]
+                if anchor <= 0 or ahead <= 0:
                     continue
-                target = np.log(nxt / anchor) * target_scale
+                target = np.log(ahead / anchor) * target_scale
             else:
-                target = df[features[features.index("Close")]].values[i + look_back]
+                target = df[features[features.index("Close")]].values[
+                    anchor_at + horizon
+                ]
 
             if not np.isfinite(window).all() or not np.isfinite(target):
                 continue

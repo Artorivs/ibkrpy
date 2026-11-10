@@ -279,7 +279,7 @@ class RunTickWiringTests(unittest.TestCase):
             )
         )
         eng.cost_model = build_execution_cost_model(None)
-        eng._record_to_ledger = lambda *a: None
+        eng._record_to_ledger = lambda *a, **k: None
         eng.strategies = {
             "NVDA": types.SimpleNamespace(
                 min_edge_pct=0.0,
