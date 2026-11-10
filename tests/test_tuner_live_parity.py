@@ -86,6 +86,9 @@ class BacktestMirrorsLiveTests(unittest.TestCase):
             def estimate(self, price, shares):
                 return types.SimpleNamespace(total=10.0)
 
+            def is_viable(self, **kw):
+                return True, None, ""
+
         decide, _ = scripted({0: "BUY", 1: "SELL"})
         perf = self.engine(cost_model=FlatCost()).simulate(bars([100.0] * 3), decide)
         self.assertAlmostEqual(perf["final_equity"], 100000.0 - 10.0, places=2)
